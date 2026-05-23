@@ -276,7 +276,11 @@ def choose_apple_music_id(
         return AppleMusicMatch(str(metadata.catalog_id), "catalog")
 
     if not metadata.playlist_id:
-        return AppleMusicMatch(None, "missing-playlist-id", ["missing ITUNESPLAYLISTID"])
+        return AppleMusicMatch(
+            None,
+            "missing-apple-music-id",
+            ["音频中未读取到 Apple Music 歌曲 ID 或专辑 ID"],
+        )
 
     errors: list[str] = []
     tried_stores: set[str] = set()
@@ -732,7 +736,10 @@ def _flatten_tags(tags: Any) -> dict[str, list[Any]]:
         except Exception:
             continue
         values = _coerce_tag_values(raw_value)
-        flattened.setdefault(str(key).casefold(), []).extend(values)
+        normalized_key = _normalize_tag_key(str(key))
+        flattened.setdefault(normalized_key, []).extend(
+            value for value in (_stringify_tag_value(value) for value in values) if value
+        )
     return flattened
 
 
@@ -747,6 +754,18 @@ def _coerce_tag_values(raw_value: Any) -> list[Any]:
     if text is not None:
         return list(text) if isinstance(text, list) else [text]
     return [raw_value]
+
+
+def _normalize_tag_key(key: str) -> str:
+    normalized = key.casefold()
+    aliases = {
+        "cnid": "itunescatalogid",
+        "plid": "itunesplaylistid",
+        "atid": "itunesalbumtitleid",
+        "----:com.apple.itunes:isrc": "isrc",
+        "----:com.apple.itunes:barcode": "barcode",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _tag_values(tags: dict[str, list[Any]], *names: str) -> list[str]:

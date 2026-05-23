@@ -36,6 +36,9 @@ env/
 *.lyric
 *.yrc
 
+# ame
+Ame (Apple Music).user.js
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

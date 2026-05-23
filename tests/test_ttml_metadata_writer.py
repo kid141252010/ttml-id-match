@@ -2,7 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fill_ttml_metadata import update_ttml_metadata
+from fill_ttml_metadata import (
+    AudioMetadata,
+    choose_apple_music_id,
+    update_ttml_metadata,
+    _flatten_tags,
+)
 
 
 REFERENCE_STYLE_TTML = (
@@ -167,6 +172,53 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             )
             self.assertIn('<amll:meta key="musicName" value="Song"/>', after)
             self.assertEqual(after.count("xmlns:amll="), 1)
+
+    def test_flattens_mutagen_mp4_itunes_keys_to_metadata_keys(self) -> None:
+        tags = {
+            "cnID": [1691701944],
+            "plID": [1691701942],
+            "atID": [152678183],
+            "----:com.apple.iTunes:ISRC": [b"TWA472368001"],
+        }
+
+        flattened = _flatten_tags(tags)
+
+        self.assertEqual(flattened["itunescatalogid"], ["1691701944"])
+        self.assertEqual(flattened["itunesplaylistid"], ["1691701942"])
+        self.assertEqual(flattened["itunesalbumtitleid"], ["152678183"])
+        self.assertEqual(flattened["isrc"], ["TWA472368001"])
+
+    def test_catalog_id_from_cnid_is_used_without_album_lookup(self) -> None:
+        class NoLookupClient:
+            def fetch_album_tracks(self, store, album_id):
+                raise AssertionError("catalog id should not require album lookup")
+
+        match = choose_apple_music_id(
+            AudioMetadata(catalog_id="1691701944", playlist_id="1691701942"),
+            NoLookupClient(),
+            ["cn", "us"],
+            interactive=False,
+        )
+
+        self.assertEqual(match.value, "1691701944")
+        self.assertEqual(match.source, "catalog")
+        self.assertEqual(match.errors, [])
+
+    def test_missing_catalog_and_playlist_reports_clear_reason(self) -> None:
+        class NoLookupClient:
+            def fetch_album_tracks(self, store, album_id):
+                raise AssertionError("missing ids should not require album lookup")
+
+        match = choose_apple_music_id(
+            AudioMetadata(),
+            NoLookupClient(),
+            ["cn", "us"],
+            interactive=False,
+        )
+
+        self.assertIsNone(match.value)
+        self.assertEqual(match.source, "missing-apple-music-id")
+        self.assertEqual(match.errors, ["音频中未读取到 Apple Music 歌曲 ID 或专辑 ID"])
 
 
 if __name__ == "__main__":
