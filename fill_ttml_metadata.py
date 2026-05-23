@@ -313,7 +313,7 @@ def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool
         backup_path = _backup_path(path)
         shutil.copy2(path, backup_path)
         result.backup_path = backup_path
-        output = ET.tostring(root, encoding="unicode", short_empty_elements=True)
+        output = _serialize_ttml(root)
         path.write_text(output, encoding="utf-8")
 
     return result
@@ -434,6 +434,11 @@ def _print_change_group(label: str, changes: dict[str, list[str]]) -> None:
     for key, values in changes.items():
         joined = ", ".join(values)
         print(f"  {label}: {key} = {joined}")
+
+
+def _serialize_ttml(root: ET.Element) -> str:
+    output = ET.tostring(root, encoding="unicode", short_empty_elements=True)
+    return re.sub(r"(<[^<>]*?)\s+/>", r"\1/>", output)
 
 
 def _apply_meta_values(

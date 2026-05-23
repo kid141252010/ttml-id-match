@@ -96,6 +96,9 @@ class TtmlUpdateTests(unittest.TestCase):
 
             self.assertEqual(result.added["appleMusicId"], ["6768201779"])
             self.assertTrue(path.with_suffix(".ttml.bak").exists())
+            written = path.read_text(encoding="utf-8")
+            self.assertIn('<amll:meta key="appleMusicId" value="6768201779"/>', written)
+            self.assertNotIn(" />", written)
 
             root = ET.parse(path).getroot()
             metadata = root.find(f"{{{TTML_NS}}}head/{{{TTML_NS}}}metadata")
