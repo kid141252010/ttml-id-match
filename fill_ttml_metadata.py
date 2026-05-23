@@ -85,11 +85,17 @@ class QQMusicSearchResult:
 
 @dataclass
 class PairMetadata:
-    audio_path: Path
+    audio_path: Path | None
     ttml_path: Path
     metadata: AudioMetadata
     apple_music_metadata: AppleMusicMetadataResult
     qq_music_metadata: QQMusicSearchResult
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    ttml_path: Path
+    audio_path: Path | None = None
 
 
 @dataclass
@@ -316,6 +322,28 @@ def read_audio_metadata(path: Path) -> AudioMetadata:
     )
 
 
+def read_ttml_metadata(path: Path) -> AudioMetadata:
+    text = path.read_text(encoding="utf-8")
+    metadata_start, metadata_end = _find_metadata_inner_bounds(text)
+    metadata = text[metadata_start:metadata_end]
+    amll_prefix = _find_amll_prefix(text)
+    values: dict[str, list[str]] = {}
+
+    for tag in _iter_amll_meta_tags(metadata, amll_prefix):
+        key = _xml_attr_value(tag, "key")
+        if key not in {"musicName", "artists", "album"}:
+            continue
+        value = _real_meta_value(_xml_attr_value(tag, "value"))
+        if value:
+            _add_unique_value(values, key, value)
+
+    return AudioMetadata(
+        title=values.get("musicName", [None])[0],
+        artists=split_artists(values.get("artists", [])),
+        album=values.get("album", [None])[0],
+    )
+
+
 def split_artists(values: Iterable[Any]) -> list[str]:
     artists: list[str] = []
     for raw_value in values:
@@ -478,29 +506,41 @@ def values_from_metadata(
     return values
 
 
-def find_directory_pairs(directory: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+def find_directory_work_items(directory: Path) -> tuple[list[WorkItem], list[str]]:
     ttml_files = sorted(directory.glob("*.ttml"))
     audio_by_stem: dict[str, list[Path]] = {}
     for child in directory.iterdir():
         if child.is_file() and child.suffix.lower() in AUDIO_EXTENSIONS:
             audio_by_stem.setdefault(child.stem, []).append(child)
 
-    pairs: list[tuple[Path, Path]] = []
+    work_items: list[WorkItem] = []
     warnings: list[str] = []
     for ttml in ttml_files:
         matches = sorted(audio_by_stem.get(ttml.stem, []), key=lambda path: (path.suffix.lower(), path.name.lower()))
         if len(matches) == 1:
-            pairs.append((matches[0], ttml))
+            work_items.append(WorkItem(ttml, matches[0]))
         elif not matches:
-            warnings.append(f"{ttml.name}: no same-stem audio file found")
+            work_items.append(WorkItem(ttml))
         else:
             flac_matches = [match for match in matches if match.suffix.lower() == ".flac"]
             if len(flac_matches) == 1:
-                pairs.append((flac_matches[0], ttml))
+                work_items.append(WorkItem(ttml, flac_matches[0]))
             else:
                 names = ", ".join(match.name for match in matches)
                 warnings.append(f"{ttml.name}: multiple same-stem audio files found: {names}")
-    return pairs, warnings
+    return work_items, warnings
+
+
+def find_directory_pairs(directory: Path) -> tuple[list[tuple[Path, Path]], list[str]]:
+    work_items, warnings = find_directory_work_items(directory)
+    pairs: list[tuple[Path, Path]] = []
+    legacy_warnings = list(warnings)
+    for item in work_items:
+        if item.audio_path:
+            pairs.append((item.audio_path, item.ttml_path))
+        else:
+            legacy_warnings.append(f"{item.ttml_path.name}: no same-stem audio file found")
+    return pairs, legacy_warnings
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -511,17 +551,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="show changes without writing files")
     args = parser.parse_args(argv)
 
-    if bool(args.audio) != bool(args.ttml):
-        parser.error("--audio and --ttml must be provided together")
+    if args.audio and not args.ttml:
+        parser.error("--audio requires --ttml")
 
     if args.audio and args.ttml:
-        pairs = [(args.audio, args.ttml)]
+        work_items = [WorkItem(args.ttml, args.audio)]
+        warnings: list[str] = []
+    elif args.ttml:
+        work_items = [WorkItem(args.ttml)]
         warnings: list[str] = []
     else:
         directory = Path(args.path)
         if not directory.is_dir():
             parser.error(f"{directory} is not a directory")
-        pairs, warnings = find_directory_pairs(directory)
+        work_items, warnings = find_directory_work_items(directory)
 
     for warning in warnings:
         _safe_print(f"[skip] {warning}")
@@ -530,12 +573,12 @@ def main(argv: list[str] | None = None) -> int:
     qq_music_client = QQMusicClient()
     failures = 0
     prepared_pairs: list[PairMetadata] = []
-    for audio_path, ttml_path in pairs:
+    for work_item in work_items:
         try:
-            prepared_pairs.append(_prepare_pair(audio_path, ttml_path, apple_music_client, qq_music_client))
+            prepared_pairs.append(_prepare_work_item(work_item, apple_music_client, qq_music_client))
         except Exception as exc:
             failures += 1
-            _safe_print(f"[error] {ttml_path.name}: {exc}", file=sys.stderr)
+            _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
 
     confirm_qq_music_candidates(prepared_pairs, dry_run=args.dry_run)
 
@@ -559,6 +602,26 @@ def _prepare_pair(
     apple_music_metadata = collect_apple_music_metadata(metadata, apple_music_client)
     qq_music_metadata = collect_qq_music_metadata(metadata, qq_music_client)
     return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata)
+
+
+def _prepare_work_item(
+    work_item: WorkItem,
+    apple_music_client: AppleMusicClientProtocol,
+    qq_music_client: QQMusicClientProtocol,
+) -> PairMetadata:
+    if work_item.audio_path:
+        return _prepare_pair(work_item.audio_path, work_item.ttml_path, apple_music_client, qq_music_client)
+
+    metadata = read_ttml_metadata(work_item.ttml_path)
+    if not metadata.title:
+        raise ValueError("TTML 中未读取到歌名，跳过 QQ 音乐搜索")
+    return PairMetadata(
+        None,
+        work_item.ttml_path,
+        metadata,
+        AppleMusicMetadataResult(),
+        collect_qq_music_metadata(metadata, qq_music_client),
+    )
 
 
 def _process_pair(
@@ -589,7 +652,7 @@ def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
     if not result.changed:
         status = "unchanged"
     _safe_print(f"[{status}] {ttml_path.name}")
-    _safe_print(f"  audio: {audio_path.name}")
+    _safe_print(f"  audio: {audio_path.name if audio_path else '-'}")
     _safe_print(f"  appleMusicId: {', '.join(apple_music_metadata.values.get('appleMusicId', [])) or '-'}")
     _safe_print(f"  appleMusicSources: {', '.join(apple_music_metadata.sources) or '-'}")
     if apple_music_metadata.errors:
@@ -813,6 +876,13 @@ def _add_unique_value(values: dict[str, list[str]], key: str, value: str | None)
         return
     if value not in values.setdefault(key, []):
         values[key].append(value)
+
+
+def _real_meta_value(value: str | None) -> str | None:
+    if _is_placeholder(value):
+        return None
+    assert value is not None
+    return value.strip()
 
 
 def _find_metadata_inner_bounds(text: str) -> tuple[int, int]:

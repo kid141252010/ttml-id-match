@@ -16,10 +16,14 @@ from fill_ttml_metadata import (
     collect_apple_music_metadata,
     collect_qq_music_metadata,
     confirm_qq_music_candidates,
+    find_directory_work_items,
     main,
+    read_ttml_metadata,
     update_ttml_metadata,
     values_from_metadata,
+    WorkItem,
     _flatten_tags,
+    _prepare_work_item,
     _parse_qq_music_candidates,
     _safe_print,
 )
@@ -532,6 +536,110 @@ class QQMusicMetadataTests(unittest.TestCase):
         )
 
         self.assertEqual(result.selected, result.candidates[2])
+
+
+class TtmlOnlyMetadataTests(unittest.TestCase):
+    def write_ttml(self, directory: Path, name: str = "song.ttml", body: str | None = None) -> Path:
+        path = directory / name
+        path.write_text(body or REFERENCE_STYLE_TTML, encoding="utf-8")
+        return path
+
+    def metadata_ttml(self, metadata_inner: str) -> str:
+        return (
+            '<tt xmlns="http://www.w3.org/ns/ttml" '
+            'xmlns:amll="http://www.example.com/ns/amll">'
+            f"<head><metadata>{metadata_inner}</metadata></head><body/></tt>"
+        )
+
+    def test_reads_title_artists_and_album_from_ttml_metadata(self) -> None:
+        text = self.metadata_ttml(
+            '<amll:meta key="musicName" value="玫瑰少年"/>'
+            '<amll:meta key="musicName" value="*"/>'
+            '<amll:meta key="artists" value="蔡依林"/>'
+            '<amll:meta key="artists" value=""/>'
+            '<amll:meta key="album" value="UGLY BEAUTY"/>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(Path(tmp), body=text)
+
+            metadata = read_ttml_metadata(path)
+
+        self.assertEqual(metadata.title, "玫瑰少年")
+        self.assertEqual(metadata.artists, ["蔡依林"])
+        self.assertEqual(metadata.album, "UGLY BEAUTY")
+        self.assertIsNone(metadata.isrc)
+        self.assertIsNone(metadata.catalog_id)
+        self.assertIsNone(metadata.playlist_id)
+
+    def test_batch_discovery_includes_unmatched_ttml_as_ttml_only_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.write_ttml(directory, "matched.ttml")
+            (directory / "matched.flac").write_text("", encoding="utf-8")
+            self.write_ttml(directory, "lyrics-only.ttml")
+            self.write_ttml(directory, "ambiguous.ttml")
+            (directory / "ambiguous.mp3").write_text("", encoding="utf-8")
+            (directory / "ambiguous.m4a").write_text("", encoding="utf-8")
+
+            work_items, warnings = find_directory_work_items(directory)
+
+        item_map = {item.ttml_path.name: item.audio_path.name if item.audio_path else None for item in work_items}
+        self.assertEqual(item_map["matched.ttml"], "matched.flac")
+        self.assertIsNone(item_map["lyrics-only.ttml"])
+        self.assertNotIn("ambiguous.ttml", item_map)
+        self.assertEqual(warnings, ["ambiguous.ttml: multiple same-stem audio files found: ambiguous.m4a, ambiguous.mp3"])
+
+    def test_ttml_only_preparation_reuses_title_query_and_artist_album_ranking(self) -> None:
+        class NoAppleLookupClient:
+            def fetch_album_tracks(self, store, album_id):
+                raise AssertionError("TTML-only work should not call Apple Music")
+
+        class SearchClient:
+            def search_songs(self, query):
+                self.query = query
+                return [
+                    QQMusicCandidate("235883438", "0035sVym0anwc4", "玫瑰少年", "", ["五月天"], "玫瑰少年", 0),
+                    QQMusicCandidate("224116257", "001hrIGe3flaPr", "玫瑰少年", "", ["JOLIN蔡依林"], "UGLY BEAUTY", 1),
+                    QQMusicCandidate(
+                        "415233914",
+                        "003YUKMv2dcOZq",
+                        "玫瑰少年 - From THE FIRST TAKE",
+                        "",
+                        ["蔡依林"],
+                        "玫瑰少年 - From THE FIRST TAKE",
+                        2,
+                    ),
+                ]
+
+        text = self.metadata_ttml(
+            '<amll:meta key="musicName" value="玫瑰少年"/>'
+            '<amll:meta key="artists" value="蔡依林"/>'
+            '<amll:meta key="album" value="UGLY BEAUTY"/>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(Path(tmp), body=text)
+            qq_client = SearchClient()
+
+            pair = _prepare_work_item(WorkItem(ttml_path=path), NoAppleLookupClient(), qq_client)
+
+        self.assertIsNone(pair.audio_path)
+        self.assertEqual(pair.metadata.title, "玫瑰少年")
+        self.assertEqual(pair.metadata.artists, ["蔡依林"])
+        self.assertEqual(pair.metadata.album, "UGLY BEAUTY")
+        self.assertEqual(qq_client.query, "玫瑰少年")
+        self.assertEqual([candidate.song_id for candidate in pair.qq_music_metadata.candidates], ["224116257", "415233914", "235883438"])
+
+    def test_ttml_only_cli_without_audio_is_accepted_and_reports_missing_title(self) -> None:
+        text = self.metadata_ttml('<amll:meta key="artists" value="蔡依林"/>')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(Path(tmp), body=text)
+            stderr = StringIO()
+
+            with redirect_stderr(stderr):
+                exit_code = main(["--ttml", str(path), "--dry-run"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("TTML 中未读取到歌名，跳过 QQ 音乐搜索", stderr.getvalue())
 
 
 if __name__ == "__main__":

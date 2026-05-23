@@ -1,6 +1,6 @@
 # TTML 元数据快速填充脚本
 
-这个仓库提供一个 Python CLI 脚本，用音频文件里的标签快速填充 TTML 歌词文件中的 AMLL 元数据。
+这个仓库提供一个 Python CLI 脚本，用音频文件里的标签或 TTML 里已有的基础信息快速填充 TTML 歌词文件中的 AMLL 元数据。
 
 当前脚本入口：
 
@@ -26,7 +26,7 @@ python fill_ttml_metadata.py --help
 - 追加缺失的元数据值，不覆盖已有真实值，重复值会跳过。
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
-- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。
+- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐 ID。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
@@ -122,6 +122,14 @@ python fill_ttml_metadata.py `
   --dry-run
 ```
 
+如果没有音频，也可以只指定 TTML。脚本会读取 TTML 已有的 `musicName`、`artists`、`album`，然后复用同一套 QQ 音乐搜索和候选确认流程：
+
+```powershell
+python fill_ttml_metadata.py `
+  --ttml "example\lyrics-only.ttml" `
+  --dry-run
+```
+
 ## Apple Music 区域
 
 默认区域查找顺序：
@@ -194,9 +202,9 @@ Disease (Apple Music Live) -> 6768201779
 
 ### QQ 音乐元数据查找
 
-QQ 音乐查找只使用音频歌名作为搜索关键词。脚本请求 QQ 音乐移动端搜索接口，读取 `item_song` 候选，要求候选同时具备 songid 和 mid。
+QQ 音乐查找只使用歌名作为搜索关键词。音频模式下歌名来自音频标签；TTML-only 模式下歌名来自已有 `amll:meta key="musicName"`。脚本请求 QQ 音乐移动端搜索接口，读取 `item_song` 候选，要求候选同时具备 songid 和 mid。
 
-匹配时会综合歌名、歌手和专辑：歌名权重最高，歌手其次，专辑再次。精确匹配优先于包含匹配；包含匹配可处理 `JOLIN蔡依林` 包含 `蔡依林` 这类别名。多歌手会逐个比较。
+匹配时会综合歌名、歌手和专辑：歌名权重最高，歌手其次，专辑再次。TTML-only 模式下歌手和专辑来自已有 `artists`、`album` 元数据。精确匹配优先于包含匹配；包含匹配可处理 `JOLIN蔡依林` 包含 `蔡依林` 这类别名。多歌手会逐个比较。
 
 dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先汇总所有最佳候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
 
@@ -263,7 +271,7 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
 
 ### 批量运行时某个 TTML 被跳过
 
-批量模式只按同名 stem 自动配对。
+批量模式优先按同名 stem 自动配对音频和 TTML。
 
 例如下面这组会匹配：
 
@@ -280,14 +288,14 @@ song.m4a
 song.ttml
 ```
 
-下面这组不会自动匹配：
+下面这组不会自动匹配音频，但会进入 TTML-only 模式；如果 TTML 里已有有效 `musicName`，脚本仍会尝试查找 QQ 音乐 ID：
 
 ```text
 song-audio.flac
 song-lyrics.ttml
 ```
 
-这种情况请使用 `--audio` 和 `--ttml` 单首模式。
+如果想强制指定音频，请使用 `--audio` 和 `--ttml` 单首模式。
 
 ### 找不到 Apple Music ID
 
@@ -302,7 +310,7 @@ song-lyrics.ttml
 
 常见原因：
 
-- 音频缺少歌名，无法发起 QQ 音乐搜索。
+- 音频或 TTML 缺少歌名，无法发起 QQ 音乐搜索。
 - QQ 音乐搜索结果没有同时带 songid 和 mid 的候选。
 - 歌名、歌手或专辑标签太不一致，最佳候选需要在真实写入时输入 `N` 手动选择。
 - 当前网络无法访问 QQ 音乐搜索接口。
