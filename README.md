@@ -332,4 +332,4 @@ python -B fill_ttml_metadata.py example --dry-run --non-interactive
 
 此仓库使用 **GNU Affero General Public License v3.0（AGPLv3）** 授权。
 
-如果你分发、修改、部署或通过网络提供本仓库代码产生的服务，需要遵守 AGPLv3 的源代码开放要求。仓库根目录的 `LICENSE` 文件已包含 AGPLv3 全文。
+如果你分发、修改、部署或通过网络提供本仓库代码产生的服务，需要遵守 AGPLv3 的源代码开放要求。仓库的 [LICENSE](https://github.com/kid141252010/ttml-id-match/blob/main/LICENSE) 文件已包含 AGPLv3 全文。
