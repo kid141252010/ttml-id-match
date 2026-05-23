@@ -30,6 +30,12 @@ env/
 *.wav
 *.wma
 
+# Lyrics
+*.ttml
+*.qrc
+*.lyric
+*.yrc
+
 # OS/editor noise
 .DS_Store
 Thumbs.db
