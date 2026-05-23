@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import html
 import json
 import re
@@ -19,7 +20,12 @@ from typing import Any, Callable, Iterable, Protocol
 AMLL_NS = "http://www.example.com/ns/amll"
 
 DEFAULT_STORES = ["cn", "tw", "jp", "kr", "us"]
-TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "appleMusicId", "isrc"]
+DEFAULT_NCM_API_BASES = [
+    "https://music163.xuanmou.com.cn",
+    "https://neteasecloudmusicapi-main-api.vercel.app",
+    "https://api-enhanced-six-beta.vercel.app",
+]
+TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "ncmMusicId", "appleMusicId", "isrc"]
 AUDIO_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -83,6 +89,23 @@ class QQMusicSearchResult:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class NCMusicCandidate:
+    song_id: str
+    title: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    artists: list[str] = field(default_factory=list)
+    album: str | None = None
+    source_index: int = 0
+
+
+@dataclass
+class NCMusicSearchResult:
+    candidates: list[NCMusicCandidate] = field(default_factory=list)
+    selected: NCMusicCandidate | None = None
+    errors: list[str] = field(default_factory=list)
+
+
 @dataclass
 class PairMetadata:
     audio_path: Path | None
@@ -90,6 +113,7 @@ class PairMetadata:
     metadata: AudioMetadata
     apple_music_metadata: AppleMusicMetadataResult
     qq_music_metadata: QQMusicSearchResult
+    ncm_music_metadata: NCMusicSearchResult = field(default_factory=NCMusicSearchResult)
 
 
 @dataclass(frozen=True)
@@ -131,6 +155,11 @@ class AppleMusicClientProtocol(Protocol):
 
 class QQMusicClientProtocol(Protocol):
     def search_songs(self, query: str) -> list[QQMusicCandidate]:
+        ...
+
+
+class NCMusicClientProtocol(Protocol):
+    def search_songs(self, query: str) -> list[NCMusicCandidate]:
         ...
 
 
@@ -287,6 +316,72 @@ class QQMusicClient:
         )
 
 
+class NCMusicClient:
+    def __init__(
+        self,
+        timeout: int = 20,
+        api_bases: Iterable[str] | None = None,
+        read_json: Callable[[str], dict[str, Any]] | None = None,
+    ):
+        self.timeout = timeout
+        self.api_bases = [base.rstrip("/") for base in (api_bases or DEFAULT_NCM_API_BASES) if base]
+        self._read_json = read_json or self._read_json_from_url
+
+    def search_songs(self, query: str) -> list[NCMusicCandidate]:
+        if not self.api_bases:
+            return []
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.api_bases))
+        futures = {
+            executor.submit(self._search_base, base, query): base
+            for base in self.api_bases
+        }
+        errors: list[str] = []
+        successful_responses = 0
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                base = futures[future]
+                try:
+                    candidates = future.result()
+                except Exception as exc:
+                    errors.append(f"{base}: {exc}")
+                    continue
+
+                successful_responses += 1
+                if candidates:
+                    return candidates
+
+            if errors and not successful_responses:
+                raise LookupError("; ".join(errors))
+            return []
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _search_base(self, base: str, query: str) -> list[NCMusicCandidate]:
+        url = self._build_search_url(base, query)
+        payload = self._read_json(url)
+        return _parse_ncm_music_candidates(payload)
+
+    @staticmethod
+    def _build_search_url(base: str, query: str) -> str:
+        params = urllib.parse.urlencode({"keywords": query})
+        return f"{base.rstrip('/')}/cloudsearch?{params}"
+
+    def _read_json_from_url(self, url: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json,text/plain,*/*",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "ignore"))
+        if not isinstance(payload, dict):
+            raise ValueError("NCM API returned a non-object payload")
+        return payload
+
+
 def read_audio_metadata(path: Path) -> AudioMetadata:
     try:
         from mutagen import File
@@ -412,6 +507,30 @@ def collect_qq_music_metadata(
     return result
 
 
+def collect_ncm_music_metadata(
+    metadata: AudioMetadata,
+    client: NCMusicClientProtocol,
+) -> NCMusicSearchResult:
+    result = NCMusicSearchResult()
+    if not metadata.title:
+        result.errors.append("未读取到歌名，跳过网易云音乐搜索")
+        return result
+
+    try:
+        candidates = client.search_songs(metadata.title)
+    except Exception as exc:
+        result.errors.append(f"网易云音乐搜索失败: {exc}")
+        return result
+
+    result.candidates = sorted(
+        candidates,
+        key=lambda candidate: (-_ncm_music_candidate_score(metadata, candidate), candidate.source_index),
+    )
+    if not result.candidates:
+        result.errors.append("网易云音乐未找到带歌曲 ID 的候选")
+    return result
+
+
 def confirm_qq_music_candidates(
     pairs: list[PairMetadata],
     dry_run: bool,
@@ -460,6 +579,54 @@ def confirm_qq_music_candidates(
             print_func("Invalid selection.")
 
 
+def confirm_ncm_music_candidates(
+    pairs: list[PairMetadata],
+    dry_run: bool,
+    input_func: Callable[[str], str] = input,
+    print_func: Callable[..., None] | None = None,
+) -> None:
+    if print_func is None:
+        print_func = _safe_print
+
+    available = [pair for pair in pairs if pair.ncm_music_metadata.candidates]
+    for pair in available:
+        pair.ncm_music_metadata.selected = pair.ncm_music_metadata.candidates[0]
+
+    if dry_run or not available:
+        return
+
+    print_func("")
+    print_func("网易云音乐最佳候选：")
+    for pair in available:
+        best = pair.ncm_music_metadata.candidates[0]
+        print_func(f"  {pair.ttml_path.name}: {_format_ncm_music_candidate(best)}")
+
+    while True:
+        answer = input_func("Accept all NetEase Cloud Music best candidates? Type Y to accept, N to choose alternatives: ").strip()
+        if answer.casefold() in {"y", "n"}:
+            break
+        print_func("Please type Y or N.")
+
+    if answer.casefold() == "y":
+        return
+
+    for pair in available:
+        options = pair.ncm_music_metadata.candidates[:5]
+        print_func("")
+        print_func(f"{pair.ttml_path.name} 网易云音乐候选：")
+        for index, candidate in enumerate(options, start=1):
+            print_func(f"  {index}. {_format_ncm_music_candidate(candidate)}")
+        while True:
+            answer = input_func("Select 1-5, or press Enter to skip this song: ").strip()
+            if not answer:
+                pair.ncm_music_metadata.selected = None
+                break
+            if answer.isdigit() and 1 <= int(answer) <= len(options):
+                pair.ncm_music_metadata.selected = options[int(answer) - 1]
+                break
+            print_func("Invalid selection.")
+
+
 def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool) -> TtmlUpdateResult:
     text = path.read_text(encoding="utf-8")
     text, amll_prefix = _ensure_amll_namespace(text)
@@ -487,6 +654,7 @@ def values_from_metadata(
     metadata: AudioMetadata,
     apple_music_values: dict[str, list[str]] | None = None,
     qq_music_candidate: QQMusicCandidate | None = None,
+    ncm_music_candidate: NCMusicCandidate | None = None,
 ) -> dict[str, list[str]]:
     values: dict[str, list[str]] = {}
     if metadata.title:
@@ -501,6 +669,8 @@ def values_from_metadata(
             _add_unique_value(values, key, value)
     if qq_music_candidate:
         _merge_qq_music_metadata(values, metadata, qq_music_candidate)
+    if ncm_music_candidate:
+        _merge_ncm_music_metadata(values, metadata, ncm_music_candidate)
     if metadata.isrc:
         _add_unique_value(values, "isrc", metadata.isrc)
     return values
@@ -571,16 +741,18 @@ def main(argv: list[str] | None = None) -> int:
 
     apple_music_client = AppleMusicClient()
     qq_music_client = QQMusicClient()
+    ncm_music_client = NCMusicClient()
     failures = 0
     prepared_pairs: list[PairMetadata] = []
     for work_item in work_items:
         try:
-            prepared_pairs.append(_prepare_work_item(work_item, apple_music_client, qq_music_client))
+            prepared_pairs.append(_prepare_work_item(work_item, apple_music_client, qq_music_client, ncm_music_client))
         except Exception as exc:
             failures += 1
             _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
 
     confirm_qq_music_candidates(prepared_pairs, dry_run=args.dry_run)
+    confirm_ncm_music_candidates(prepared_pairs, dry_run=args.dry_run)
 
     for pair in prepared_pairs:
         try:
@@ -597,30 +769,34 @@ def _prepare_pair(
     ttml_path: Path,
     apple_music_client: AppleMusicClientProtocol,
     qq_music_client: QQMusicClientProtocol,
+    ncm_music_client: NCMusicClientProtocol | None = None,
 ) -> PairMetadata:
     metadata = read_audio_metadata(audio_path)
     apple_music_metadata = collect_apple_music_metadata(metadata, apple_music_client)
     qq_music_metadata = collect_qq_music_metadata(metadata, qq_music_client)
-    return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata)
+    ncm_music_metadata = collect_ncm_music_metadata(metadata, ncm_music_client or NCMusicClient())
+    return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata, ncm_music_metadata)
 
 
 def _prepare_work_item(
     work_item: WorkItem,
     apple_music_client: AppleMusicClientProtocol,
     qq_music_client: QQMusicClientProtocol,
+    ncm_music_client: NCMusicClientProtocol | None = None,
 ) -> PairMetadata:
     if work_item.audio_path:
-        return _prepare_pair(work_item.audio_path, work_item.ttml_path, apple_music_client, qq_music_client)
+        return _prepare_pair(work_item.audio_path, work_item.ttml_path, apple_music_client, qq_music_client, ncm_music_client)
 
     metadata = read_ttml_metadata(work_item.ttml_path)
     if not metadata.title:
-        raise ValueError("TTML 中未读取到歌名，跳过 QQ 音乐搜索")
+        raise ValueError("TTML 中未读取到歌名，跳过 QQ 音乐搜索和网易云音乐搜索")
     return PairMetadata(
         None,
         work_item.ttml_path,
         metadata,
         AppleMusicMetadataResult(),
         collect_qq_music_metadata(metadata, qq_music_client),
+        collect_ncm_music_metadata(metadata, ncm_music_client or NCMusicClient()),
     )
 
 
@@ -630,9 +806,11 @@ def _process_pair(
     client: AppleMusicClientProtocol,
     dry_run: bool,
     qq_music_client: QQMusicClientProtocol | None = None,
+    ncm_music_client: NCMusicClientProtocol | None = None,
 ) -> None:
-    pair = _prepare_pair(audio_path, ttml_path, client, qq_music_client or QQMusicClient())
+    pair = _prepare_pair(audio_path, ttml_path, client, qq_music_client or QQMusicClient(), ncm_music_client)
     confirm_qq_music_candidates([pair], dry_run=dry_run)
+    confirm_ncm_music_candidates([pair], dry_run=dry_run)
     _process_prepared_pair(pair, dry_run=dry_run)
 
 
@@ -641,11 +819,13 @@ def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
         pair.metadata,
         pair.apple_music_metadata.values,
         qq_music_candidate=pair.qq_music_metadata.selected,
+        ncm_music_candidate=pair.ncm_music_metadata.selected,
     )
     audio_path = pair.audio_path
     ttml_path = pair.ttml_path
     apple_music_metadata = pair.apple_music_metadata
     qq_music_metadata = pair.qq_music_metadata
+    ncm_music_metadata = pair.ncm_music_metadata
     result = update_ttml_metadata(ttml_path, values, dry_run=dry_run)
 
     status = "dry-run" if dry_run else "updated"
@@ -664,6 +844,13 @@ def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
     _safe_print(f"  qqMusicId: {', '.join([selected.song_id, selected.mid]) if selected else '-'}")
     if qq_music_metadata.errors:
         for error in qq_music_metadata.errors:
+            _safe_print(f"  lookup warning: {error}")
+    best = ncm_music_metadata.candidates[0] if ncm_music_metadata.candidates else None
+    _safe_print(f"  ncmMusicBest: {_format_ncm_music_candidate(best) if best else '-'}")
+    selected_ncm = ncm_music_metadata.selected
+    _safe_print(f"  ncmMusicId: {selected_ncm.song_id if selected_ncm else '-'}")
+    if ncm_music_metadata.errors:
+        for error in ncm_music_metadata.errors:
             _safe_print(f"  lookup warning: {error}")
     _print_change_group("added", result.added)
     _print_change_group("replaced", result.replaced)
@@ -715,6 +902,24 @@ def _merge_qq_music_metadata(
         and not _same_raw_text(candidate.subtitle, candidate.title)
     ):
         _add_unique_value(values, "musicName", candidate.subtitle)
+    for artist in candidate.artists:
+        if not any(_same_raw_text(artist, existing) for existing in metadata.artists):
+            _add_unique_value(values, "artists", artist)
+    if candidate.album and not _same_raw_text(candidate.album, metadata.album):
+        _add_unique_value(values, "album", candidate.album)
+
+
+def _merge_ncm_music_metadata(
+    values: dict[str, list[str]],
+    metadata: AudioMetadata,
+    candidate: NCMusicCandidate,
+) -> None:
+    _add_unique_value(values, "ncmMusicId", candidate.song_id)
+    existing_titles = [metadata.title, *values.get("musicName", [])]
+    for title in [candidate.title, *candidate.aliases]:
+        if title and not any(_same_raw_text(title, existing) for existing in existing_titles):
+            _add_unique_value(values, "musicName", title)
+            existing_titles.append(title)
     for artist in candidate.artists:
         if not any(_same_raw_text(artist, existing) for existing in metadata.artists):
             _add_unique_value(values, "artists", artist)
@@ -800,6 +1005,68 @@ def _parse_qq_music_candidates(payload: dict[str, Any]) -> list[QQMusicCandidate
     return candidates
 
 
+def _parse_ncm_music_candidates(payload: dict[str, Any]) -> list[NCMusicCandidate]:
+    songs = _nested_get(payload, "result", "songs")
+    if not isinstance(songs, list):
+        return []
+
+    candidates: list[NCMusicCandidate] = []
+    for index, song in enumerate(songs):
+        if not isinstance(song, dict):
+            continue
+        song_id = _stringify_tag_value(song.get("id") or song.get("songid"))
+        if not song_id:
+            continue
+        candidates.append(
+            NCMusicCandidate(
+                song_id=song_id,
+                title=_stringify_tag_value(song.get("name") or song.get("title")),
+                aliases=_ncm_music_aliases(song),
+                artists=_ncm_music_artists(song.get("ar") or song.get("artists")),
+                album=_ncm_music_album(song.get("al") or song.get("album")),
+                source_index=index,
+            )
+        )
+    return candidates
+
+
+def _ncm_music_aliases(song: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    for key in ("alia", "alias", "tns"):
+        value = song.get(key)
+        if isinstance(value, list):
+            pieces = value
+        elif value:
+            pieces = [value]
+        else:
+            pieces = []
+        for piece in pieces:
+            text = _stringify_tag_value(piece)
+            if text and text not in aliases:
+                aliases.append(text)
+    return aliases
+
+
+def _ncm_music_artists(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return split_artists([value.get("name")])
+    if not isinstance(value, list):
+        return split_artists([value]) if value else []
+    artists: list[str] = []
+    for item in value:
+        name = _stringify_tag_value(item.get("name") if isinstance(item, dict) else item)
+        for artist in split_artists([name]):
+            if artist not in artists:
+                artists.append(artist)
+    return artists
+
+
+def _ncm_music_album(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _stringify_tag_value(value.get("name") or value.get("title"))
+    return _stringify_tag_value(value)
+
+
 def _qq_music_artists(value: Any) -> list[str]:
     if isinstance(value, dict):
         return split_artists([value.get("name")])
@@ -822,6 +1089,18 @@ def _qq_music_album(value: Any) -> str | None:
 
 def _qq_music_candidate_score(metadata: AudioMetadata, candidate: QQMusicCandidate) -> int:
     score = _text_match_score(metadata.title, candidate.title) * 100
+    for artist in metadata.artists:
+        score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 60
+    score += _text_match_score(metadata.album, candidate.album) * 30
+    return score
+
+
+def _ncm_music_candidate_score(metadata: AudioMetadata, candidate: NCMusicCandidate) -> int:
+    title_score = max(
+        [_text_match_score(metadata.title, candidate.title)]
+        + [_text_match_score(metadata.title, alias) for alias in candidate.aliases]
+    )
+    score = title_score * 100
     for artist in metadata.artists:
         score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 60
     score += _text_match_score(metadata.album, candidate.album) * 30
@@ -869,6 +1148,14 @@ def _format_qq_music_candidate(candidate: QQMusicCandidate) -> str:
     artists = "/".join(candidate.artists) or "-"
     album = candidate.album or "-"
     return f"{title}{subtitle} - {artists} - {album} [{candidate.song_id}, {candidate.mid}]"
+
+
+def _format_ncm_music_candidate(candidate: NCMusicCandidate) -> str:
+    title = candidate.title or "-"
+    aliases = f" ({'; '.join(candidate.aliases)})" if candidate.aliases else ""
+    artists = "/".join(candidate.artists) or "-"
+    album = candidate.album or "-"
+    return f"{title}{aliases} - {artists} - {album} [{candidate.song_id}]"
 
 
 def _add_unique_value(values: dict[str, list[str]], key: str, value: str | None) -> None:

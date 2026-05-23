@@ -17,6 +17,7 @@ python fill_ttml_metadata.py --help
 <amll:meta key="artists" value="..."/>
 <amll:meta key="album" value="..."/>
 <amll:meta key="qqMusicId" value="..."/>
+<amll:meta key="ncmMusicId" value="..."/>
 <amll:meta key="isrc" value="..."/>
 <amll:meta key="appleMusicId" value="..."/>
 ```
@@ -26,16 +27,17 @@ python fill_ttml_metadata.py --help
 - 追加缺失的元数据值，不覆盖已有真实值，重复值会跳过。
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
-- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐 ID。
+- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐和网易云音乐 ID。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
 - 会用歌名搜索 QQ 音乐，按歌名、歌手、专辑匹配候选，并把选中结果的 songid 和 mid 分别写入 `qqMusicId`。
+- 会同时用歌名搜索网易云音乐，按歌名、歌手、专辑匹配候选，并把选中结果的歌曲 ID 写入 `ncmMusicId`。
 
 ## 环境要求
 
 - Python 3.10 或更新版本。
-- 网络访问 Apple Music 和 QQ 音乐，用于查找歌曲 ID。
+- 网络访问 Apple Music、QQ 音乐和网易云音乐公开 API，用于查找歌曲 ID。
 - Python 依赖：`mutagen`。
 
 安装依赖：
@@ -101,7 +103,7 @@ PowerShell 里运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
 ```
 
-交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会再次汇总 QQ 音乐最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 `mutagen`，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 QQ 音乐和网易云音乐最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 `mutagen`，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
 
 ## 单首文件处理
 
@@ -122,7 +124,7 @@ python fill_ttml_metadata.py `
   --dry-run
 ```
 
-如果没有音频，也可以只指定 TTML。脚本会读取 TTML 已有的 `musicName`、`artists`、`album`，然后复用同一套 QQ 音乐搜索和候选确认流程：
+如果没有音频，也可以只指定 TTML。脚本会读取 TTML 已有的 `musicName`、`artists`、`album`，然后复用同一套 QQ 音乐和网易云音乐搜索及候选确认流程：
 
 ```powershell
 python fill_ttml_metadata.py `
@@ -208,6 +210,22 @@ QQ 音乐查找只使用歌名作为搜索关键词。音频模式下歌名来�
 
 dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先汇总所有最佳候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
 
+### 网易云音乐元数据查找
+
+网易云音乐查找只使用歌名作为搜索关键词。音频模式下歌名来自音频标签；TTML-only 模式下歌名来自已有 `amll:meta key="musicName"`。
+
+脚本会并发请求以下公开 API，优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API：
+
+```text
+https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}
+https://neteasecloudmusicapi-main-api.vercel.app/cloudsearch?keywords={歌名}
+https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}
+```
+
+脚本读取 `result.songs` 候选，解析歌曲 ID、歌名、别名、歌手和专辑。匹配权重与 QQ 音乐一致：歌名最高，歌手其次，专辑再次。选中候选后只把网易云歌曲 ID 写入 `ncmMusicId`；候选里的新歌名、别名、歌手和专辑会按现有去重规则追加到对应元数据。
+
+dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时会在 QQ 音乐确认之后单独确认网易云候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
+
 ## 写入结构
 
 脚本只会修改已有 `<metadata>...</metadata>` 内部的目标 `amll:meta` 节点，不会重排或重写 TTML 其它内容，也不会补充 `<head>` 或 `<metadata>`。如果根节点缺少 AMLL 命名空间声明，脚本会在根 `<tt>` 上补充 `xmlns:amll="http://www.example.com/ns/amll"`。
@@ -223,6 +241,7 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
   <amll:meta key="artists" value="..."/>
   <amll:meta key="album" value="..."/>
   <amll:meta key="qqMusicId" value="..."/>
+  <amll:meta key="ncmMusicId" value="..."/>
   <amll:meta key="appleMusicId" value="..."/>
   <amll:meta key="isrc" value="..."/>
   <iTunesMetadata>...</iTunesMetadata>
@@ -242,10 +261,13 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
   appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
   qqMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [123456, 001abc]
   qqMusicId: 123456, 001abc
+  ncmMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [456789]
+  ncmMusicId: 456789
   added: musicName = Disease (Apple Music Live), Disease - Apple Music Live
   added: artists = Lady Gaga
   added: album = Apple Music Live: MAYHEM Requiem, Apple Music Live: MAYHEM
   added: qqMusicId = 123456, 001abc
+  added: ncmMusicId = 456789
   added: appleMusicId = 6768201779, 6768201780
   added: isrc = USUM72603828
 ```
@@ -259,10 +281,13 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
   appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
   qqMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [123456, 001abc]
   qqMusicId: 123456, 001abc
+  ncmMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [456789]
+  ncmMusicId: 456789
   skipped: musicName = Disease (Apple Music Live)
   skipped: artists = Lady Gaga
   skipped: album = Apple Music Live: MAYHEM Requiem
   skipped: qqMusicId = 123456, 001abc
+  skipped: ncmMusicId = 456789
   skipped: appleMusicId = 6768201779, 6768201780
   skipped: isrc = USUM72603828
 ```
@@ -288,7 +313,7 @@ song.m4a
 song.ttml
 ```
 
-下面这组不会自动匹配音频，但会进入 TTML-only 模式；如果 TTML 里已有有效 `musicName`，脚本仍会尝试查找 QQ 音乐 ID：
+下面这组不会自动匹配音频，但会进入 TTML-only 模式；如果 TTML 里已有有效 `musicName`，脚本仍会尝试查找 QQ 音乐和网易云音乐 ID：
 
 ```text
 song-audio.flac
@@ -314,6 +339,15 @@ song-lyrics.ttml
 - QQ 音乐搜索结果没有同时带 songid 和 mid 的候选。
 - 歌名、歌手或专辑标签太不一致，最佳候选需要在真实写入时输入 `N` 手动选择。
 - 当前网络无法访问 QQ 音乐搜索接口。
+
+### 找不到网易云音乐 ID
+
+常见原因：
+
+- 音频或 TTML 缺少歌名，无法发起网易云音乐搜索。
+- 三个公开网易云 API 都不可用、超时或返回结构变化。
+- 网易云音乐搜索结果没有带歌曲 ID 的候选。
+- 歌名、歌手或专辑标签太不一致，最佳候选需要在真实写入时输入 `N` 手动选择。
 
 ### 不想覆盖原文件
 
