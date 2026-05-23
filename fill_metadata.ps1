@@ -56,8 +56,6 @@ try {
         Exit-WithCode 1
     }
 
-    Write-Host ""
-    Write-Host "[DRY-RUN] Previewing changes. No files will be modified."
     & python $pythonScript $resolvedTarget.Path --dry-run
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
