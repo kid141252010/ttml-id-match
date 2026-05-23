@@ -58,7 +58,7 @@ try {
 
     Write-Host ""
     Write-Host "[DRY-RUN] Previewing changes. No files will be modified."
-    & python $pythonScript $resolvedTarget.Path --dry-run --non-interactive
+    & python $pythonScript $resolvedTarget.Path --dry-run
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
         Write-Host "[ERROR] dry-run failed. Fix the errors above and try again."
@@ -70,7 +70,7 @@ try {
     if ($confirm -ieq "Y") {
         Write-Host ""
         Write-Host "[WRITE] Updating TTML files. The Python script will create .bak backups."
-        & python $pythonScript $resolvedTarget.Path --non-interactive
+        & python $pythonScript $resolvedTarget.Path
         if ($LASTEXITCODE -ne 0) {
             Write-Host ""
             Write-Host "[ERROR] write failed. Fix the errors above and try again."

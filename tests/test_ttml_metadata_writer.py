@@ -1,12 +1,17 @@
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO, TextIOWrapper
 from pathlib import Path
 
 from fill_ttml_metadata import (
     AudioMetadata,
-    choose_apple_music_id,
+    DEFAULT_STORES,
+    collect_apple_music_metadata,
+    main,
     update_ttml_metadata,
     _flatten_tags,
+    _safe_print,
 )
 
 
@@ -101,7 +106,7 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             self.assertEqual(after.count('key="musicName"'), 1)
             self.assertEqual(result.replaced["musicName"], ["Real Song"])
 
-    def test_existing_real_value_is_skipped_without_rewriting_file(self) -> None:
+    def test_existing_real_value_appends_new_unique_values(self) -> None:
         text = REFERENCE_STYLE_TTML.replace(
             "<iTunesMetadata>",
             '<amll:meta key="musicName" value="Existing"/>'
@@ -112,13 +117,18 @@ class TtmlMetadataWriterTests(unittest.TestCase):
 
             result = update_ttml_metadata(
                 path,
-                {"musicName": ["New"]},
+                {"musicName": ["Existing", "New"]},
                 dry_run=False,
             )
 
-            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            after = path.read_text(encoding="utf-8")
+            self.assertIn('<amll:meta key="musicName" value="Existing"/>', after)
+            self.assertIn('<amll:meta key="musicName" value="New"/>', after)
+            self.assertEqual(after.count('key="musicName" value="Existing"'), 1)
+            self.assertEqual(after.count('key="musicName" value="New"'), 1)
+            self.assertEqual(result.added["musicName"], ["New"])
             self.assertEqual(result.skipped["musicName"], ["Existing"])
-            self.assertIsNone(result.backup_path)
+            self.assertIsNotNone(result.backup_path)
 
     def test_missing_metadata_raises_without_creating_nodes(self) -> None:
         text = (
@@ -188,37 +198,106 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         self.assertEqual(flattened["itunesalbumtitleid"], ["152678183"])
         self.assertEqual(flattened["isrc"], ["TWA472368001"])
 
-    def test_catalog_id_from_cnid_is_used_without_album_lookup(self) -> None:
-        class NoLookupClient:
-            def fetch_album_tracks(self, store, album_id):
-                raise AssertionError("catalog id should not require album lookup")
+    def test_collects_metadata_from_all_default_storefronts_without_stopping_at_first_match(self) -> None:
+        class RecordingClient:
+            def __init__(self):
+                self.calls = []
 
-        match = choose_apple_music_id(
-            AudioMetadata(catalog_id="1691701944", playlist_id="1691701942"),
-            NoLookupClient(),
-            ["cn", "us"],
-            interactive=False,
+            def fetch_album_tracks(self, store, album_id):
+                self.calls.append((store, album_id))
+                names = {
+                    "cn": ("Song", "Artist", "Album", "111"),
+                    "tw": ("Song", "Artist", "Album", "111"),
+                    "jp": ("曲", "Artist JP", "アルバム", "222"),
+                    "kr": ("노래", "Artist KR", "앨범", "333"),
+                    "us": ("Song", "Artist", "Album", "444"),
+                }
+                name, artist, album, track_id = names[store]
+                return [
+                    {
+                        "id": track_id,
+                        "name": name,
+                        "artistName": artist,
+                        "albumName": album,
+                        "isrc": "TST000000001",
+                        "discNumber": 1,
+                        "trackNumber": 2,
+                        "durationInMillis": 180000,
+                    }
+                ]
+
+        client = RecordingClient()
+
+        result = collect_apple_music_metadata(
+            AudioMetadata(
+                title="Song",
+                playlist_id="999",
+                track_number=2,
+                disc_number=1,
+                duration_seconds=180,
+            ),
+            client,
         )
 
-        self.assertEqual(match.value, "1691701944")
-        self.assertEqual(match.source, "catalog")
-        self.assertEqual(match.errors, [])
+        self.assertEqual(client.calls, [(store, "999") for store in DEFAULT_STORES])
+        self.assertEqual(result.values["musicName"], ["Song", "曲", "노래"])
+        self.assertEqual(result.values["artists"], ["Artist", "Artist JP", "Artist KR"])
+        self.assertEqual(result.values["album"], ["Album", "アルバム", "앨범"])
+        self.assertEqual(result.values["appleMusicId"], ["111", "222", "333", "444"])
+        self.assertEqual(result.values["isrc"], ["TST000000001"])
+        self.assertEqual(
+            result.sources,
+            [
+                "album:cn:track",
+                "album:tw:track",
+                "album:jp:track",
+                "album:kr:track",
+                "album:us:track",
+            ],
+        )
+
+    def test_catalog_id_without_playlist_only_writes_existing_song_id(self) -> None:
+        class NoLookupClient:
+            def fetch_album_tracks(self, store, album_id):
+                raise AssertionError("catalog-only metadata should not require album lookup")
+
+        result = collect_apple_music_metadata(
+            AudioMetadata(catalog_id="1691701944"),
+            NoLookupClient(),
+        )
+
+        self.assertEqual(result.values, {"appleMusicId": ["1691701944"]})
+        self.assertEqual(result.sources, ["catalog"])
+        self.assertEqual(result.errors, [])
 
     def test_missing_catalog_and_playlist_reports_clear_reason(self) -> None:
         class NoLookupClient:
             def fetch_album_tracks(self, store, album_id):
                 raise AssertionError("missing ids should not require album lookup")
 
-        match = choose_apple_music_id(
+        result = collect_apple_music_metadata(
             AudioMetadata(),
             NoLookupClient(),
-            ["cn", "us"],
-            interactive=False,
         )
 
-        self.assertIsNone(match.value)
-        self.assertEqual(match.source, "missing-apple-music-id")
-        self.assertEqual(match.errors, ["音频中未读取到 Apple Music 歌曲 ID 或专辑 ID"])
+        self.assertEqual(result.values, {})
+        self.assertEqual(result.sources, ["missing-apple-music-id"])
+        self.assertEqual(result.errors, ["音频中未读取到 Apple Music 歌曲 ID 或专辑 ID"])
+
+    def test_legacy_storefront_cli_options_are_removed(self) -> None:
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                main(["--store", "jp", "--dry-run"])
+
+        self.assertNotEqual(raised.exception.code, 0)
+
+    def test_printing_non_gbk_metadata_does_not_raise_on_windows_console_encoding(self) -> None:
+        stream = TextIOWrapper(tempfile.TemporaryFile(), encoding="gbk")
+
+        try:
+            _safe_print("lookup warning: 앨범", file=stream)
+        finally:
+            stream.close()
 
 
 if __name__ == "__main__":

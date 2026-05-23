@@ -22,13 +22,13 @@ python fill_ttml_metadata.py --help
 
 默认行为：
 
-- 只补缺项，不覆盖已有真实值。
+- 追加缺失的元数据值，不覆盖已有真实值，重复值会跳过。
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
 - 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
-- 没有有效歌曲 ID 时，会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID 查找曲目 ID。
+- 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
 
 ## 环境要求
 
@@ -68,16 +68,10 @@ example\2. Disease (Apple Music Live).ttml.bak
 先 dry-run 看脚本准备写什么：
 
 ```powershell
-python fill_ttml_metadata.py example --dry-run --non-interactive
+python fill_ttml_metadata.py example --dry-run
 ```
 
 确认输出无误后再真实写入：
-
-```powershell
-python fill_ttml_metadata.py example --non-interactive
-```
-
-如果你希望在 `cn` 和 `us` 都找不到时手动输入区域名，不要加 `--non-interactive`：
 
 ```powershell
 python fill_ttml_metadata.py example
@@ -123,8 +117,7 @@ python fill_ttml_metadata.py `
 python fill_ttml_metadata.py `
   --audio "example\2. Disease (Apple Music Live).flac" `
   --ttml "example\2. Disease (Apple Music Live).ttml" `
-  --dry-run `
-  --non-interactive
+  --dry-run
 ```
 
 ## Apple Music 区域
@@ -132,26 +125,12 @@ python fill_ttml_metadata.py `
 默认区域查找顺序：
 
 1. `cn`
-2. `us`
-3. 如果不是 `--non-interactive`，提示用户输入其他区域名。
+2. `tw`
+3. `jp`
+4. `kr`
+5. `us`
 
-指定首选区域：
-
-```powershell
-python fill_ttml_metadata.py example --store hk
-```
-
-指定首选区域和兜底区域：
-
-```powershell
-python fill_ttml_metadata.py example --store cn --fallback-store jp
-```
-
-如果你在自动化脚本或 CI 里运行，建议加 `--non-interactive`，避免命令卡在区域输入：
-
-```powershell
-python fill_ttml_metadata.py example --non-interactive
-```
+脚本固定查询这五个区域，不再提供单区域、兜底区域或交互输入区域参数。
 
 ## 匹配规则
 
@@ -187,11 +166,11 @@ A, B, C & D
 
 单个乐队名如 `Florence & The Machine` 不会因为 `&` 被拆开。
 
-### Apple Music ID 查找
+### Apple Music 元数据查找
 
-优先使用音频标签中的 `ITUNESCATALOGID`，但只有看起来像有效歌曲 ID 时才直接采用。
+音频标签中的 `ITUNESCATALOGID` 只有看起来像有效歌曲 ID 时才直接写入。
 
-如果没有有效歌曲 ID，则使用 `ITUNESPLAYLISTID` 作为专辑 ID：
+多地区元数据查找使用 `ITUNESPLAYLISTID` 作为专辑 ID：
 
 ```text
 https://music.apple.com/{store}/album/{ITUNESPLAYLISTID}
@@ -203,7 +182,7 @@ https://music.apple.com/{store}/album/{ITUNESPLAYLISTID}
 https://amp-api.music.apple.com/v1/catalog/{store}/albums/{albumId}
 ```
 
-匹配曲目时优先使用碟号和曲目号，再校验曲名；缺少曲目号时会使用规范化曲名和时长辅助匹配。
+脚本会在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域分别读取专辑曲目。匹配曲目时优先使用碟号和曲目号；缺少曲目号时会使用规范化曲名和时长辅助匹配。
 
 示例验证：
 
@@ -231,7 +210,7 @@ Disease (Apple Music Live) -> 6768201779
 </metadata>
 ```
 
-如果 TTML 已经有人工整理过的多语言歌名、艺术家别名或其他真实值，默认会保留，不会替换。
+如果 TTML 已经有人工整理过的多语言歌名、艺术家别名或其他真实值，默认会保留，不会替换。新查到且尚未出现过的值会追加到同一个 key 下。
 
 ## 输出说明
 
@@ -240,22 +219,26 @@ Disease (Apple Music Live) -> 6768201779
 ```text
 [dry-run] 2. Disease (Apple Music Live).ttml
   audio: 2. Disease (Apple Music Live).flac
-  appleMusicId: 6768201779 (album:cn:track)
-  added: musicName = Disease (Apple Music Live)
+  appleMusicId: 6768201779, 6768201780
+  appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
+  added: musicName = Disease (Apple Music Live), Disease - Apple Music Live
   added: artists = Lady Gaga
-  added: album = Apple Music Live: MAYHEM Requiem
-  added: appleMusicId = 6768201779
+  added: album = Apple Music Live: MAYHEM Requiem, Apple Music Live: MAYHEM
+  added: appleMusicId = 6768201779, 6768201780
   added: isrc = USUM72603828
 ```
 
-如果文件已经填过真实值，再运行会显示 `unchanged` 和 `skipped`：
+如果文件已经填过所有真实值，再运行会显示 `unchanged` 和 `skipped`：
 
 ```text
 [unchanged] 2. Disease (Apple Music Live).ttml
+  audio: 2. Disease (Apple Music Live).flac
+  appleMusicId: 6768201779, 6768201780
+  appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
   skipped: musicName = Disease (Apple Music Live)
   skipped: artists = Lady Gaga
   skipped: album = Apple Music Live: MAYHEM Requiem
-  skipped: appleMusicId = 6768201779
+  skipped: appleMusicId = 6768201779, 6768201780
   skipped: isrc = USUM72603828
 ```
 
@@ -294,15 +277,9 @@ song-lyrics.ttml
 常见原因：
 
 - 音频缺少 `ITUNESPLAYLISTID`。
-- 默认区域 `cn` 和兜底区域 `us` 都没有该专辑。
+- 固定查询的 `cn`、`tw`、`jp`、`kr`、`us` 区域都没有该专辑。
 - 专辑页存在，但曲名或曲目号和音频标签不一致。
 - 当前网络无法访问 Apple Music。
-
-可以尝试指定区域：
-
-```powershell
-python fill_ttml_metadata.py example --store jp --fallback-store us
-```
 
 ### 不想覆盖原文件
 
@@ -325,7 +302,7 @@ python -B -m unittest discover -s tests
 运行示例 dry-run：
 
 ```powershell
-python -B fill_ttml_metadata.py example --dry-run --non-interactive
+python -B fill_ttml_metadata.py example --dry-run
 ```
 
 ## 许可协议

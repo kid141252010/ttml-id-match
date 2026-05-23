@@ -9,7 +9,6 @@ import json
 import re
 import shutil
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -19,8 +18,7 @@ from typing import Any, Iterable, Protocol
 
 AMLL_NS = "http://www.example.com/ns/amll"
 
-DEFAULT_STORE = "cn"
-DEFAULT_FALLBACK_STORE = "us"
+DEFAULT_STORES = ["cn", "tw", "jp", "kr", "us"]
 TARGET_KEY_ORDER = ["musicName", "artists", "album", "appleMusicId", "isrc"]
 AUDIO_EXTENSIONS = {
     ".aac",
@@ -55,9 +53,15 @@ class AudioMetadata:
 
 
 @dataclass(frozen=True)
-class AppleMusicMatch:
-    value: str | None
+class AppleMusicTrackMatch:
+    track: dict[str, Any] | None
     source: str
+
+
+@dataclass
+class AppleMusicMetadataResult:
+    values: dict[str, list[str]] = field(default_factory=dict)
+    sources: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -136,8 +140,9 @@ class AppleMusicClient:
         )
         payload = json.loads(data)
         album = payload["data"][0]
+        album_name = album.get("attributes", {}).get("name")
         tracks = album.get("relationships", {}).get("tracks", {}).get("data", [])
-        return [self._track_from_amp_api_track(track) for track in tracks if track.get("type") == "songs"]
+        return [self._track_from_amp_api_track(track, album_name) for track in tracks if track.get("type") == "songs"]
 
     def _fetch_album_tracks_from_json_ld(self, store: str, album_id: str) -> list[dict[str, Any]]:
         page = self._get_album_page(store, album_id)
@@ -205,12 +210,13 @@ class AppleMusicClient:
             return response.read().decode("utf-8", "ignore")
 
     @staticmethod
-    def _track_from_amp_api_track(track: dict[str, Any]) -> dict[str, Any]:
+    def _track_from_amp_api_track(track: dict[str, Any], album_name: Any = None) -> dict[str, Any]:
         attributes = track.get("attributes", {})
         return {
             "id": str(track.get("id") or ""),
             "name": attributes.get("name"),
             "artistName": attributes.get("artistName"),
+            "albumName": album_name,
             "isrc": attributes.get("isrc"),
             "discNumber": attributes.get("discNumber"),
             "trackNumber": attributes.get("trackNumber"),
@@ -266,45 +272,35 @@ def split_artists(values: Iterable[Any]) -> list[str]:
     return artists
 
 
-def choose_apple_music_id(
+def collect_apple_music_metadata(
     metadata: AudioMetadata,
     client: AppleMusicClientProtocol,
-    stores: list[str],
-    interactive: bool,
-) -> AppleMusicMatch:
+    stores: list[str] | None = None,
+) -> AppleMusicMetadataResult:
+    result = AppleMusicMetadataResult()
     if is_valid_apple_music_song_id(metadata.catalog_id):
-        return AppleMusicMatch(str(metadata.catalog_id), "catalog")
+        _add_unique_value(result.values, "appleMusicId", str(metadata.catalog_id))
+        result.sources.append("catalog")
 
     if not metadata.playlist_id:
-        return AppleMusicMatch(
-            None,
-            "missing-apple-music-id",
-            ["音频中未读取到 Apple Music 歌曲 ID 或专辑 ID"],
-        )
+        if not result.values:
+            result.sources.append("missing-apple-music-id")
+            result.errors.append("音频中未读取到 Apple Music 歌曲 ID 或专辑 ID")
+        return result
 
-    errors: list[str] = []
     tried_stores: set[str] = set()
-    for store in stores:
+    for store in stores or DEFAULT_STORES:
         if not store or store in tried_stores:
             continue
         tried_stores.add(store)
-        result = _match_album_store(metadata, client, store, metadata.playlist_id, errors)
-        if result.value:
-            return result
+        match = _match_album_store(metadata, client, store, metadata.playlist_id, result.errors)
+        result.sources.append(match.source)
+        if match.track:
+            _merge_track_metadata(result.values, match.track)
 
-    while interactive:
-        store = input("cn/us 均未匹配到歌曲，请输入 Apple Music 区域名（直接回车跳过）：").strip().lower()
-        if not store:
-            break
-        if store in tried_stores:
-            print(f"已尝试过 {store}，跳过。", file=sys.stderr)
-            continue
-        tried_stores.add(store)
-        result = _match_album_store(metadata, client, store, metadata.playlist_id, errors)
-        if result.value:
-            return result
-
-    return AppleMusicMatch(None, "not-found", errors)
+    if not result.values:
+        result.sources.append("not-found")
+    return result
 
 
 def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool) -> TtmlUpdateResult:
@@ -330,18 +326,23 @@ def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool
     return result
 
 
-def values_from_metadata(metadata: AudioMetadata, apple_music_id: str | None) -> dict[str, list[str]]:
+def values_from_metadata(
+    metadata: AudioMetadata,
+    apple_music_values: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
     values: dict[str, list[str]] = {}
     if metadata.title:
-        values["musicName"] = [metadata.title]
+        _add_unique_value(values, "musicName", metadata.title)
     if metadata.artists:
-        values["artists"] = metadata.artists
+        for artist in metadata.artists:
+            _add_unique_value(values, "artists", artist)
     if metadata.album:
-        values["album"] = [metadata.album]
-    if apple_music_id:
-        values["appleMusicId"] = [apple_music_id]
+        _add_unique_value(values, "album", metadata.album)
+    for key, proposed_values in (apple_music_values or {}).items():
+        for value in proposed_values:
+            _add_unique_value(values, key, value)
     if metadata.isrc:
-        values["isrc"] = [metadata.isrc]
+        _add_unique_value(values, "isrc", metadata.isrc)
     return values
 
 
@@ -376,9 +377,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--audio", type=Path, help="single audio file")
     parser.add_argument("--ttml", type=Path, help="single TTML file")
     parser.add_argument("--dry-run", action="store_true", help="show changes without writing files")
-    parser.add_argument("--store", default=DEFAULT_STORE, help="first Apple Music storefront to try")
-    parser.add_argument("--fallback-store", default=DEFAULT_FALLBACK_STORE, help="fallback Apple Music storefront")
-    parser.add_argument("--non-interactive", action="store_true", help="do not prompt for extra storefronts")
     args = parser.parse_args(argv)
 
     if bool(args.audio) != bool(args.ttml):
@@ -394,10 +392,9 @@ def main(argv: list[str] | None = None) -> int:
         pairs, warnings = find_directory_pairs(directory)
 
     for warning in warnings:
-        print(f"[skip] {warning}")
+        _safe_print(f"[skip] {warning}")
 
     client = AppleMusicClient()
-    stores = [args.store.lower(), args.fallback_store.lower()]
     failures = 0
     for audio_path, ttml_path in pairs:
         try:
@@ -405,13 +402,11 @@ def main(argv: list[str] | None = None) -> int:
                 audio_path,
                 ttml_path,
                 client,
-                stores,
-                interactive=not args.non_interactive,
                 dry_run=args.dry_run,
             )
         except Exception as exc:
             failures += 1
-            print(f"[error] {ttml_path.name}: {exc}", file=sys.stderr)
+            _safe_print(f"[error] {ttml_path.name}: {exc}", file=sys.stderr)
 
     return 1 if failures else 0
 
@@ -420,35 +415,63 @@ def _process_pair(
     audio_path: Path,
     ttml_path: Path,
     client: AppleMusicClientProtocol,
-    stores: list[str],
-    interactive: bool,
     dry_run: bool,
 ) -> None:
     metadata = read_audio_metadata(audio_path)
-    match = choose_apple_music_id(metadata, client, stores, interactive)
-    values = values_from_metadata(metadata, match.value)
+    apple_music_metadata = collect_apple_music_metadata(metadata, client)
+    values = values_from_metadata(metadata, apple_music_metadata.values)
     result = update_ttml_metadata(ttml_path, values, dry_run=dry_run)
 
     status = "dry-run" if dry_run else "updated"
     if not result.changed:
         status = "unchanged"
-    print(f"[{status}] {ttml_path.name}")
-    print(f"  audio: {audio_path.name}")
-    print(f"  appleMusicId: {match.value or '-'} ({match.source})")
-    if match.errors:
-        for error in match.errors:
-            print(f"  lookup warning: {error}")
+    _safe_print(f"[{status}] {ttml_path.name}")
+    _safe_print(f"  audio: {audio_path.name}")
+    _safe_print(f"  appleMusicId: {', '.join(apple_music_metadata.values.get('appleMusicId', [])) or '-'}")
+    _safe_print(f"  appleMusicSources: {', '.join(apple_music_metadata.sources) or '-'}")
+    if apple_music_metadata.errors:
+        for error in apple_music_metadata.errors:
+            _safe_print(f"  lookup warning: {error}")
     _print_change_group("added", result.added)
     _print_change_group("replaced", result.replaced)
     _print_change_group("skipped", result.skipped)
     if result.backup_path:
-        print(f"  backup: {result.backup_path}")
+        _safe_print(f"  backup: {result.backup_path}")
 
 
 def _print_change_group(label: str, changes: dict[str, list[str]]) -> None:
     for key, values in changes.items():
         joined = ", ".join(values)
-        print(f"  {label}: {key} = {joined}")
+        _safe_print(f"  {label}: {key} = {joined}")
+
+
+def _safe_print(*values: Any, file: Any = None, **kwargs: Any) -> None:
+    stream = file or sys.stdout
+    try:
+        print(*values, file=stream, **kwargs)
+    except UnicodeEncodeError:
+        text = kwargs.get("sep", " ").join(str(value) for value in values)
+        end = kwargs.get("end", "\n")
+        encoded = text.encode(getattr(stream, "encoding", None) or "utf-8", "backslashreplace").decode(
+            getattr(stream, "encoding", None) or "utf-8"
+        )
+        stream.write(encoded + end)
+
+
+def _merge_track_metadata(values: dict[str, list[str]], track: dict[str, Any]) -> None:
+    _add_unique_value(values, "musicName", _stringify_tag_value(track.get("name")))
+    for artist in split_artists([track.get("artistName")]):
+        _add_unique_value(values, "artists", artist)
+    _add_unique_value(values, "album", _stringify_tag_value(track.get("albumName")))
+    _add_unique_value(values, "appleMusicId", _track_id(track))
+    _add_unique_value(values, "isrc", _stringify_tag_value(track.get("isrc")))
+
+
+def _add_unique_value(values: dict[str, list[str]], key: str, value: str | None) -> None:
+    if not value:
+        return
+    if value not in values.setdefault(key, []):
+        values[key].append(value)
 
 
 def _find_metadata_inner_bounds(text: str) -> tuple[int, int]:
@@ -523,32 +546,42 @@ def _apply_meta_values(
         if not _is_placeholder(_xml_attr_value(tag, "value"))
     ]
     placeholders = [tag for tag in existing if _is_placeholder(_xml_attr_value(tag, "value"))]
-
-    if real_values:
-        result.skipped[key] = real_values
-        return metadata
+    unique_proposed_values: list[str] = []
+    for value in proposed_values:
+        if value not in unique_proposed_values:
+            unique_proposed_values.append(value)
 
     if placeholders:
         replacements: list[tuple[int, int, str]] = []
-        for tag, value in zip(placeholders, proposed_values):
+        replacement_values = [value for value in unique_proposed_values if value not in real_values]
+        for tag, value in zip(placeholders, replacement_values):
             value_attr = tag.attrs.get("value")
             if value_attr:
                 replacements.append((value_attr.value_start, value_attr.value_end, _escape_xml_attr(value)))
             else:
                 replacements.append((tag.start, tag.end, _make_meta_node(amll_prefix, key, value)))
-        consumed_count = min(len(placeholders), len(proposed_values))
+        consumed_count = min(len(placeholders), len(replacement_values))
         for extra in placeholders[consumed_count:]:
             replacements.append((extra.start, extra.end, ""))
         metadata = _apply_text_replacements(metadata, replacements)
 
-        remaining = proposed_values[consumed_count:]
-        result.replaced[key] = proposed_values
+        remaining = replacement_values[consumed_count:]
+        if replacement_values:
+            result.replaced[key] = replacement_values
+        if real_values:
+            result.skipped[key] = real_values
         if remaining:
             metadata = _insert_meta_values(metadata, amll_prefix, key, remaining)
         return metadata
 
-    metadata = _insert_meta_values(metadata, amll_prefix, key, proposed_values)
-    result.added[key] = proposed_values
+    missing_values = [value for value in unique_proposed_values if value not in real_values]
+    if real_values:
+        result.skipped[key] = real_values
+    if not missing_values:
+        return metadata
+
+    metadata = _insert_meta_values(metadata, amll_prefix, key, missing_values)
+    result.added[key] = missing_values
     return metadata
 
 
@@ -625,26 +658,26 @@ def _match_album_store(
     store: str,
     album_id: str,
     errors: list[str],
-) -> AppleMusicMatch:
+) -> AppleMusicTrackMatch:
     try:
         tracks = client.fetch_album_tracks(store, album_id)
     except Exception as exc:
         errors.append(f"{store}: {exc}")
-        return AppleMusicMatch(None, f"album:{store}:error", errors)
+        return AppleMusicTrackMatch(None, f"album:{store}:error")
 
     track_match = _match_by_track_number(metadata, tracks)
     if track_match:
-        return AppleMusicMatch(track_match, f"album:{store}:track", errors)
+        return AppleMusicTrackMatch(track_match, f"album:{store}:track")
 
     title_match = _match_by_title(metadata, tracks)
     if title_match:
-        return AppleMusicMatch(title_match, f"album:{store}:title", errors)
+        return AppleMusicTrackMatch(title_match, f"album:{store}:title")
 
     errors.append(f"{store}: no matching track in album {album_id}")
-    return AppleMusicMatch(None, f"album:{store}:not-found", errors)
+    return AppleMusicTrackMatch(None, f"album:{store}:not-found")
 
 
-def _match_by_track_number(metadata: AudioMetadata, tracks: list[dict[str, Any]]) -> str | None:
+def _match_by_track_number(metadata: AudioMetadata, tracks: list[dict[str, Any]]) -> dict[str, Any] | None:
     if metadata.track_number is None:
         return None
     candidates = []
@@ -657,24 +690,24 @@ def _match_by_track_number(metadata: AudioMetadata, tracks: list[dict[str, Any]]
 
     if not candidates:
         return None
-    if not metadata.title and len(candidates) == 1:
-        return _track_id(candidates[0])
+    if len(candidates) == 1:
+        return candidates[0]
 
     normalized_title = _normalize_title(metadata.title)
     for candidate in candidates:
         if _normalize_title(candidate.get("name")) == normalized_title:
-            return _track_id(candidate)
+            return candidate
     return None
 
 
-def _match_by_title(metadata: AudioMetadata, tracks: list[dict[str, Any]]) -> str | None:
+def _match_by_title(metadata: AudioMetadata, tracks: list[dict[str, Any]]) -> dict[str, Any] | None:
     normalized_title = _normalize_title(metadata.title)
     if not normalized_title:
         return None
 
     candidates = [track for track in tracks if _normalize_title(track.get("name")) == normalized_title]
     if len(candidates) == 1:
-        return _track_id(candidates[0])
+        return candidates[0]
 
     if metadata.duration_seconds is not None:
         timed = [
@@ -684,7 +717,7 @@ def _match_by_title(metadata: AudioMetadata, tracks: list[dict[str, Any]]) -> st
             and _duration_close(metadata.duration_seconds, track.get("durationInMillis"))
         ]
         if len(timed) == 1:
-            return _track_id(timed[0])
+            return timed[0]
     return None
 
 
