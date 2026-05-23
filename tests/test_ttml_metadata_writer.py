@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO, TextIOWrapper
@@ -9,12 +10,17 @@ from fill_ttml_metadata import (
     AudioMetadata,
     AppleMusicMetadataResult,
     DEFAULT_STORES,
+    NCMusicCandidate,
+    NCMusicClient,
+    NCMusicSearchResult,
     PairMetadata,
     QQMusicCandidate,
     QQMusicClient,
     QQMusicSearchResult,
     collect_apple_music_metadata,
+    collect_ncm_music_metadata,
     collect_qq_music_metadata,
+    confirm_ncm_music_candidates,
     confirm_qq_music_candidates,
     find_directory_work_items,
     main,
@@ -24,6 +30,7 @@ from fill_ttml_metadata import (
     WorkItem,
     _flatten_tags,
     _prepare_work_item,
+    _parse_ncm_music_candidates,
     _parse_qq_music_candidates,
     _safe_print,
 )
@@ -538,6 +545,191 @@ class QQMusicMetadataTests(unittest.TestCase):
         self.assertEqual(result.selected, result.candidates[2])
 
 
+class NCMusicMetadataTests(unittest.TestCase):
+    def test_parses_ncm_music_candidates_from_cloudsearch_songs_and_requires_id(self) -> None:
+        payload = {
+            "result": {
+                "songs": [
+                    {
+                        "id": 224116257,
+                        "name": "玫瑰少年",
+                        "alia": ["Live"],
+                        "tns": ["Rose Boy"],
+                        "ar": [{"name": "蔡依林"}, {"name": "五月天"}],
+                        "al": {"name": "UGLY BEAUTY"},
+                    },
+                    {
+                        "name": "missing id",
+                        "ar": [{"name": "Nobody"}],
+                    },
+                    {
+                        "id": "415233914",
+                        "title": "玫瑰少年 - From THE FIRST TAKE",
+                        "alias": ["THE FIRST TAKE"],
+                        "artists": [{"name": "蔡依林"}],
+                        "album": {"title": "玫瑰少年 - From THE FIRST TAKE"},
+                    },
+                ]
+            }
+        }
+
+        candidates = _parse_ncm_music_candidates(payload)
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(candidates[0].song_id, "224116257")
+        self.assertEqual(candidates[0].title, "玫瑰少年")
+        self.assertEqual(candidates[0].aliases, ["Live", "Rose Boy"])
+        self.assertEqual(candidates[0].artists, ["蔡依林", "五月天"])
+        self.assertEqual(candidates[0].album, "UGLY BEAUTY")
+        self.assertEqual(candidates[1].song_id, "415233914")
+        self.assertEqual(candidates[1].artists, ["蔡依林"])
+        self.assertEqual(candidates[1].album, "玫瑰少年 - From THE FIRST TAKE")
+
+    def test_ncm_client_returns_fastest_successful_candidate_response(self) -> None:
+        def read_json(url: str):
+            if "slow.invalid" in url:
+                time.sleep(0.05)
+                return {"result": {"songs": [{"id": 1, "name": "Slow"}]}}
+            return {"result": {"songs": [{"id": 2, "name": "Fast"}]}}
+
+        client = NCMusicClient(
+            api_bases=["https://slow.invalid", "https://fast.invalid"],
+            read_json=read_json,
+        )
+
+        candidates = client.search_songs("玫瑰少年")
+
+        self.assertEqual([candidate.song_id for candidate in candidates], ["2"])
+
+    def test_ncm_client_falls_back_when_fastest_response_fails(self) -> None:
+        def read_json(url: str):
+            if "fast-fail.invalid" in url:
+                raise RuntimeError("temporary outage")
+            time.sleep(0.01)
+            return {"result": {"songs": [{"id": 3, "name": "Fallback"}]}}
+
+        client = NCMusicClient(
+            api_bases=["https://fast-fail.invalid", "https://slow-valid.invalid"],
+            read_json=read_json,
+        )
+
+        candidates = client.search_songs("玫瑰少年")
+
+        self.assertEqual([candidate.song_id for candidate in candidates], ["3"])
+
+    def test_ranks_ncm_candidates_by_title_artist_album_and_contains(self) -> None:
+        class SearchClient:
+            def search_songs(self, query):
+                self.query = query
+                return [
+                    NCMusicCandidate("235883438", "玫瑰少年", [], ["五月天"], "玫瑰少年", 0),
+                    NCMusicCandidate("224116257", "玫瑰少年", [], ["JOLIN蔡依林"], "UGLY BEAUTY", 1),
+                    NCMusicCandidate(
+                        "415233914",
+                        "玫瑰少年 - From THE FIRST TAKE",
+                        [],
+                        ["蔡依林"],
+                        "玫瑰少年 - From THE FIRST TAKE",
+                        2,
+                    ),
+                ]
+
+        client = SearchClient()
+
+        result = collect_ncm_music_metadata(
+            AudioMetadata(title="玫瑰少年", artists=["蔡依林"], album="UGLY BEAUTY"),
+            client,
+        )
+
+        self.assertEqual(client.query, "玫瑰少年")
+        self.assertEqual([candidate.song_id for candidate in result.candidates], ["224116257", "415233914", "235883438"])
+
+    def test_values_from_metadata_adds_ncm_id_and_changed_fields(self) -> None:
+        values = values_from_metadata(
+            AudioMetadata(title="玫瑰少年", artists=["蔡依林"], album="UGLY BEAUTY"),
+            ncm_music_candidate=NCMusicCandidate(
+                "224116257",
+                "玫瑰少年",
+                ["Rose Boy"],
+                ["JOLIN蔡依林"],
+                "Ugly Beauty",
+                0,
+            ),
+        )
+
+        self.assertEqual(values["ncmMusicId"], ["224116257"])
+        self.assertEqual(values["musicName"], ["玫瑰少年", "Rose Boy"])
+        self.assertEqual(values["artists"], ["蔡依林", "JOLIN蔡依林"])
+        self.assertEqual(values["album"], ["UGLY BEAUTY", "Ugly Beauty"])
+
+    def test_dry_run_ncm_confirmation_selects_best_without_prompting(self) -> None:
+        result = NCMusicSearchResult(
+            candidates=[
+                NCMusicCandidate("1", "Best", [], ["A"], "Album", 0),
+                NCMusicCandidate("2", "Backup", [], ["A"], "Album", 1),
+            ]
+        )
+        pair = PairMetadata(
+            Path("a.flac"),
+            Path("a.ttml"),
+            AudioMetadata(title="Best"),
+            AppleMusicMetadataResult(),
+            QQMusicSearchResult(),
+            result,
+        )
+
+        confirm_ncm_music_candidates(
+            [pair],
+            dry_run=True,
+            input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(result.selected, result.candidates[0])
+
+    def test_accepting_best_ncm_candidates_uses_all_first_choices(self) -> None:
+        first = NCMusicSearchResult(
+            candidates=[
+                NCMusicCandidate("1", "One", [], ["A"], "Album", 0),
+                NCMusicCandidate("2", "Two", [], ["A"], "Album", 1),
+            ]
+        )
+        second = NCMusicSearchResult(candidates=[NCMusicCandidate("3", "Three", [], ["B"], "Album", 0)])
+        pairs = [
+            PairMetadata(Path("one.flac"), Path("one.ttml"), AudioMetadata(title="One"), AppleMusicMetadataResult(), QQMusicSearchResult(), first),
+            PairMetadata(Path("two.flac"), Path("two.ttml"), AudioMetadata(title="Two"), AppleMusicMetadataResult(), QQMusicSearchResult(), second),
+        ]
+
+        confirm_ncm_music_candidates(
+            pairs,
+            dry_run=False,
+            input_func=lambda prompt: "Y",
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(first.selected, first.candidates[0])
+        self.assertEqual(second.selected, second.candidates[0])
+
+    def test_rejecting_best_ncm_candidates_prompts_for_one_of_five_choices(self) -> None:
+        result = NCMusicSearchResult(
+            candidates=[
+                NCMusicCandidate(str(index), f"Song {index}", [], ["A"], "Album", index)
+                for index in range(1, 7)
+            ]
+        )
+        pair = PairMetadata(Path("song.flac"), Path("song.ttml"), AudioMetadata(title="Song"), AppleMusicMetadataResult(), QQMusicSearchResult(), result)
+        answers = iter(["N", "3"])
+
+        confirm_ncm_music_candidates(
+            [pair],
+            dry_run=False,
+            input_func=lambda prompt: next(answers),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(result.selected, result.candidates[2])
+
+
 class TtmlOnlyMetadataTests(unittest.TestCase):
     def write_ttml(self, directory: Path, name: str = "song.ttml", body: str | None = None) -> Path:
         path = directory / name
@@ -611,6 +803,14 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
                     ),
                 ]
 
+        class NCMSearchClient:
+            def search_songs(self, query):
+                self.query = query
+                return [
+                    NCMusicCandidate("33894312", "玫瑰少年", [], ["五月天"], "玫瑰少年", 0),
+                    NCMusicCandidate("1375248354", "玫瑰少年", [], ["蔡依林"], "UGLY BEAUTY", 1),
+                ]
+
         text = self.metadata_ttml(
             '<amll:meta key="musicName" value="玫瑰少年"/>'
             '<amll:meta key="artists" value="蔡依林"/>'
@@ -619,15 +819,18 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_ttml(Path(tmp), body=text)
             qq_client = SearchClient()
+            ncm_client = NCMSearchClient()
 
-            pair = _prepare_work_item(WorkItem(ttml_path=path), NoAppleLookupClient(), qq_client)
+            pair = _prepare_work_item(WorkItem(ttml_path=path), NoAppleLookupClient(), qq_client, ncm_client)
 
         self.assertIsNone(pair.audio_path)
         self.assertEqual(pair.metadata.title, "玫瑰少年")
         self.assertEqual(pair.metadata.artists, ["蔡依林"])
         self.assertEqual(pair.metadata.album, "UGLY BEAUTY")
         self.assertEqual(qq_client.query, "玫瑰少年")
+        self.assertEqual(ncm_client.query, "玫瑰少年")
         self.assertEqual([candidate.song_id for candidate in pair.qq_music_metadata.candidates], ["224116257", "415233914", "235883438"])
+        self.assertEqual([candidate.song_id for candidate in pair.ncm_music_metadata.candidates], ["1375248354", "33894312"])
 
     def test_ttml_only_cli_without_audio_is_accepted_and_reports_missing_title(self) -> None:
         text = self.metadata_ttml('<amll:meta key="artists" value="蔡依林"/>')
