@@ -1,0 +1,37 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local/generated metadata backups
+*.bak
+
+# Audio assets should stay local unless explicitly licensed for the repo
+*.aac
+*.aif
+*.aiff
+*.alac
+*.ape
+*.flac
+*.m4a
+*.m4b
+*.m4p
+*.mp3
+*.mp4
+*.ogg
+*.opus
+*.wav
+*.wma
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
