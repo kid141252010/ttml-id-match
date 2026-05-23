@@ -44,3 +44,7 @@ Ame (Apple Music).user.js
 Thumbs.db
 .idea/
 .vscode/
+
+# temp
+# example/*
+.env
