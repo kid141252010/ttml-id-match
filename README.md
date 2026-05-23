@@ -31,7 +31,7 @@ python fill_ttml_metadata.py --help
 - 只补缺项，不覆盖已有真实值。
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
-- 批量模式按同名文件配对音频和 TTML。
+- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 没有有效歌曲 ID 时，会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID 查找曲目 ID。
@@ -253,6 +253,14 @@ xmlns:amll="http://www.example.com/ns/amll"
 
 ```text
 song.flac
+song.ttml
+```
+
+如果同目录下同时存在同名 `.flac` 和 `.m4a`，批量模式会优先使用 `.flac`：
+
+```text
+song.flac
+song.m4a
 song.ttml
 ```
 

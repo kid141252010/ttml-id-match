@@ -344,14 +344,18 @@ def find_directory_pairs(directory: Path) -> tuple[list[tuple[Path, Path]], list
     pairs: list[tuple[Path, Path]] = []
     warnings: list[str] = []
     for ttml in ttml_files:
-        matches = audio_by_stem.get(ttml.stem, [])
+        matches = sorted(audio_by_stem.get(ttml.stem, []), key=lambda path: (path.suffix.lower(), path.name.lower()))
         if len(matches) == 1:
             pairs.append((matches[0], ttml))
         elif not matches:
             warnings.append(f"{ttml.name}: no same-stem audio file found")
         else:
-            names = ", ".join(match.name for match in matches)
-            warnings.append(f"{ttml.name}: multiple same-stem audio files found: {names}")
+            flac_matches = [match for match in matches if match.suffix.lower() == ".flac"]
+            if len(flac_matches) == 1:
+                pairs.append((flac_matches[0], ttml))
+            else:
+                names = ", ".join(match.name for match in matches)
+                warnings.append(f"{ttml.name}: multiple same-stem audio files found: {names}")
     return pairs, warnings
 
 

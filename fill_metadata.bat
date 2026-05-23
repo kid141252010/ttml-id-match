@@ -28,7 +28,13 @@ if not defined TARGET_DIR (
     exit /b 1
 )
 
-set "TARGET_DIR=%TARGET_DIR:"=%"
+for %%I in ("%TARGET_DIR%") do set "TARGET_DIR=%%~I"
+
+if not defined TARGET_DIR (
+    echo [错误] 目录不能为空。
+    pause
+    exit /b 1
+)
 
 if not exist "%TARGET_DIR%\." (
     echo [错误] 目录不存在: "%TARGET_DIR%"
