@@ -89,6 +89,30 @@ python fill_ttml_metadata.py example --non-interactive
 python fill_ttml_metadata.py example
 ```
 
+## Windows 交互脚本
+
+仓库根目录提供 `fill_metadata.bat`，适合在 Windows 上双击或从 CMD/PowerShell 里运行。
+
+双击运行时，脚本会提示你输入要处理的目录。也可以直接带目录参数运行：
+
+```cmd
+fill_metadata.bat "D:\lyrics"
+```
+
+PowerShell 里运行：
+
+```powershell
+.\fill_metadata.bat "D:\lyrics"
+```
+
+如果想直接运行 PowerShell 脚本：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
+```
+
+交互脚本会先执行 dry-run 预览，不会立刻修改文件；只有在预览成功后输入 `Y` 才会真实写入。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 `mutagen`，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+
 ## 单首文件处理
 
 如果音频和 TTML 文件名不一致，或只想处理一首歌，可以显式指定文件：
