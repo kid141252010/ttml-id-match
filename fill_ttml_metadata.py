@@ -12,17 +12,12 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 
-TTML_NS = "http://www.w3.org/ns/ttml"
-TTM_NS = "http://www.w3.org/ns/ttml#metadata"
-TTS_NS = "http://www.w3.org/ns/ttml#styling"
 AMLL_NS = "http://www.example.com/ns/amll"
-XML_NS = "http://www.w3.org/XML/1998/namespace"
 
 DEFAULT_STORE = "cn"
 DEFAULT_FALLBACK_STORE = "us"
@@ -76,6 +71,20 @@ class TtmlUpdateResult:
     @property
     def changed(self) -> bool:
         return bool(self.added or self.replaced)
+
+
+@dataclass(frozen=True)
+class _XmlAttribute:
+    value: str
+    value_start: int
+    value_end: int
+
+
+@dataclass(frozen=True)
+class _MetaTag:
+    start: int
+    end: int
+    attrs: dict[str, _XmlAttribute]
 
 
 class AppleMusicClientProtocol(Protocol):
@@ -295,25 +304,23 @@ def choose_apple_music_id(
 
 
 def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool) -> TtmlUpdateResult:
-    namespaces = _collect_namespaces(path)
-    _register_namespaces(namespaces)
-
-    tree = ET.parse(path)
-    root = tree.getroot()
-    metadata = _ensure_metadata(root)
+    text = path.read_text(encoding="utf-8")
+    metadata_start, metadata_end = _find_metadata_inner_bounds(text)
+    amll_prefix = _find_amll_prefix(text)
+    metadata = text[metadata_start:metadata_end]
     result = TtmlUpdateResult()
 
     for key in TARGET_KEY_ORDER:
         proposed_values = [value for value in values.get(key, []) if value]
         if not proposed_values:
             continue
-        _apply_meta_values(metadata, key, proposed_values, result)
+        metadata = _apply_meta_values(metadata, amll_prefix, key, proposed_values, result)
 
     if result.changed and not dry_run:
         backup_path = _backup_path(path)
         shutil.copy2(path, backup_path)
         result.backup_path = backup_path
-        output = _serialize_ttml(root)
+        output = text[:metadata_start] + metadata + text[metadata_end:]
         path.write_text(output, encoding="utf-8")
 
     return result
@@ -440,102 +447,136 @@ def _print_change_group(label: str, changes: dict[str, list[str]]) -> None:
         print(f"  {label}: {key} = {joined}")
 
 
-def _serialize_ttml(root: ET.Element) -> str:
-    output = ET.tostring(root, encoding="unicode", short_empty_elements=True)
-    return re.sub(r"(<[^<>]*?)\s+/>", r"\1/>", output)
+def _find_metadata_inner_bounds(text: str) -> tuple[int, int]:
+    open_match = re.search(r"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?metadata)\b[^>]*>", text)
+    if not open_match:
+        raise ValueError("missing <metadata>; refusing to create TTML metadata nodes")
+
+    tag_name = open_match.group("tag")
+    close_match = re.search(rf"</{re.escape(tag_name)}\s*>", text[open_match.end() :])
+    if not close_match:
+        raise ValueError(f"missing </{tag_name}>; refusing to rewrite TTML")
+
+    return open_match.end(), open_match.end() + close_match.start()
+
+
+def _find_amll_prefix(text: str) -> str:
+    prefixes: list[str] = []
+    for match in re.finditer(
+        r"\bxmlns:(?P<prefix>[A-Za-z_][\w.-]*)\s*=\s*(?P<quote>[\"'])(?P<uri>.*?)\2",
+        text,
+        flags=re.DOTALL,
+    ):
+        if html.unescape(match.group("uri")) == AMLL_NS:
+            prefixes.append(match.group("prefix"))
+
+    if not prefixes:
+        raise ValueError("missing AMLL namespace; refusing to add namespace declaration")
+    if "amll" in prefixes:
+        return "amll"
+    return prefixes[0]
 
 
 def _apply_meta_values(
-    metadata: ET.Element,
+    metadata: str,
+    amll_prefix: str,
     key: str,
     proposed_values: list[str],
     result: TtmlUpdateResult,
-) -> None:
+) -> str:
     existing = [
-        child
-        for child in list(metadata)
-        if child.tag == f"{{{AMLL_NS}}}meta" and child.attrib.get("key") == key
+        tag
+        for tag in _iter_amll_meta_tags(metadata, amll_prefix)
+        if _xml_attr_value(tag, "key") == key
     ]
-    real_values = [child.attrib.get("value", "") for child in existing if not _is_placeholder(child.attrib.get("value"))]
-    placeholders = [child for child in existing if _is_placeholder(child.attrib.get("value"))]
+    real_values = [
+        _xml_attr_value(tag, "value") or ""
+        for tag in existing
+        if not _is_placeholder(_xml_attr_value(tag, "value"))
+    ]
+    placeholders = [tag for tag in existing if _is_placeholder(_xml_attr_value(tag, "value"))]
 
     if real_values:
         result.skipped[key] = real_values
-        return
+        return metadata
 
     if placeholders:
-        consumed = 0
-        for element, value in zip(placeholders, proposed_values):
-            element.set("value", value)
-            consumed += 1
-        for extra in placeholders[consumed:]:
-            metadata.remove(extra)
-        remaining = proposed_values[consumed:]
+        replacements: list[tuple[int, int, str]] = []
+        for tag, value in zip(placeholders, proposed_values):
+            value_attr = tag.attrs.get("value")
+            if value_attr:
+                replacements.append((value_attr.value_start, value_attr.value_end, _escape_xml_attr(value)))
+            else:
+                replacements.append((tag.start, tag.end, _make_meta_node(amll_prefix, key, value)))
+        consumed_count = min(len(placeholders), len(proposed_values))
+        for extra in placeholders[consumed_count:]:
+            replacements.append((extra.start, extra.end, ""))
+        metadata = _apply_text_replacements(metadata, replacements)
+
+        remaining = proposed_values[consumed_count:]
         result.replaced[key] = proposed_values
         if remaining:
-            _insert_meta_values(metadata, key, remaining)
-        return
+            metadata = _insert_meta_values(metadata, amll_prefix, key, remaining)
+        return metadata
 
-    _insert_meta_values(metadata, key, proposed_values)
+    metadata = _insert_meta_values(metadata, amll_prefix, key, proposed_values)
     result.added[key] = proposed_values
-
-
-def _insert_meta_values(metadata: ET.Element, key: str, values: list[str]) -> None:
-    index = _metadata_insert_index(metadata)
-    for offset, value in enumerate(values):
-        element = ET.Element(f"{{{AMLL_NS}}}meta", {"key": key, "value": value})
-        metadata.insert(index + offset, element)
-
-
-def _metadata_insert_index(metadata: ET.Element) -> int:
-    children = list(metadata)
-    for index, child in enumerate(children):
-        if _local_name(child.tag) == "iTunesMetadata":
-            return index
-    index = 0
-    for child in children:
-        if child.tag == f"{{{TTM_NS}}}agent" or child.tag == f"{{{AMLL_NS}}}meta":
-            index += 1
-            continue
-        break
-    return index
-
-
-def _ensure_metadata(root: ET.Element) -> ET.Element:
-    head = root.find(f"{{{TTML_NS}}}head")
-    if head is None:
-        head = ET.Element(f"{{{TTML_NS}}}head")
-        root.insert(0, head)
-    metadata = head.find(f"{{{TTML_NS}}}metadata")
-    if metadata is None:
-        metadata = ET.Element(f"{{{TTML_NS}}}metadata")
-        head.insert(0, metadata)
     return metadata
 
 
-def _collect_namespaces(path: Path) -> dict[str, str]:
-    namespaces: dict[str, str] = {}
-    for _, item in ET.iterparse(path, events=("start-ns",)):
-        prefix, uri = item
-        namespaces[prefix or ""] = uri
-    return namespaces
+def _iter_amll_meta_tags(metadata: str, amll_prefix: str) -> Iterable[_MetaTag]:
+    pattern = re.compile(
+        rf"<{re.escape(amll_prefix)}:meta\b[^<>]*(?:/>|>\s*</{re.escape(amll_prefix)}:meta\s*>)",
+        flags=re.DOTALL,
+    )
+    for match in pattern.finditer(metadata):
+        yield _MetaTag(match.start(), match.end(), _parse_xml_attributes(match.group(0), match.start()))
 
 
-def _register_namespaces(namespaces: dict[str, str]) -> None:
-    merged = {
-        "": namespaces.get("", TTML_NS),
-        "ttm": namespaces.get("ttm", TTM_NS),
-        "tts": namespaces.get("tts", TTS_NS),
-        "amll": namespaces.get("amll", AMLL_NS),
-    }
-    for prefix, uri in namespaces.items():
-        if prefix == "xml":
-            continue
-        merged[prefix] = uri
-    for prefix, uri in merged.items():
-        if prefix == "xml":
-            continue
-        ET.register_namespace(prefix, uri)
+def _parse_xml_attributes(tag_text: str, absolute_start: int) -> dict[str, _XmlAttribute]:
+    attrs: dict[str, _XmlAttribute] = {}
+    for match in re.finditer(
+        r"(?P<name>[^\s=/>]+)\s*=\s*(?P<quote>[\"'])(?P<value>.*?)\2",
+        tag_text,
+        flags=re.DOTALL,
+    ):
+        attrs[match.group("name")] = _XmlAttribute(
+            value=html.unescape(match.group("value")),
+            value_start=absolute_start + match.start("value"),
+            value_end=absolute_start + match.end("value"),
+        )
+    return attrs
+
+
+def _xml_attr_value(tag: _MetaTag, name: str) -> str | None:
+    attr = tag.attrs.get(name)
+    return attr.value if attr else None
+
+
+def _apply_text_replacements(text: str, replacements: list[tuple[int, int, str]]) -> str:
+    output = text
+    for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+        output = output[:start] + replacement + output[end:]
+    return output
+
+
+def _insert_meta_values(metadata: str, amll_prefix: str, key: str, values: list[str]) -> str:
+    insertion = "".join(_make_meta_node(amll_prefix, key, value) for value in values)
+    index = _metadata_insert_index(metadata)
+    return metadata[:index] + insertion + metadata[index:]
+
+
+def _metadata_insert_index(metadata: str) -> int:
+    match = re.search(r"<(?:[A-Za-z_][\w.-]*:)?iTunesMetadata\b", metadata)
+    return match.start() if match else len(metadata)
+
+
+def _make_meta_node(amll_prefix: str, key: str, value: str) -> str:
+    return f'<{amll_prefix}:meta key="{_escape_xml_attr(key)}" value="{_escape_xml_attr(value)}"/>'
+
+
+def _escape_xml_attr(value: str) -> str:
+    return html.escape(str(value), quote=True)
 
 
 def _backup_path(path: Path) -> Path:

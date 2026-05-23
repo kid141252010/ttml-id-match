@@ -8,12 +8,6 @@
 python fill_ttml_metadata.py --help
 ```
 
-## 许可协议
-
-此仓库使用 **GNU Affero General Public License v3.0（AGPLv3）** 授权。
-
-如果你分发、修改、部署或通过网络提供本仓库代码产生的服务，需要遵守 AGPLv3 的源代码开放要求。仓库根目录的 `LICENSE` 文件已包含 AGPLv3 全文。
-
 ## 功能
 
 脚本会从音频元数据读取并填入以下 TTML 元数据：
@@ -335,3 +329,9 @@ python -B -m unittest discover -s tests
 ```powershell
 python -B fill_ttml_metadata.py example --dry-run --non-interactive
 ```
+
+## 许可协议
+
+此仓库使用 **GNU Affero General Public License v3.0（AGPLv3）** 授权。
+
+如果你分发、修改、部署或通过网络提供本仓库代码产生的服务，需要遵守 AGPLv3 的源代码开放要求。仓库根目录的 `LICENSE` 文件已包含 AGPLv3 全文。
