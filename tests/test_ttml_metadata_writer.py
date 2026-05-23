@@ -128,7 +128,7 @@ class TtmlMetadataWriterTests(unittest.TestCase):
 
             self.assertEqual(path.read_text(encoding="utf-8"), text)
 
-    def test_missing_amll_namespace_raises_without_adding_namespace(self) -> None:
+    def test_missing_amll_namespace_adds_namespace_to_root_tt(self) -> None:
         text = (
             '<tt xmlns="http://www.w3.org/ns/ttml">'
             "<head><metadata></metadata></head><body/></tt>"
@@ -136,10 +136,37 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_ttml(text, Path(tmp))
 
-            with self.assertRaisesRegex(ValueError, "missing AMLL namespace"):
-                update_ttml_metadata(path, {"musicName": ["Song"]}, dry_run=False)
+            result = update_ttml_metadata(path, {"musicName": ["Song"]}, dry_run=False)
 
-            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            after = path.read_text(encoding="utf-8")
+            self.assertIn(
+                '<tt xmlns="http://www.w3.org/ns/ttml" '
+                'xmlns:amll="http://www.example.com/ns/amll">',
+                after,
+            )
+            self.assertIn('<amll:meta key="musicName" value="Song"/>', after)
+            self.assertEqual(after.count("xmlns:amll="), 1)
+            self.assertEqual(result.added["musicName"], ["Song"])
+
+    def test_missing_amll_namespace_adds_namespace_to_multiline_root_tt(self) -> None:
+        text = (
+            '<tt xmlns="http://www.w3.org/ns/ttml"\n'
+            '    xmlns:ttm="http://www.w3.org/ns/ttml#metadata"\n'
+            '    xml:lang="zh-Hans">\n'
+            "<head><metadata></metadata></head><body/></tt>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(text, Path(tmp))
+
+            update_ttml_metadata(path, {"musicName": ["Song"]}, dry_run=False)
+
+            after = path.read_text(encoding="utf-8")
+            self.assertIn(
+                'xml:lang="zh-Hans" xmlns:amll="http://www.example.com/ns/amll">',
+                after,
+            )
+            self.assertIn('<amll:meta key="musicName" value="Song"/>', after)
+            self.assertEqual(after.count("xmlns:amll="), 1)
 
 
 if __name__ == "__main__":

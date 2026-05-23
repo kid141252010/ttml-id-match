@@ -213,9 +213,9 @@ Disease (Apple Music Live) -> 6768201779
 
 ## 写入结构
 
-脚本只会修改已有 `<metadata>...</metadata>` 内部的目标 `amll:meta` 节点，不会重排或重写 TTML 其它内容，也不会补充 `<head>`、`<metadata>` 或根节点命名空间声明。
+脚本只会修改已有 `<metadata>...</metadata>` 内部的目标 `amll:meta` 节点，不会重排或重写 TTML 其它内容，也不会补充 `<head>` 或 `<metadata>`。如果根节点缺少 AMLL 命名空间声明，脚本会在根 `<tt>` 上补充 `xmlns:amll="http://www.example.com/ns/amll"`。
 
-如果文件缺少 `<metadata>`，或缺少指向 `http://www.example.com/ns/amll` 的 AMLL 命名空间声明，脚本会报错并跳过该文件。
+如果文件缺少 `<metadata>`，脚本会报错并跳过该文件。
 
 新增的 `amll:meta` 会插入到已有 `<metadata>` 内；有 `<iTunesMetadata>` 时插到它之前，否则插到 `</metadata>` 前：
 

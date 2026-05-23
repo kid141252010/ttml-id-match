@@ -305,8 +305,8 @@ def choose_apple_music_id(
 
 def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool) -> TtmlUpdateResult:
     text = path.read_text(encoding="utf-8")
+    text, amll_prefix = _ensure_amll_namespace(text)
     metadata_start, metadata_end = _find_metadata_inner_bounds(text)
-    amll_prefix = _find_amll_prefix(text)
     metadata = text[metadata_start:metadata_end]
     result = TtmlUpdateResult()
 
@@ -471,10 +471,34 @@ def _find_amll_prefix(text: str) -> str:
             prefixes.append(match.group("prefix"))
 
     if not prefixes:
-        raise ValueError("missing AMLL namespace; refusing to add namespace declaration")
+        raise ValueError("missing AMLL namespace")
     if "amll" in prefixes:
         return "amll"
     return prefixes[0]
+
+
+def _ensure_amll_namespace(text: str) -> tuple[str, str]:
+    try:
+        return text, _find_amll_prefix(text)
+    except ValueError:
+        pass
+
+    root_match = re.search(r"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?tt)\b[^>]*>", text, flags=re.DOTALL)
+    if not root_match:
+        raise ValueError("missing <tt> root; refusing to add AMLL namespace declaration")
+
+    root_tag = root_match.group(0)
+    amll_prefix_match = re.search(
+        r"\bxmlns:amll\s*=\s*(?P<quote>[\"'])(?P<uri>.*?)\1",
+        root_tag,
+        flags=re.DOTALL,
+    )
+    if amll_prefix_match and html.unescape(amll_prefix_match.group("uri")) != AMLL_NS:
+        raise ValueError("xmlns:amll already uses a different namespace; refusing to rewrite TTML")
+
+    insert_at = root_match.end() - 1
+    insertion = f' xmlns:amll="{AMLL_NS}"'
+    return text[:insert_at] + insertion + text[insert_at:], "amll"
 
 
 def _apply_meta_values(
