@@ -2,15 +2,25 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO, TextIOWrapper
+import json
 from pathlib import Path
 
 from fill_ttml_metadata import (
     AudioMetadata,
+    AppleMusicMetadataResult,
     DEFAULT_STORES,
+    PairMetadata,
+    QQMusicCandidate,
+    QQMusicClient,
+    QQMusicSearchResult,
     collect_apple_music_metadata,
+    collect_qq_music_metadata,
+    confirm_qq_music_candidates,
     main,
     update_ttml_metadata,
+    values_from_metadata,
     _flatten_tags,
+    _parse_qq_music_candidates,
     _safe_print,
 )
 
@@ -129,6 +139,30 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             self.assertEqual(result.added["musicName"], ["New"])
             self.assertEqual(result.skipped["musicName"], ["Existing"])
             self.assertIsNotNone(result.backup_path)
+
+    def test_writes_qq_music_id_values_after_album_before_apple_music_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(REFERENCE_STYLE_TTML, Path(tmp))
+
+            update_ttml_metadata(
+                path,
+                {
+                    "album": ["Album"],
+                    "qqMusicId": ["235883438", "0035sVym0anwc4"],
+                    "appleMusicId": ["1691701944"],
+                },
+                dry_run=False,
+            )
+
+            after = path.read_text(encoding="utf-8")
+            expected_insert = (
+                '<amll:meta key="album" value="Album"/>'
+                '<amll:meta key="qqMusicId" value="235883438"/>'
+                '<amll:meta key="qqMusicId" value="0035sVym0anwc4"/>'
+                '<amll:meta key="appleMusicId" value="1691701944"/>'
+                "<iTunesMetadata>"
+            )
+            self.assertIn(expected_insert, after)
 
     def test_missing_metadata_raises_without_creating_nodes(self) -> None:
         text = (
@@ -298,6 +332,206 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             _safe_print("lookup warning: 앨범", file=stream)
         finally:
             stream.close()
+
+
+class QQMusicMetadataTests(unittest.TestCase):
+    def test_qq_music_request_uses_exact_mobile_search_payload(self) -> None:
+        request = QQMusicClient()._build_search_request("玫瑰少年")
+
+        self.assertEqual(request.full_url, "http://u.y.qq.com/cgi-bin/musicu.fcg")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Accept-language"), "zh-CN")
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("User-agent"), "QQMusic 14090508(android 12)")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+
+        payload = json.loads((request.data or b"").decode("utf-8"))
+        self.assertEqual(
+            payload["comm"],
+            {
+                "ct": "11",
+                "cv": "14090508",
+                "v": "14090508",
+                "tmeAppID": "qqmusic",
+                "phonetype": "EBG-AN10",
+                "deviceScore": "553.47",
+                "devicelevel": "50",
+                "newdevicelevel": "20",
+                "rom": "HuaWei/EMOTION/EmotionUI_14.2.0",
+                "os_ver": "12",
+                "OpenUDID": "0",
+                "OpenUDID2": "0",
+                "QIMEI36": "0",
+                "udid": "0",
+                "chid": "0",
+                "aid": "0",
+                "oaid": "0",
+                "taid": "0",
+                "tid": "0",
+                "wid": "0",
+                "uid": "0",
+                "sid": "0",
+                "modeSwitch": "6",
+                "teenMode": "0",
+                "ui_mode": "2",
+                "nettype": "1020",
+                "v4ip": "",
+            },
+        )
+        self.assertEqual(
+            payload["req"],
+            {
+                "module": "music.search.SearchCgiService",
+                "method": "DoSearchForQQMusicMobile",
+                "param": {
+                    "search_type": 0,
+                    "query": "玫瑰少年",
+                    "page_num": 1,
+                    "num_per_page": 30,
+                    "highlight": 0,
+                    "nqc_flag": 0,
+                    "multi_zhida": 0,
+                    "cat": 2,
+                    "grp": 1,
+                    "sin": 0,
+                    "sem": 0,
+                },
+            },
+        )
+
+    def test_parses_qq_music_candidates_from_item_song_and_requires_id_and_mid(self) -> None:
+        payload = {
+            "req": {
+                "data": {
+                    "body": {
+                        "item_song": [
+                            {
+                                "id": 235883438,
+                                "mid": "0035sVym0anwc4",
+                                "name": "玫瑰少年",
+                                "title": "玫瑰少年",
+                                "subtitle": "Live",
+                                "singer": [{"name": "蔡依林"}, {"name": "五月天"}],
+                                "album": {"name": "UGLY BEAUTY", "title": "UGLY BEAUTY"},
+                            },
+                            {
+                                "songid": 1,
+                                "name": "missing mid",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+
+        candidates = _parse_qq_music_candidates(payload)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].song_id, "235883438")
+        self.assertEqual(candidates[0].mid, "0035sVym0anwc4")
+        self.assertEqual(candidates[0].title, "玫瑰少年")
+        self.assertEqual(candidates[0].subtitle, "Live")
+        self.assertEqual(candidates[0].artists, ["蔡依林", "五月天"])
+        self.assertEqual(candidates[0].album, "UGLY BEAUTY")
+
+    def test_ranks_qq_candidates_by_title_artist_album_and_contains(self) -> None:
+        class SearchClient:
+            def search_songs(self, query):
+                self.query = query
+                return [
+                    QQMusicCandidate("235883438", "0035sVym0anwc4", "玫瑰少年", "", ["五月天"], "玫瑰少年", 0),
+                    QQMusicCandidate("224116257", "001hrIGe3flaPr", "玫瑰少年", "", ["JOLIN蔡依林"], "UGLY BEAUTY", 1),
+                    QQMusicCandidate("415233914", "003YUKMv2dcOZq", "玫瑰少年 - From THE FIRST TAKE", "", ["蔡依林"], "玫瑰少年 - From THE FIRST TAKE", 2),
+                ]
+
+        client = SearchClient()
+
+        result = collect_qq_music_metadata(
+            AudioMetadata(title="玫瑰少年", artists=["蔡依林"], album="UGLY BEAUTY"),
+            client,
+        )
+
+        self.assertEqual(client.query, "玫瑰少年")
+        self.assertEqual([candidate.song_id for candidate in result.candidates], ["224116257", "415233914", "235883438"])
+
+    def test_values_from_metadata_adds_qq_ids_and_changed_fields_and_subtitle_to_music_name(self) -> None:
+        values = values_from_metadata(
+            AudioMetadata(title="玫瑰少年", artists=["蔡依林"], album="UGLY BEAUTY"),
+            qq_music_candidate=QQMusicCandidate(
+                "224116257",
+                "001hrIGe3flaPr",
+                "玫瑰少年",
+                "Ugly Beauty Remix",
+                ["JOLIN蔡依林"],
+                "Ugly Beauty",
+                0,
+            ),
+        )
+
+        self.assertEqual(values["qqMusicId"], ["224116257", "001hrIGe3flaPr"])
+        self.assertEqual(values["musicName"], ["玫瑰少年", "Ugly Beauty Remix"])
+        self.assertEqual(values["artists"], ["蔡依林", "JOLIN蔡依林"])
+        self.assertEqual(values["album"], ["UGLY BEAUTY", "Ugly Beauty"])
+
+    def test_dry_run_qq_confirmation_selects_best_without_prompting(self) -> None:
+        result = QQMusicSearchResult(
+            candidates=[
+                QQMusicCandidate("1", "mid1", "Best", "", ["A"], "Album", 0),
+                QQMusicCandidate("2", "mid2", "Backup", "", ["A"], "Album", 1),
+            ]
+        )
+        pair = PairMetadata(Path("a.flac"), Path("a.ttml"), AudioMetadata(title="Best"), AppleMusicMetadataResult(), result)
+
+        confirm_qq_music_candidates(
+            [pair],
+            dry_run=True,
+            input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(result.selected, result.candidates[0])
+
+    def test_accepting_best_qq_candidates_uses_all_first_choices(self) -> None:
+        first = QQMusicSearchResult(
+            candidates=[
+                QQMusicCandidate("1", "mid1", "One", "", ["A"], "Album", 0),
+                QQMusicCandidate("2", "mid2", "Two", "", ["A"], "Album", 1),
+            ]
+        )
+        second = QQMusicSearchResult(candidates=[QQMusicCandidate("3", "mid3", "Three", "", ["B"], "Album", 0)])
+        pairs = [
+            PairMetadata(Path("one.flac"), Path("one.ttml"), AudioMetadata(title="One"), AppleMusicMetadataResult(), first),
+            PairMetadata(Path("two.flac"), Path("two.ttml"), AudioMetadata(title="Two"), AppleMusicMetadataResult(), second),
+        ]
+
+        confirm_qq_music_candidates(
+            pairs,
+            dry_run=False,
+            input_func=lambda prompt: "Y",
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(first.selected, first.candidates[0])
+        self.assertEqual(second.selected, second.candidates[0])
+
+    def test_rejecting_best_qq_candidates_prompts_for_one_of_five_choices(self) -> None:
+        result = QQMusicSearchResult(
+            candidates=[
+                QQMusicCandidate(str(index), f"mid{index}", f"Song {index}", "", ["A"], "Album", index)
+                for index in range(1, 7)
+            ]
+        )
+        pair = PairMetadata(Path("song.flac"), Path("song.ttml"), AudioMetadata(title="Song"), AppleMusicMetadataResult(), result)
+        answers = iter(["N", "3"])
+
+        confirm_qq_music_candidates(
+            [pair],
+            dry_run=False,
+            input_func=lambda prompt: next(answers),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(result.selected, result.candidates[2])
 
 
 if __name__ == "__main__":

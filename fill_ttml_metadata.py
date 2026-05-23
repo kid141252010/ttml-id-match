@@ -13,13 +13,13 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 
 AMLL_NS = "http://www.example.com/ns/amll"
 
 DEFAULT_STORES = ["cn", "tw", "jp", "kr", "us"]
-TARGET_KEY_ORDER = ["musicName", "artists", "album", "appleMusicId", "isrc"]
+TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "appleMusicId", "isrc"]
 AUDIO_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -65,6 +65,33 @@ class AppleMusicMetadataResult:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class QQMusicCandidate:
+    song_id: str
+    mid: str
+    title: str | None = None
+    subtitle: str | None = None
+    artists: list[str] = field(default_factory=list)
+    album: str | None = None
+    source_index: int = 0
+
+
+@dataclass
+class QQMusicSearchResult:
+    candidates: list[QQMusicCandidate] = field(default_factory=list)
+    selected: QQMusicCandidate | None = None
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PairMetadata:
+    audio_path: Path
+    ttml_path: Path
+    metadata: AudioMetadata
+    apple_music_metadata: AppleMusicMetadataResult
+    qq_music_metadata: QQMusicSearchResult
+
+
 @dataclass
 class TtmlUpdateResult:
     added: dict[str, list[str]] = field(default_factory=dict)
@@ -93,6 +120,11 @@ class _MetaTag:
 
 class AppleMusicClientProtocol(Protocol):
     def fetch_album_tracks(self, store: str, album_id: str) -> list[dict[str, Any]]:
+        ...
+
+
+class QQMusicClientProtocol(Protocol):
+    def search_songs(self, query: str) -> list[QQMusicCandidate]:
         ...
 
 
@@ -224,6 +256,31 @@ class AppleMusicClient:
         }
 
 
+class QQMusicClient:
+    def __init__(self, timeout: int = 20):
+        self.timeout = timeout
+
+    def search_songs(self, query: str) -> list[QQMusicCandidate]:
+        request = self._build_search_request(query)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "ignore"))
+        return _parse_qq_music_candidates(payload)
+
+    def _build_search_request(self, query: str) -> urllib.request.Request:
+        data = json.dumps(_qq_music_search_payload(query), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return urllib.request.Request(
+            "http://u.y.qq.com/cgi-bin/musicu.fcg",
+            data=data,
+            headers={
+                "Accept-Language": "zh-CN",
+                "Accept": "application/json",
+                "User-Agent": "QQMusic 14090508(android 12)",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+
 def read_audio_metadata(path: Path) -> AudioMetadata:
     try:
         from mutagen import File
@@ -303,6 +360,78 @@ def collect_apple_music_metadata(
     return result
 
 
+def collect_qq_music_metadata(
+    metadata: AudioMetadata,
+    client: QQMusicClientProtocol,
+) -> QQMusicSearchResult:
+    result = QQMusicSearchResult()
+    if not metadata.title:
+        result.errors.append("音频中未读取到歌名，跳过 QQ 音乐搜索")
+        return result
+
+    try:
+        candidates = client.search_songs(metadata.title)
+    except Exception as exc:
+        result.errors.append(f"QQ 音乐搜索失败: {exc}")
+        return result
+
+    result.candidates = sorted(
+        candidates,
+        key=lambda candidate: (-_qq_music_candidate_score(metadata, candidate), candidate.source_index),
+    )
+    if not result.candidates:
+        result.errors.append("QQ 音乐未找到带 songid 和 mid 的候选")
+    return result
+
+
+def confirm_qq_music_candidates(
+    pairs: list[PairMetadata],
+    dry_run: bool,
+    input_func: Callable[[str], str] = input,
+    print_func: Callable[..., None] | None = None,
+) -> None:
+    if print_func is None:
+        print_func = _safe_print
+
+    available = [pair for pair in pairs if pair.qq_music_metadata.candidates]
+    for pair in available:
+        pair.qq_music_metadata.selected = pair.qq_music_metadata.candidates[0]
+
+    if dry_run or not available:
+        return
+
+    print_func("")
+    print_func("QQ 音乐最佳候选：")
+    for pair in available:
+        best = pair.qq_music_metadata.candidates[0]
+        print_func(f"  {pair.ttml_path.name}: {_format_qq_music_candidate(best)}")
+
+    while True:
+        answer = input_func("Accept all QQ Music best candidates? Type Y to accept, N to choose alternatives: ").strip()
+        if answer.casefold() in {"y", "n"}:
+            break
+        print_func("Please type Y or N.")
+
+    if answer.casefold() == "y":
+        return
+
+    for pair in available:
+        options = pair.qq_music_metadata.candidates[:5]
+        print_func("")
+        print_func(f"{pair.ttml_path.name} QQ 音乐候选：")
+        for index, candidate in enumerate(options, start=1):
+            print_func(f"  {index}. {_format_qq_music_candidate(candidate)}")
+        while True:
+            answer = input_func("Select 1-5, or press Enter to skip this song: ").strip()
+            if not answer:
+                pair.qq_music_metadata.selected = None
+                break
+            if answer.isdigit() and 1 <= int(answer) <= len(options):
+                pair.qq_music_metadata.selected = options[int(answer) - 1]
+                break
+            print_func("Invalid selection.")
+
+
 def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool) -> TtmlUpdateResult:
     text = path.read_text(encoding="utf-8")
     text, amll_prefix = _ensure_amll_namespace(text)
@@ -329,6 +458,7 @@ def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool
 def values_from_metadata(
     metadata: AudioMetadata,
     apple_music_values: dict[str, list[str]] | None = None,
+    qq_music_candidate: QQMusicCandidate | None = None,
 ) -> dict[str, list[str]]:
     values: dict[str, list[str]] = {}
     if metadata.title:
@@ -341,6 +471,8 @@ def values_from_metadata(
     for key, proposed_values in (apple_music_values or {}).items():
         for value in proposed_values:
             _add_unique_value(values, key, value)
+    if qq_music_candidate:
+        _merge_qq_music_metadata(values, metadata, qq_music_candidate)
     if metadata.isrc:
         _add_unique_value(values, "isrc", metadata.isrc)
     return values
@@ -394,21 +526,39 @@ def main(argv: list[str] | None = None) -> int:
     for warning in warnings:
         _safe_print(f"[skip] {warning}")
 
-    client = AppleMusicClient()
+    apple_music_client = AppleMusicClient()
+    qq_music_client = QQMusicClient()
     failures = 0
+    prepared_pairs: list[PairMetadata] = []
     for audio_path, ttml_path in pairs:
         try:
-            _process_pair(
-                audio_path,
-                ttml_path,
-                client,
-                dry_run=args.dry_run,
-            )
+            prepared_pairs.append(_prepare_pair(audio_path, ttml_path, apple_music_client, qq_music_client))
         except Exception as exc:
             failures += 1
             _safe_print(f"[error] {ttml_path.name}: {exc}", file=sys.stderr)
 
+    confirm_qq_music_candidates(prepared_pairs, dry_run=args.dry_run)
+
+    for pair in prepared_pairs:
+        try:
+            _process_prepared_pair(pair, dry_run=args.dry_run)
+        except Exception as exc:
+            failures += 1
+            _safe_print(f"[error] {pair.ttml_path.name}: {exc}", file=sys.stderr)
+
     return 1 if failures else 0
+
+
+def _prepare_pair(
+    audio_path: Path,
+    ttml_path: Path,
+    apple_music_client: AppleMusicClientProtocol,
+    qq_music_client: QQMusicClientProtocol,
+) -> PairMetadata:
+    metadata = read_audio_metadata(audio_path)
+    apple_music_metadata = collect_apple_music_metadata(metadata, apple_music_client)
+    qq_music_metadata = collect_qq_music_metadata(metadata, qq_music_client)
+    return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata)
 
 
 def _process_pair(
@@ -416,10 +566,23 @@ def _process_pair(
     ttml_path: Path,
     client: AppleMusicClientProtocol,
     dry_run: bool,
+    qq_music_client: QQMusicClientProtocol | None = None,
 ) -> None:
-    metadata = read_audio_metadata(audio_path)
-    apple_music_metadata = collect_apple_music_metadata(metadata, client)
-    values = values_from_metadata(metadata, apple_music_metadata.values)
+    pair = _prepare_pair(audio_path, ttml_path, client, qq_music_client or QQMusicClient())
+    confirm_qq_music_candidates([pair], dry_run=dry_run)
+    _process_prepared_pair(pair, dry_run=dry_run)
+
+
+def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
+    values = values_from_metadata(
+        pair.metadata,
+        pair.apple_music_metadata.values,
+        qq_music_candidate=pair.qq_music_metadata.selected,
+    )
+    audio_path = pair.audio_path
+    ttml_path = pair.ttml_path
+    apple_music_metadata = pair.apple_music_metadata
+    qq_music_metadata = pair.qq_music_metadata
     result = update_ttml_metadata(ttml_path, values, dry_run=dry_run)
 
     status = "dry-run" if dry_run else "updated"
@@ -431,6 +594,13 @@ def _process_pair(
     _safe_print(f"  appleMusicSources: {', '.join(apple_music_metadata.sources) or '-'}")
     if apple_music_metadata.errors:
         for error in apple_music_metadata.errors:
+            _safe_print(f"  lookup warning: {error}")
+    best = qq_music_metadata.candidates[0] if qq_music_metadata.candidates else None
+    _safe_print(f"  qqMusicBest: {_format_qq_music_candidate(best) if best else '-'}")
+    selected = qq_music_metadata.selected
+    _safe_print(f"  qqMusicId: {', '.join([selected.song_id, selected.mid]) if selected else '-'}")
+    if qq_music_metadata.errors:
+        for error in qq_music_metadata.errors:
             _safe_print(f"  lookup warning: {error}")
     _print_change_group("added", result.added)
     _print_change_group("replaced", result.replaced)
@@ -465,6 +635,177 @@ def _merge_track_metadata(values: dict[str, list[str]], track: dict[str, Any]) -
     _add_unique_value(values, "album", _stringify_tag_value(track.get("albumName")))
     _add_unique_value(values, "appleMusicId", _track_id(track))
     _add_unique_value(values, "isrc", _stringify_tag_value(track.get("isrc")))
+
+
+def _merge_qq_music_metadata(
+    values: dict[str, list[str]],
+    metadata: AudioMetadata,
+    candidate: QQMusicCandidate,
+) -> None:
+    _add_unique_value(values, "qqMusicId", candidate.song_id)
+    _add_unique_value(values, "qqMusicId", candidate.mid)
+    if candidate.title and not _same_raw_text(candidate.title, metadata.title):
+        _add_unique_value(values, "musicName", candidate.title)
+    if (
+        candidate.subtitle
+        and not _same_raw_text(candidate.subtitle, metadata.title)
+        and not _same_raw_text(candidate.subtitle, candidate.title)
+    ):
+        _add_unique_value(values, "musicName", candidate.subtitle)
+    for artist in candidate.artists:
+        if not any(_same_raw_text(artist, existing) for existing in metadata.artists):
+            _add_unique_value(values, "artists", artist)
+    if candidate.album and not _same_raw_text(candidate.album, metadata.album):
+        _add_unique_value(values, "album", candidate.album)
+
+
+def _qq_music_search_payload(query: str) -> dict[str, Any]:
+    return {
+        "comm": {
+            "ct": "11",
+            "cv": "14090508",
+            "v": "14090508",
+            "tmeAppID": "qqmusic",
+            "phonetype": "EBG-AN10",
+            "deviceScore": "553.47",
+            "devicelevel": "50",
+            "newdevicelevel": "20",
+            "rom": "HuaWei/EMOTION/EmotionUI_14.2.0",
+            "os_ver": "12",
+            "OpenUDID": "0",
+            "OpenUDID2": "0",
+            "QIMEI36": "0",
+            "udid": "0",
+            "chid": "0",
+            "aid": "0",
+            "oaid": "0",
+            "taid": "0",
+            "tid": "0",
+            "wid": "0",
+            "uid": "0",
+            "sid": "0",
+            "modeSwitch": "6",
+            "teenMode": "0",
+            "ui_mode": "2",
+            "nettype": "1020",
+            "v4ip": "",
+        },
+        "req": {
+            "module": "music.search.SearchCgiService",
+            "method": "DoSearchForQQMusicMobile",
+            "param": {
+                "search_type": 0,
+                "query": query,
+                "page_num": 1,
+                "num_per_page": 30,
+                "highlight": 0,
+                "nqc_flag": 0,
+                "multi_zhida": 0,
+                "cat": 2,
+                "grp": 1,
+                "sin": 0,
+                "sem": 0,
+            },
+        },
+    }
+
+
+def _parse_qq_music_candidates(payload: dict[str, Any]) -> list[QQMusicCandidate]:
+    songs = _nested_get(payload, "req", "data", "body", "item_song")
+    if not isinstance(songs, list):
+        return []
+
+    candidates: list[QQMusicCandidate] = []
+    for index, song in enumerate(songs):
+        if not isinstance(song, dict):
+            continue
+        song_id = _stringify_tag_value(song.get("id") or song.get("songid"))
+        mid = _stringify_tag_value(song.get("mid") or song.get("songmid"))
+        if not song_id or not mid:
+            continue
+        candidates.append(
+            QQMusicCandidate(
+                song_id=song_id,
+                mid=mid,
+                title=_stringify_tag_value(song.get("name") or song.get("title")),
+                subtitle=_stringify_tag_value(song.get("subtitle")),
+                artists=_qq_music_artists(song.get("singer")),
+                album=_qq_music_album(song.get("album")),
+                source_index=index,
+            )
+        )
+    return candidates
+
+
+def _qq_music_artists(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return split_artists([value.get("name")])
+    if not isinstance(value, list):
+        return split_artists([value]) if value else []
+    artists: list[str] = []
+    for item in value:
+        name = _stringify_tag_value(item.get("name") if isinstance(item, dict) else item)
+        for artist in split_artists([name]):
+            if artist not in artists:
+                artists.append(artist)
+    return artists
+
+
+def _qq_music_album(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _stringify_tag_value(value.get("name") or value.get("title"))
+    return _stringify_tag_value(value)
+
+
+def _qq_music_candidate_score(metadata: AudioMetadata, candidate: QQMusicCandidate) -> int:
+    score = _text_match_score(metadata.title, candidate.title) * 100
+    for artist in metadata.artists:
+        score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 60
+    score += _text_match_score(metadata.album, candidate.album) * 30
+    return score
+
+
+def _text_match_score(expected: Any, actual: Any) -> int:
+    expected_text = _normalize_match_text(expected)
+    actual_text = _normalize_match_text(actual)
+    if not expected_text or not actual_text:
+        return 0
+    if expected_text == actual_text:
+        return 2
+    if expected_text in actual_text or actual_text in expected_text:
+        return 1
+    return 0
+
+
+def _normalize_match_text(value: Any) -> str:
+    if value is None:
+        return ""
+    normalized = str(value).casefold().strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _same_raw_text(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    return str(left).strip() == str(right).strip()
+
+
+def _nested_get(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _format_qq_music_candidate(candidate: QQMusicCandidate) -> str:
+    title = candidate.title or "-"
+    subtitle = f" ({candidate.subtitle})" if candidate.subtitle else ""
+    artists = "/".join(candidate.artists) or "-"
+    album = candidate.album or "-"
+    return f"{title}{subtitle} - {artists} - {album} [{candidate.song_id}, {candidate.mid}]"
 
 
 def _add_unique_value(values: dict[str, list[str]], key: str, value: str | None) -> None:

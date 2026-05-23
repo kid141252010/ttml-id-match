@@ -16,6 +16,7 @@ python fill_ttml_metadata.py --help
 <amll:meta key="musicName" value="..."/>
 <amll:meta key="artists" value="..."/>
 <amll:meta key="album" value="..."/>
+<amll:meta key="qqMusicId" value="..."/>
 <amll:meta key="isrc" value="..."/>
 <amll:meta key="appleMusicId" value="..."/>
 ```
@@ -29,11 +30,12 @@ python fill_ttml_metadata.py --help
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
+- 会用歌名搜索 QQ 音乐，按歌名、歌手、专辑匹配候选，并把选中结果的 songid 和 mid 分别写入 `qqMusicId`。
 
 ## 环境要求
 
 - Python 3.10 或更新版本。
-- 网络访问 Apple Music，用于从专辑 ID 查找歌曲 ID。
+- 网络访问 Apple Music 和 QQ 音乐，用于查找歌曲 ID。
 - Python 依赖：`mutagen`。
 
 安装依赖：
@@ -99,7 +101,7 @@ PowerShell 里运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
 ```
 
-交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会真实写入。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 `mutagen`，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会再次汇总 QQ 音乐最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 `mutagen`，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
 
 ## 单首文件处理
 
@@ -190,6 +192,14 @@ https://amp-api.music.apple.com/v1/catalog/{store}/albums/{albumId}
 Disease (Apple Music Live) -> 6768201779
 ```
 
+### QQ 音乐元数据查找
+
+QQ 音乐查找只使用音频歌名作为搜索关键词。脚本请求 QQ 音乐移动端搜索接口，读取 `item_song` 候选，要求候选同时具备 songid 和 mid。
+
+匹配时会综合歌名、歌手和专辑：歌名权重最高，歌手其次，专辑再次。精确匹配优先于包含匹配；包含匹配可处理 `JOLIN蔡依林` 包含 `蔡依林` 这类别名。多歌手会逐个比较。
+
+dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先汇总所有最佳候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
+
 ## 写入结构
 
 脚本只会修改已有 `<metadata>...</metadata>` 内部的目标 `amll:meta` 节点，不会重排或重写 TTML 其它内容，也不会补充 `<head>` 或 `<metadata>`。如果根节点缺少 AMLL 命名空间声明，脚本会在根 `<tt>` 上补充 `xmlns:amll="http://www.example.com/ns/amll"`。
@@ -204,6 +214,7 @@ Disease (Apple Music Live) -> 6768201779
   <amll:meta key="musicName" value="..."/>
   <amll:meta key="artists" value="..."/>
   <amll:meta key="album" value="..."/>
+  <amll:meta key="qqMusicId" value="..."/>
   <amll:meta key="appleMusicId" value="..."/>
   <amll:meta key="isrc" value="..."/>
   <iTunesMetadata>...</iTunesMetadata>
@@ -221,9 +232,12 @@ Disease (Apple Music Live) -> 6768201779
   audio: 2. Disease (Apple Music Live).flac
   appleMusicId: 6768201779, 6768201780
   appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
+  qqMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [123456, 001abc]
+  qqMusicId: 123456, 001abc
   added: musicName = Disease (Apple Music Live), Disease - Apple Music Live
   added: artists = Lady Gaga
   added: album = Apple Music Live: MAYHEM Requiem, Apple Music Live: MAYHEM
+  added: qqMusicId = 123456, 001abc
   added: appleMusicId = 6768201779, 6768201780
   added: isrc = USUM72603828
 ```
@@ -235,9 +249,12 @@ Disease (Apple Music Live) -> 6768201779
   audio: 2. Disease (Apple Music Live).flac
   appleMusicId: 6768201779, 6768201780
   appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
+  qqMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [123456, 001abc]
+  qqMusicId: 123456, 001abc
   skipped: musicName = Disease (Apple Music Live)
   skipped: artists = Lady Gaga
   skipped: album = Apple Music Live: MAYHEM Requiem
+  skipped: qqMusicId = 123456, 001abc
   skipped: appleMusicId = 6768201779, 6768201780
   skipped: isrc = USUM72603828
 ```
@@ -280,6 +297,15 @@ song-lyrics.ttml
 - 固定查询的 `cn`、`tw`、`jp`、`kr`、`us` 区域都没有该专辑。
 - 专辑页存在，但曲名或曲目号和音频标签不一致。
 - 当前网络无法访问 Apple Music。
+
+### 找不到 QQ 音乐 ID
+
+常见原因：
+
+- 音频缺少歌名，无法发起 QQ 音乐搜索。
+- QQ 音乐搜索结果没有同时带 songid 和 mid 的候选。
+- 歌名、歌手或专辑标签太不一致，最佳候选需要在真实写入时输入 `N` 手动选择。
+- 当前网络无法访问 QQ 音乐搜索接口。
 
 ### 不想覆盖原文件
 
