@@ -27,18 +27,19 @@ python fill_ttml_metadata.py --help
 - 追加缺失的元数据值，不覆盖已有真实值，重复值会跳过。
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
+- 处理主语言为 `xml:lang="zh-Hant"` 的 TTML 时，会先自动改为 `zh-Hans`，并把歌词正文转换为简体。
 - 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐和网易云音乐 ID。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
 - 会用歌名搜索 QQ 音乐，按歌名、歌手、专辑匹配候选，并把选中结果的 songid 和 mid 分别写入 `qqMusicId`。
-- 会同时用歌名搜索网易云音乐，按歌名、歌手、专辑匹配候选，并把选中结果的歌曲 ID 写入 `ncmMusicId`。
+- 会在 QQ 音乐候选确认后查找网易云音乐：先用歌名搜索，再用确认后的 QQ 歌手和专辑补充网易云歌手专辑回查，并把选中结果的歌曲 ID 写入 `ncmMusicId`。
 
 ## 环境要求
 
 - Python 3.10 或更新版本。
 - 网络访问 Apple Music、QQ 音乐和网易云音乐公开 API，用于查找歌曲 ID。
-- Python 依赖：`mutagen`。
+- Python 依赖：`mutagen`、`opencc-python-reimplemented`。
 
 安装依赖：
 
@@ -103,7 +104,7 @@ PowerShell 里运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
 ```
 
-交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 QQ 音乐和网易云音乐最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 `mutagen`，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 QQ 音乐和网易云音乐最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
 
 ## 单首文件处理
 
@@ -212,9 +213,9 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
 
 ### 网易云音乐元数据查找
 
-网易云音乐查找只使用歌名作为搜索关键词。音频模式下歌名来自音频标签；TTML-only 模式下歌名来自已有 `amll:meta key="musicName"`。
+网易云音乐查找会在 QQ 音乐候选确认后执行。脚本先用歌名搜索网易云，再用已确认的 QQ 音乐候选补充歌名、歌手和专辑线索；如果有歌手和专辑，会额外走网易云歌手专辑回查。匹配前会把繁体和简体文本统一到简体比较，因此 `浪費眼淚` 和 `浪费眼泪` 会被视为同一歌名，但写入 TTML 时仍保留原始返回文本。
 
-脚本按网易云 API 文档的搜索参数并发请求以下公开 API，固定使用单曲搜索第一页最多 100 条候选。优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API：
+脚本按网易云 API 文档的搜索参数并发请求以下公开 API，固定使用单曲搜索第一页最多 100 条候选。优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API。直接歌名搜索会同时尝试原歌名和繁简归一后的歌名：
 
 ```text
 https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1
@@ -222,13 +223,25 @@ https://neteasecloudmusicapi-main-api.vercel.app/cloudsearch?keywords={歌名}&l
 https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1
 ```
 
-脚本读取 `result.songs` 候选，解析歌曲 ID、歌名、别名、歌手和专辑。匹配权重与 QQ 音乐一致：歌名最高，歌手其次，专辑再次。脚本会先对最多 100 条候选整体排序，再只把匹配度最高的 5 条作为手动备选展示。选中候选后只把网易云歌曲 ID 写入 `ncmMusicId`；候选里的新歌名、别名、歌手和专辑会按现有去重规则追加到对应元数据。
+如果已确认的 QQ 候选提供歌手和专辑，脚本还会请求：
+
+```text
+{网易云 API}/cloudsearch?keywords={歌手}&limit=10&offset=0&type=100
+{网易云 API}/artist/album?id={歌手id}&limit=50
+{网易云 API}/album?id={专辑id}
+```
+
+脚本读取 `result.songs` 和专辑详情里的歌曲候选，解析歌曲 ID、歌名、别名、歌手和专辑，并按歌曲 ID 去重。匹配权重与 QQ 音乐一致：歌名最高，歌手其次，专辑再次。脚本会先对合并后的候选整体排序，再只把匹配度最高的 5 条作为手动备选展示。选中候选后只把网易云歌曲 ID 写入 `ncmMusicId`；候选里的新歌名、别名、歌手和专辑会按现有去重规则追加到对应元数据。
 
 dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时会在 QQ 音乐确认之后单独确认网易云候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
 
 ## 写入结构
 
-脚本只会修改已有 `<metadata>...</metadata>` 内部的目标 `amll:meta` 节点，不会重排或重写 TTML 其它内容，也不会补充 `<head>` 或 `<metadata>`。如果根节点缺少 AMLL 命名空间声明，脚本会在根 `<tt>` 上补充 `xmlns:amll="http://www.example.com/ns/amll"`。
+脚本不会用 XML 序列化器重写整份 TTML，避免命名空间前缀和属性顺序产生无关变化。
+
+如果根 `<tt>` 是 `xml:lang="zh-Hant"`，脚本会先把根语言改为 `zh-Hans`，只转换 `<body>` 内的主歌词文本节点，并删除 `zh-Hans` replacement 翻译层和 `zh-Latn-pinyin` 音译层。`<head>/<metadata>` 里的文字和 `amll:meta value="..."` 属性不会被繁简转换。
+
+除上述语言规范化外，脚本只会修改已有 `<metadata>...</metadata>` 内部的目标 `amll:meta` 节点，不会补充 `<head>` 或 `<metadata>`。如果根节点缺少 AMLL 命名空间声明，脚本会在根 `<tt>` 上补充 `xmlns:amll="http://www.example.com/ns/amll"`。
 
 如果文件缺少 `<metadata>`，脚本会报错并跳过该文件。
 
@@ -345,8 +358,9 @@ song-lyrics.ttml
 常见原因：
 
 - 音频或 TTML 缺少歌名，无法发起网易云音乐搜索。
+- 缺少 `opencc-python-reimplemented`，无法进行繁简归一匹配；请重新执行 `python -m pip install -r requirements.txt`。
 - 三个公开网易云 API 都不可用、超时或返回结构变化。
-- 网易云音乐搜索结果没有带歌曲 ID 的候选。
+- 网易云音乐搜索结果、歌手专辑列表或专辑详情没有带歌曲 ID 的候选。
 - 歌名、歌手或专辑标签太不一致，最佳候选需要在真实写入时输入 `N` 手动选择。
 
 ### 不想覆盖原文件

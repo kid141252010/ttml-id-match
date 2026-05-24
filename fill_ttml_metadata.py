@@ -12,9 +12,12 @@ import shutil
 import sys
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
+
+from opencc import OpenCC
 
 
 AMLL_NS = "http://www.example.com/ns/amll"
@@ -26,7 +29,10 @@ DEFAULT_NCM_API_BASES = [
     "https://api-enhanced-six-beta.vercel.app",
 ]
 NCM_SEARCH_LIMIT = 100
+NCM_ARTIST_SEARCH_LIMIT = 10
+NCM_ARTIST_ALBUM_LIMIT = 50
 TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "ncmMusicId", "appleMusicId", "isrc"]
+OPENCC_T2S = OpenCC("t2s")
 AUDIO_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -100,11 +106,33 @@ class NCMusicCandidate:
     source_index: int = 0
 
 
+@dataclass(frozen=True)
+class NCMusicSearchContext:
+    titles: list[str] = field(default_factory=list)
+    artists: list[str] = field(default_factory=list)
+    albums: list[str] = field(default_factory=list)
+
+
 @dataclass
 class NCMusicSearchResult:
     candidates: list[NCMusicCandidate] = field(default_factory=list)
     selected: NCMusicCandidate | None = None
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _NCMusicArtistCandidate:
+    artist_id: str
+    name: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    source_index: int = 0
+
+
+@dataclass(frozen=True)
+class _NCMusicAlbumCandidate:
+    album_id: str
+    name: str | None = None
+    source_index: int = 0
 
 
 @dataclass
@@ -135,6 +163,24 @@ class TtmlUpdateResult:
         return bool(self.added or self.replaced)
 
 
+@dataclass
+class TtmlLanguageNormalizationResult:
+    language_changed: bool = False
+    body_text_changed: bool = False
+    removed_translations: int = 0
+    removed_transliterations: int = 0
+    backup_path: Path | None = None
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.language_changed
+            or self.body_text_changed
+            or self.removed_translations
+            or self.removed_transliterations
+        )
+
+
 @dataclass(frozen=True)
 class _XmlAttribute:
     value: str
@@ -160,7 +206,7 @@ class QQMusicClientProtocol(Protocol):
 
 
 class NCMusicClientProtocol(Protocol):
-    def search_songs(self, query: str) -> list[NCMusicCandidate]:
+    def search_songs(self, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
         ...
 
 
@@ -328,13 +374,15 @@ class NCMusicClient:
         self.api_bases = [base.rstrip("/") for base in (api_bases or DEFAULT_NCM_API_BASES) if base]
         self._read_json = read_json or self._read_json_from_url
 
-    def search_songs(self, query: str) -> list[NCMusicCandidate]:
+    def search_songs(self, context: NCMusicSearchContext | str) -> list[NCMusicCandidate]:
         if not self.api_bases:
             return []
+        if isinstance(context, str):
+            context = NCMusicSearchContext(titles=_text_with_simplified_variants(context))
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.api_bases))
         futures = {
-            executor.submit(self._search_base, base, query): base
+            executor.submit(self._search_base, base, context): base
             for base in self.api_bases
         }
         errors: list[str] = []
@@ -358,10 +406,64 @@ class NCMusicClient:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-    def _search_base(self, base: str, query: str) -> list[NCMusicCandidate]:
-        url = self._build_search_url(base, query)
-        payload = self._read_json(url)
-        return _parse_ncm_music_candidates(payload)
+    def _search_base(self, base: str, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
+        candidates: list[NCMusicCandidate] = []
+        errors: list[str] = []
+        for query in context.titles:
+            try:
+                payload = self._read_json(self._build_search_url(base, query))
+            except Exception as exc:
+                errors.append(f"song:{query}: {exc}")
+                continue
+            candidates.extend(_parse_ncm_music_candidates(payload))
+
+        candidates.extend(self._search_album_song_candidates(base, context))
+        deduped = _dedupe_ncm_music_candidates(candidates)
+        if not deduped and errors:
+            raise LookupError("; ".join(errors))
+        return deduped
+
+    def _search_album_song_candidates(self, base: str, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
+        if not context.titles or not context.artists or not context.albums:
+            return []
+
+        artists = self._find_matching_artists(base, context)
+        candidates: list[NCMusicCandidate] = []
+        seen_album_ids: set[str] = set()
+        for artist in artists:
+            try:
+                payload = self._read_json(self._build_artist_album_url(base, artist.artist_id))
+            except Exception:
+                continue
+            for album in _parse_ncm_artist_album_candidates(payload):
+                if album.album_id in seen_album_ids or not _ncm_album_matches(context, album):
+                    continue
+                seen_album_ids.add(album.album_id)
+                try:
+                    album_payload = self._read_json(self._build_album_url(base, album.album_id))
+                except Exception:
+                    continue
+                candidates.extend(
+                    candidate
+                    for candidate in _parse_ncm_album_song_candidates(album_payload)
+                    if _ncm_candidate_title_score(context, candidate) > 0
+                )
+        return candidates
+
+    def _find_matching_artists(self, base: str, context: NCMusicSearchContext) -> list[_NCMusicArtistCandidate]:
+        matches: list[_NCMusicArtistCandidate] = []
+        seen_artist_ids: set[str] = set()
+        for query in context.artists:
+            try:
+                payload = self._read_json(self._build_artist_search_url(base, query))
+            except Exception:
+                continue
+            for artist in _parse_ncm_artist_candidates(payload):
+                if artist.artist_id in seen_artist_ids or not _ncm_artist_matches(context, artist):
+                    continue
+                seen_artist_ids.add(artist.artist_id)
+                matches.append(artist)
+        return matches
 
     @staticmethod
     def _build_search_url(base: str, query: str) -> str:
@@ -374,6 +476,33 @@ class NCMusicClient:
             }
         )
         return f"{base.rstrip('/')}/cloudsearch?{params}"
+
+    @staticmethod
+    def _build_artist_search_url(base: str, query: str) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "keywords": query,
+                "limit": NCM_ARTIST_SEARCH_LIMIT,
+                "offset": 0,
+                "type": 100,
+            }
+        )
+        return f"{base.rstrip('/')}/cloudsearch?{params}"
+
+    @staticmethod
+    def _build_artist_album_url(base: str, artist_id: str) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "id": artist_id,
+                "limit": NCM_ARTIST_ALBUM_LIMIT,
+            }
+        )
+        return f"{base.rstrip('/')}/artist/album?{params}"
+
+    @staticmethod
+    def _build_album_url(base: str, album_id: str) -> str:
+        params = urllib.parse.urlencode({"id": album_id})
+        return f"{base.rstrip('/')}/album?{params}"
 
     def _read_json_from_url(self, url: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -518,21 +647,23 @@ def collect_qq_music_metadata(
 def collect_ncm_music_metadata(
     metadata: AudioMetadata,
     client: NCMusicClientProtocol,
+    qq_music_candidate: QQMusicCandidate | None = None,
 ) -> NCMusicSearchResult:
     result = NCMusicSearchResult()
     if not metadata.title:
         result.errors.append("未读取到歌名，跳过网易云音乐搜索")
         return result
 
+    context = _build_ncm_music_search_context(metadata, qq_music_candidate)
     try:
-        candidates = client.search_songs(metadata.title)
+        candidates = client.search_songs(context)
     except Exception as exc:
         result.errors.append(f"网易云音乐搜索失败: {exc}")
         return result
 
     result.candidates = sorted(
         candidates,
-        key=lambda candidate: (-_ncm_music_candidate_score(metadata, candidate), candidate.source_index),
+        key=lambda candidate: (-_ncm_music_candidate_score(context, candidate), candidate.source_index),
     )
     if not result.candidates:
         result.errors.append("网易云音乐未找到带歌曲 ID 的候选")
@@ -635,7 +766,12 @@ def confirm_ncm_music_candidates(
             print_func("Invalid selection.")
 
 
-def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool) -> TtmlUpdateResult:
+def update_ttml_metadata(
+    path: Path,
+    values: dict[str, list[str]],
+    dry_run: bool,
+    backup_paths: dict[Path, Path] | None = None,
+) -> TtmlUpdateResult:
     text = path.read_text(encoding="utf-8")
     text, amll_prefix = _ensure_amll_namespace(text)
     metadata_start, metadata_end = _find_metadata_inner_bounds(text)
@@ -649,10 +785,51 @@ def update_ttml_metadata(path: Path, values: dict[str, list[str]], dry_run: bool
         metadata = _apply_meta_values(metadata, amll_prefix, key, proposed_values, result)
 
     if result.changed and not dry_run:
-        backup_path = _backup_path(path)
-        shutil.copy2(path, backup_path)
+        backup_path = _ensure_backup(path, backup_paths)
         result.backup_path = backup_path
         output = text[:metadata_start] + metadata + text[metadata_end:]
+        path.write_text(output, encoding="utf-8")
+
+    return result
+
+
+def normalize_ttml_language(
+    path: Path,
+    dry_run: bool,
+    backup_paths: dict[Path, Path] | None = None,
+) -> TtmlLanguageNormalizationResult:
+    text = path.read_text(encoding="utf-8")
+    root_match = _find_root_tt_tag(text)
+    if not root_match:
+        raise ValueError("missing <tt> root; refusing to normalize TTML language")
+
+    root_tag = root_match.group(0)
+    root_attrs = _parse_xml_attributes(root_tag, root_match.start())
+    lang_attr = root_attrs.get("xml:lang")
+    if not lang_attr or lang_attr.value != "zh-Hant":
+        return TtmlLanguageNormalizationResult()
+
+    result = TtmlLanguageNormalizationResult(language_changed=True)
+    output = text[: lang_attr.value_start] + "zh-Hans" + text[lang_attr.value_end :]
+
+    output, result.removed_translations = _remove_zh_hans_replacement_translations(output)
+    output, result.removed_transliterations = _remove_pinyin_transliterations(output)
+    output = _remove_empty_layer_containers(output, "translations")
+    output = _remove_empty_layer_containers(output, "transliterations")
+
+    converted = _convert_body_text_nodes_to_simplified(output)
+    if converted != output:
+        result.body_text_changed = True
+        output = converted
+
+    if result.changed:
+        try:
+            ET.fromstring(output)
+        except ET.ParseError as exc:
+            raise ValueError(f"normalized TTML is not valid XML: {exc}") from exc
+
+    if result.changed and not dry_run:
+        result.backup_path = _ensure_backup(path, backup_paths)
         path.write_text(output, encoding="utf-8")
 
     return result
@@ -751,8 +928,17 @@ def main(argv: list[str] | None = None) -> int:
     qq_music_client = QQMusicClient()
     ncm_music_client = NCMusicClient()
     failures = 0
+    backup_paths: dict[Path, Path] = {}
     prepared_pairs: list[PairMetadata] = []
     for work_item in work_items:
+        try:
+            normalization = normalize_ttml_language(work_item.ttml_path, dry_run=args.dry_run, backup_paths=backup_paths)
+            _print_language_normalization_result(work_item.ttml_path, normalization, dry_run=args.dry_run)
+        except Exception as exc:
+            failures += 1
+            _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
+            continue
+
         try:
             prepared_pairs.append(_prepare_work_item(work_item, apple_music_client, qq_music_client, ncm_music_client))
         except Exception as exc:
@@ -760,11 +946,12 @@ def main(argv: list[str] | None = None) -> int:
             _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
 
     confirm_qq_music_candidates(prepared_pairs, dry_run=args.dry_run)
+    _collect_ncm_music_metadata_for_pairs(prepared_pairs, ncm_music_client)
     confirm_ncm_music_candidates(prepared_pairs, dry_run=args.dry_run)
 
     for pair in prepared_pairs:
         try:
-            _process_prepared_pair(pair, dry_run=args.dry_run)
+            _process_prepared_pair(pair, dry_run=args.dry_run, backup_paths=backup_paths)
         except Exception as exc:
             failures += 1
             _safe_print(f"[error] {pair.ttml_path.name}: {exc}", file=sys.stderr)
@@ -782,8 +969,7 @@ def _prepare_pair(
     metadata = read_audio_metadata(audio_path)
     apple_music_metadata = collect_apple_music_metadata(metadata, apple_music_client)
     qq_music_metadata = collect_qq_music_metadata(metadata, qq_music_client)
-    ncm_music_metadata = collect_ncm_music_metadata(metadata, ncm_music_client or NCMusicClient())
-    return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata, ncm_music_metadata)
+    return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata, NCMusicSearchResult())
 
 
 def _prepare_work_item(
@@ -804,7 +990,7 @@ def _prepare_work_item(
         metadata,
         AppleMusicMetadataResult(),
         collect_qq_music_metadata(metadata, qq_music_client),
-        collect_ncm_music_metadata(metadata, ncm_music_client or NCMusicClient()),
+        NCMusicSearchResult(),
     )
 
 
@@ -818,11 +1004,28 @@ def _process_pair(
 ) -> None:
     pair = _prepare_pair(audio_path, ttml_path, client, qq_music_client or QQMusicClient(), ncm_music_client)
     confirm_qq_music_candidates([pair], dry_run=dry_run)
+    _collect_ncm_music_metadata_for_pairs([pair], ncm_music_client or NCMusicClient())
     confirm_ncm_music_candidates([pair], dry_run=dry_run)
     _process_prepared_pair(pair, dry_run=dry_run)
 
 
-def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
+def _collect_ncm_music_metadata_for_pairs(
+    pairs: list[PairMetadata],
+    ncm_music_client: NCMusicClientProtocol,
+) -> None:
+    for pair in pairs:
+        pair.ncm_music_metadata = collect_ncm_music_metadata(
+            pair.metadata,
+            ncm_music_client,
+            qq_music_candidate=pair.qq_music_metadata.selected,
+        )
+
+
+def _process_prepared_pair(
+    pair: PairMetadata,
+    dry_run: bool,
+    backup_paths: dict[Path, Path] | None = None,
+) -> None:
     values = values_from_metadata(
         pair.metadata,
         pair.apple_music_metadata.values,
@@ -834,7 +1037,7 @@ def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
     apple_music_metadata = pair.apple_music_metadata
     qq_music_metadata = pair.qq_music_metadata
     ncm_music_metadata = pair.ncm_music_metadata
-    result = update_ttml_metadata(ttml_path, values, dry_run=dry_run)
+    result = update_ttml_metadata(ttml_path, values, dry_run=dry_run, backup_paths=backup_paths)
 
     status = "dry-run" if dry_run else "updated"
     if not result.changed:
@@ -863,6 +1066,28 @@ def _process_prepared_pair(pair: PairMetadata, dry_run: bool) -> None:
     _print_change_group("added", result.added)
     _print_change_group("replaced", result.replaced)
     _print_change_group("skipped", result.skipped)
+    if result.backup_path:
+        _safe_print(f"  backup: {result.backup_path}")
+
+
+def _print_language_normalization_result(
+    ttml_path: Path,
+    result: TtmlLanguageNormalizationResult,
+    dry_run: bool,
+) -> None:
+    if not result.changed:
+        return
+
+    status = "dry-run" if dry_run else "normalized"
+    _safe_print(f"[{status}] {ttml_path.name}")
+    if result.language_changed:
+        _safe_print("  language: zh-Hant -> zh-Hans")
+    if result.body_text_changed:
+        _safe_print("  lyrics: traditional -> simplified")
+    if result.removed_translations:
+        _safe_print(f"  removed: zh-Hans replacement translations = {result.removed_translations}")
+    if result.removed_transliterations:
+        _safe_print(f"  removed: zh-Latn-pinyin transliterations = {result.removed_transliterations}")
     if result.backup_path:
         _safe_print(f"  backup: {result.backup_path}")
 
@@ -1038,6 +1263,81 @@ def _parse_ncm_music_candidates(payload: dict[str, Any]) -> list[NCMusicCandidat
     return candidates
 
 
+def _parse_ncm_artist_candidates(payload: dict[str, Any]) -> list[_NCMusicArtistCandidate]:
+    artists = _nested_get(payload, "result", "artists")
+    if not isinstance(artists, list):
+        return []
+
+    candidates: list[_NCMusicArtistCandidate] = []
+    for index, artist in enumerate(artists):
+        if not isinstance(artist, dict):
+            continue
+        artist_id = _stringify_tag_value(artist.get("id"))
+        if not artist_id:
+            continue
+        candidates.append(
+            _NCMusicArtistCandidate(
+                artist_id=artist_id,
+                name=_stringify_tag_value(artist.get("name")),
+                aliases=_ncm_artist_aliases(artist),
+                source_index=index,
+            )
+        )
+    return candidates
+
+
+def _parse_ncm_artist_album_candidates(payload: dict[str, Any]) -> list[_NCMusicAlbumCandidate]:
+    albums = payload.get("hotAlbums")
+    if not isinstance(albums, list):
+        albums = _nested_get(payload, "result", "albums")
+    if not isinstance(albums, list):
+        return []
+
+    candidates: list[_NCMusicAlbumCandidate] = []
+    for index, album in enumerate(albums):
+        if not isinstance(album, dict):
+            continue
+        album_id = _stringify_tag_value(album.get("id"))
+        if not album_id:
+            continue
+        candidates.append(
+            _NCMusicAlbumCandidate(
+                album_id=album_id,
+                name=_stringify_tag_value(album.get("name") or album.get("title")),
+                source_index=index,
+            )
+        )
+    return candidates
+
+
+def _parse_ncm_album_song_candidates(payload: dict[str, Any]) -> list[NCMusicCandidate]:
+    songs = payload.get("songs")
+    if not isinstance(songs, list):
+        songs = _nested_get(payload, "result", "songs")
+    if not isinstance(songs, list):
+        songs = _nested_get(payload, "album", "songs")
+    if not isinstance(songs, list):
+        return []
+    return _parse_ncm_music_candidates({"result": {"songs": songs}})
+
+
+def _ncm_artist_aliases(artist: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    for key in ("alias", "alia", "trans"):
+        value = artist.get(key)
+        if isinstance(value, list):
+            pieces = value
+        elif value:
+            pieces = [value]
+        else:
+            pieces = []
+        for piece in pieces:
+            text = _stringify_tag_value(piece)
+            if text and text not in aliases:
+                aliases.append(text)
+    return aliases
+
+
 def _ncm_music_aliases(song: dict[str, Any]) -> list[str]:
     aliases: list[str] = []
     for key in ("alia", "alias", "tns"):
@@ -1103,16 +1403,91 @@ def _qq_music_candidate_score(metadata: AudioMetadata, candidate: QQMusicCandida
     return score
 
 
-def _ncm_music_candidate_score(metadata: AudioMetadata, candidate: NCMusicCandidate) -> int:
-    title_score = max(
-        [_text_match_score(metadata.title, candidate.title)]
-        + [_text_match_score(metadata.title, alias) for alias in candidate.aliases]
-    )
+def _ncm_music_candidate_score(context: NCMusicSearchContext, candidate: NCMusicCandidate) -> int:
+    title_score = _ncm_candidate_title_score(context, candidate)
     score = title_score * 100
-    for artist in metadata.artists:
+    for artist in context.artists:
         score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 60
-    score += _text_match_score(metadata.album, candidate.album) * 30
+    score += max((_text_match_score(album, candidate.album) for album in context.albums), default=0) * 30
     return score
+
+
+def _ncm_candidate_title_score(context: NCMusicSearchContext, candidate: NCMusicCandidate) -> int:
+    return max(
+        [
+            _text_match_score(title, candidate_title)
+            for title in context.titles
+            for candidate_title in [candidate.title, *candidate.aliases]
+        ],
+        default=0,
+    )
+
+
+def _build_ncm_music_search_context(
+    metadata: AudioMetadata,
+    qq_music_candidate: QQMusicCandidate | None = None,
+) -> NCMusicSearchContext:
+    titles: list[str] = []
+    artists: list[str] = []
+    albums: list[str] = []
+
+    _add_text_with_simplified_variants(titles, metadata.title)
+    for artist in metadata.artists:
+        _add_text_with_simplified_variants(artists, artist)
+    _add_text_with_simplified_variants(albums, metadata.album)
+
+    if qq_music_candidate:
+        _add_text_with_simplified_variants(titles, qq_music_candidate.title)
+        _add_text_with_simplified_variants(titles, qq_music_candidate.subtitle)
+        for artist in qq_music_candidate.artists:
+            _add_text_with_simplified_variants(artists, artist)
+        _add_text_with_simplified_variants(albums, qq_music_candidate.album)
+
+    return NCMusicSearchContext(titles=titles, artists=artists, albums=albums)
+
+
+def _text_with_simplified_variants(value: Any) -> list[str]:
+    variants: list[str] = []
+    _add_text_with_simplified_variants(variants, value)
+    return variants
+
+
+def _add_text_with_simplified_variants(values: list[str], value: Any) -> None:
+    text = _stringify_tag_value(value)
+    if not text:
+        return
+    for variant in (text, _to_simplified_text(text)):
+        if variant and variant not in values:
+            values.append(variant)
+
+
+def _ncm_artist_matches(context: NCMusicSearchContext, artist: _NCMusicArtistCandidate) -> bool:
+    candidate_names = [artist.name, *artist.aliases]
+    return any(_text_match_score(expected, actual) > 0 for expected in context.artists for actual in candidate_names)
+
+
+def _ncm_album_matches(context: NCMusicSearchContext, album: _NCMusicAlbumCandidate) -> bool:
+    return any(_text_match_score(expected, album.name) > 0 for expected in context.albums)
+
+
+def _dedupe_ncm_music_candidates(candidates: Iterable[NCMusicCandidate]) -> list[NCMusicCandidate]:
+    unique: list[NCMusicCandidate] = []
+    seen_song_ids: set[str] = set()
+    for candidate in candidates:
+        if candidate.song_id in seen_song_ids:
+            continue
+        seen_song_ids.add(candidate.song_id)
+        unique.append(
+            NCMusicCandidate(
+                song_id=candidate.song_id,
+                title=candidate.title,
+                aliases=list(candidate.aliases),
+                artists=list(candidate.artists),
+                album=candidate.album,
+                source_index=len(unique),
+            )
+        )
+    return unique
 
 
 def _text_match_score(expected: Any, actual: Any) -> int:
@@ -1130,9 +1505,13 @@ def _text_match_score(expected: Any, actual: Any) -> int:
 def _normalize_match_text(value: Any) -> str:
     if value is None:
         return ""
-    normalized = str(value).casefold().strip()
+    normalized = _to_simplified_text(str(value)).casefold().strip()
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized
+
+
+def _to_simplified_text(value: str) -> str:
+    return OPENCC_T2S.convert(value)
 
 
 def _same_raw_text(left: Any, right: Any) -> bool:
@@ -1191,6 +1570,109 @@ def _find_metadata_inner_bounds(text: str) -> tuple[int, int]:
         raise ValueError(f"missing </{tag_name}>; refusing to rewrite TTML")
 
     return open_match.end(), open_match.end() + close_match.start()
+
+
+def _find_root_tt_tag(text: str) -> re.Match[str] | None:
+    return re.search(r"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?tt)\b[^>]*>", text, flags=re.DOTALL)
+
+
+def _find_element_inner_bounds(text: str, local_name: str) -> tuple[int, int] | None:
+    open_match = re.search(rf"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?{re.escape(local_name)})\b[^>]*>", text, flags=re.DOTALL)
+    if not open_match:
+        return None
+    if open_match.group(0).rstrip().endswith("/>"):
+        return None
+
+    tag_name = open_match.group("tag")
+    close_match = re.search(rf"</{re.escape(tag_name)}\s*>", text[open_match.end() :], flags=re.DOTALL)
+    if not close_match:
+        raise ValueError(f"missing </{tag_name}>; refusing to rewrite TTML")
+    return open_match.end(), open_match.end() + close_match.start()
+
+
+def _remove_zh_hans_replacement_translations(text: str) -> tuple[str, int]:
+    pattern = re.compile(
+        r"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?translation)\b"
+        r"(?=[^>]*\btype\s*=\s*(?P<type_quote>[\"'])replacement(?P=type_quote))"
+        r"(?=[^>]*\bxml:lang\s*=\s*(?P<lang_quote>[\"'])zh-Hans(?P=lang_quote))"
+        r"[^>]*(?:/>|>.*?</(?P=tag)\s*>)",
+        flags=re.DOTALL,
+    )
+    return pattern.subn("", text)
+
+
+def _remove_pinyin_transliterations(text: str) -> tuple[str, int]:
+    pattern = re.compile(
+        r"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?transliteration)\b"
+        r"(?=[^>]*\bxml:lang\s*=\s*(?P<lang_quote>[\"'])zh-Latn-pinyin(?P=lang_quote))"
+        r"[^>]*(?:/>|>.*?</(?P=tag)\s*>)",
+        flags=re.DOTALL,
+    )
+    return pattern.subn("", text)
+
+
+def _remove_empty_layer_containers(text: str, local_name: str) -> str:
+    pattern = re.compile(
+        rf"<(?P<tag>(?:[A-Za-z_][\w.-]*:)?{re.escape(local_name)})\b[^>]*>\s*</(?P=tag)\s*>",
+        flags=re.DOTALL,
+    )
+    return pattern.sub("", text)
+
+
+def _convert_body_text_nodes_to_simplified(text: str) -> str:
+    bounds = _find_element_inner_bounds(text, "body")
+    if not bounds:
+        return text
+
+    start, end = bounds
+    body = text[start:end]
+    converted = _convert_xml_text_nodes_to_simplified(
+        body,
+        skip_local_names={"translations", "translation", "transliterations", "transliteration"},
+    )
+    return text[:start] + converted + text[end:]
+
+
+def _convert_xml_text_nodes_to_simplified(text: str, skip_local_names: set[str]) -> str:
+    pieces = re.split(r"(<[^>]+>)", text)
+    stack: list[str] = []
+    output: list[str] = []
+
+    for piece in pieces:
+        if not piece:
+            continue
+        if piece.startswith("<"):
+            _update_xml_stack(stack, piece)
+            output.append(piece)
+            continue
+        if skip_local_names.isdisjoint(stack):
+            output.append(_to_simplified_text(piece))
+        else:
+            output.append(piece)
+
+    return "".join(output)
+
+
+def _update_xml_stack(stack: list[str], tag_text: str) -> None:
+    if tag_text.startswith(("<!--", "<?", "<!")):
+        return
+
+    close_match = re.match(r"</\s*(?P<name>[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)", tag_text)
+    if close_match:
+        local_name = close_match.group("name").split(":")[-1]
+        if stack and stack[-1] == local_name:
+            stack.pop()
+            return
+        for index in range(len(stack) - 1, -1, -1):
+            if stack[index] == local_name:
+                del stack[index:]
+                return
+        return
+
+    open_match = re.match(r"<\s*(?P<name>[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)", tag_text)
+    if not open_match or tag_text.rstrip().endswith("/>"):
+        return
+    stack.append(open_match.group("name").split(":")[-1])
 
 
 def _find_amll_prefix(text: str) -> str:
@@ -1344,6 +1826,25 @@ def _make_meta_node(amll_prefix: str, key: str, value: str) -> str:
 
 def _escape_xml_attr(value: str) -> str:
     return html.escape(str(value), quote=True)
+
+
+def _ensure_backup(path: Path, backup_paths: dict[Path, Path] | None = None) -> Path:
+    key = _backup_map_key(path)
+    if backup_paths is not None and key in backup_paths:
+        return backup_paths[key]
+
+    backup_path = _backup_path(path)
+    shutil.copy2(path, backup_path)
+    if backup_paths is not None:
+        backup_paths[key] = backup_path
+    return backup_path
+
+
+def _backup_map_key(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
 
 
 def _backup_path(path: Path) -> Path:

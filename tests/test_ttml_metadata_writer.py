@@ -13,6 +13,7 @@ from fill_ttml_metadata import (
     DEFAULT_STORES,
     NCMusicCandidate,
     NCMusicClient,
+    NCMusicSearchContext,
     NCMusicSearchResult,
     PairMetadata,
     QQMusicCandidate,
@@ -25,15 +26,18 @@ from fill_ttml_metadata import (
     confirm_qq_music_candidates,
     find_directory_work_items,
     main,
+    normalize_ttml_language,
     read_ttml_metadata,
     update_ttml_metadata,
     values_from_metadata,
     WorkItem,
+    _collect_ncm_music_metadata_for_pairs,
     _flatten_tags,
     _prepare_work_item,
     _parse_ncm_music_candidates,
     _parse_qq_music_candidates,
     _safe_print,
+    _text_match_score,
 )
 
 
@@ -346,6 +350,125 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             stream.close()
 
 
+class TtmlLanguageNormalizationTests(unittest.TestCase):
+    def write_ttml(self, text: str, directory: Path) -> Path:
+        path = directory / "song.ttml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def zh_hant_ttml(self, body: str, metadata_inner: str | None = None) -> str:
+        metadata = (
+            '<amll:meta key="musicName" value="浪費眼淚"/>'
+            '<iTunesMetadata><songwriters><songwriter>黃韻玲</songwriter></songwriters></iTunesMetadata>'
+            if metadata_inner is None
+            else metadata_inner
+        )
+        return (
+            '<tt xmlns="http://www.w3.org/ns/ttml" '
+            'xmlns:amll="http://www.example.com/ns/amll" '
+            'xml:lang="zh-Hant">'
+            f"<head><metadata>{metadata}</metadata></head>"
+            f"<body>{body}</body>"
+            "</tt>"
+        )
+
+    def test_normalizes_zh_hant_body_text_and_removes_target_layers_without_rewriting_metadata(self) -> None:
+        body = (
+            '<div><p begin="00:00.000" end="00:01.000">輪到我出場 我不會怯場</p>'
+            '<translations>'
+            '<translation type="replacement" xml:lang="zh-Hans"><p>替換文字</p></translation>'
+            '<translation type="subtitle" xml:lang="en"><p>Keep English</p></translation>'
+            '</translations>'
+            '<transliterations>'
+            '<transliteration xml:lang="zh-Latn-pinyin"><p>lun dao wo chu chang</p></transliteration>'
+            '<transliteration xml:lang="ja-Latn"><p>keep latin</p></transliteration>'
+            '</transliterations>'
+            "</div>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(self.zh_hant_ttml(body), Path(tmp))
+
+            result = normalize_ttml_language(path, dry_run=False)
+
+            after = path.read_text(encoding="utf-8")
+            self.assertTrue(result.changed)
+            self.assertTrue(result.language_changed)
+            self.assertTrue(result.body_text_changed)
+            self.assertEqual(result.removed_translations, 1)
+            self.assertEqual(result.removed_transliterations, 1)
+            self.assertIsNotNone(result.backup_path)
+            self.assertTrue(result.backup_path.exists())
+            self.assertIn('xml:lang="zh-Hans"', after)
+            self.assertNotIn('xml:lang="zh-Hant"', after)
+            self.assertIn("轮到我出场 我不会怯场", after)
+            self.assertNotIn("輪到我出場 我不會怯場", after)
+            self.assertIn('<songwriter>黃韻玲</songwriter>', after)
+            self.assertIn('<amll:meta key="musicName" value="浪費眼淚"/>', after)
+            self.assertNotIn('type="replacement" xml:lang="zh-Hans"', after)
+            self.assertNotIn('xml:lang="zh-Latn-pinyin"', after)
+            self.assertIn('type="subtitle" xml:lang="en"', after)
+            self.assertIn('xml:lang="ja-Latn"', after)
+
+    def test_zh_hans_file_is_unchanged_and_does_not_create_backup(self) -> None:
+        text = self.zh_hant_ttml('<div><p>已经是简体</p></div>').replace('xml:lang="zh-Hant"', 'xml:lang="zh-Hans"')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(text, Path(tmp))
+
+            result = normalize_ttml_language(path, dry_run=False)
+
+            self.assertFalse(result.changed)
+            self.assertIsNone(result.backup_path)
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            self.assertFalse(path.with_suffix(path.suffix + ".bak").exists())
+
+    def test_dry_run_reports_changes_without_writing_or_backup(self) -> None:
+        text = self.zh_hant_ttml('<div><p>自帶燈光 自帶氣場</p></div>')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(text, Path(tmp))
+
+            result = normalize_ttml_language(path, dry_run=True)
+
+            self.assertTrue(result.changed)
+            self.assertTrue(result.language_changed)
+            self.assertTrue(result.body_text_changed)
+            self.assertIsNone(result.backup_path)
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            self.assertFalse(path.with_suffix(path.suffix + ".bak").exists())
+
+    def test_metadata_update_reuses_normalization_backup_for_same_file(self) -> None:
+        text = self.zh_hant_ttml(
+            '<div><p>聽不見 大聲為我鼓掌</p></div>',
+            metadata_inner='<amll:meta key="musicName" value="*"/>',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(text, Path(tmp))
+            backup_paths: dict[Path, Path] = {}
+
+            normalization = normalize_ttml_language(path, dry_run=False, backup_paths=backup_paths)
+            update = update_ttml_metadata(path, {"musicName": ["Real Song"]}, dry_run=False, backup_paths=backup_paths)
+
+            self.assertIsNotNone(normalization.backup_path)
+            self.assertEqual(update.backup_path, normalization.backup_path)
+            self.assertTrue(path.with_suffix(path.suffix + ".bak").exists())
+            self.assertFalse(path.with_suffix(path.suffix + ".bak1").exists())
+
+    def test_main_normalizes_language_even_when_metadata_lookup_fails(self) -> None:
+        text = self.zh_hant_ttml('<div><p>誰要不溫不火</p></div>', metadata_inner="")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(text, Path(tmp))
+            stderr = StringIO()
+
+            with redirect_stderr(stderr):
+                exit_code = main(["--ttml", str(path)])
+
+            after = path.read_text(encoding="utf-8")
+            self.assertEqual(exit_code, 1)
+            self.assertIn("TTML 中未读取到歌名", stderr.getvalue())
+            self.assertIn('xml:lang="zh-Hans"', after)
+            self.assertIn("谁要不温不火", after)
+            self.assertTrue(path.with_suffix(path.suffix + ".bak").exists())
+
+
 class QQMusicMetadataTests(unittest.TestCase):
     def test_qq_music_request_uses_exact_mobile_search_payload(self) -> None:
         request = QQMusicClient()._build_search_request("玫瑰少年")
@@ -547,6 +670,10 @@ class QQMusicMetadataTests(unittest.TestCase):
 
 
 class NCMusicMetadataTests(unittest.TestCase):
+    def test_match_score_normalizes_traditional_chinese(self) -> None:
+        self.assertEqual(_text_match_score("浪費眼淚", "浪费眼泪"), 2)
+        self.assertEqual(_text_match_score("Ella陳嘉樺", "陈嘉桦"), 1)
+
     def test_parses_ncm_music_candidates_from_cloudsearch_songs_and_requires_id(self) -> None:
         payload = {
             "result": {
@@ -613,6 +740,32 @@ class NCMusicMetadataTests(unittest.TestCase):
         self.assertEqual(params["offset"], ["0"])
         self.assertEqual(params["type"], ["1"])
 
+    def test_ncm_artist_album_urls_use_documented_windows(self) -> None:
+        artist_url = NCMusicClient._build_artist_search_url("https://music163.example", "陈嘉桦")
+        artist_parsed = urllib.parse.urlparse(artist_url)
+        artist_params = urllib.parse.parse_qs(artist_parsed.query)
+
+        self.assertEqual(artist_parsed.path, "/cloudsearch")
+        self.assertEqual(artist_params["keywords"], ["陈嘉桦"])
+        self.assertEqual(artist_params["limit"], ["10"])
+        self.assertEqual(artist_params["offset"], ["0"])
+        self.assertEqual(artist_params["type"], ["100"])
+
+        albums_url = NCMusicClient._build_artist_album_url("https://music163.example", "7647")
+        albums_parsed = urllib.parse.urlparse(albums_url)
+        albums_params = urllib.parse.parse_qs(albums_parsed.query)
+
+        self.assertEqual(albums_parsed.path, "/artist/album")
+        self.assertEqual(albums_params["id"], ["7647"])
+        self.assertEqual(albums_params["limit"], ["50"])
+
+        album_url = NCMusicClient._build_album_url("https://music163.example", "3129832")
+        album_parsed = urllib.parse.urlparse(album_url)
+        album_params = urllib.parse.parse_qs(album_parsed.query)
+
+        self.assertEqual(album_parsed.path, "/album")
+        self.assertEqual(album_params["id"], ["3129832"])
+
     def test_ncm_client_falls_back_when_fastest_response_fails(self) -> None:
         def read_json(url: str):
             if "fast-fail.invalid" in url:
@@ -631,8 +784,8 @@ class NCMusicMetadataTests(unittest.TestCase):
 
     def test_ranks_ncm_candidates_by_title_artist_album_and_contains(self) -> None:
         class SearchClient:
-            def search_songs(self, query):
-                self.query = query
+            def search_songs(self, context):
+                self.context = context
                 return [
                     NCMusicCandidate("235883438", "玫瑰少年", [], ["五月天"], "玫瑰少年", 0),
                     NCMusicCandidate("224116257", "玫瑰少年", [], ["JOLIN蔡依林"], "UGLY BEAUTY", 1),
@@ -653,13 +806,13 @@ class NCMusicMetadataTests(unittest.TestCase):
             client,
         )
 
-        self.assertEqual(client.query, "玫瑰少年")
+        self.assertEqual(client.context.titles, ["玫瑰少年"])
         self.assertEqual([candidate.song_id for candidate in result.candidates], ["224116257", "415233914", "235883438"])
 
     def test_ncm_ranking_considers_candidates_after_the_first_five_raw_results(self) -> None:
         class SearchClient:
-            def search_songs(self, query):
-                self.query = query
+            def search_songs(self, context):
+                self.context = context
                 return [
                     NCMusicCandidate(str(index), f"Other {index}", [], ["Other"], "Other Album", index)
                     for index in range(7)
@@ -673,6 +826,133 @@ class NCMusicMetadataTests(unittest.TestCase):
         )
 
         self.assertEqual(result.candidates[0].song_id, "1375248354")
+
+    def test_ncm_context_uses_selected_qq_candidate_as_search_hint(self) -> None:
+        class SearchClient:
+            def search_songs(self, context):
+                self.context = context
+                return []
+
+        client = SearchClient()
+
+        collect_ncm_music_metadata(
+            AudioMetadata(title="浪費眼淚"),
+            client,
+            qq_music_candidate=QQMusicCandidate(
+                "102347867",
+                "003Pbr2b1nKveQ",
+                "浪费眼泪",
+                "",
+                ["Ella陈嘉桦"],
+                "WHY NOT",
+                0,
+            ),
+        )
+
+        self.assertEqual(client.context.titles, ["浪費眼淚", "浪费眼泪"])
+        self.assertEqual(client.context.artists, ["Ella陈嘉桦"])
+        self.assertEqual(client.context.albums, ["WHY NOT"])
+
+    def test_ncm_context_without_qq_candidate_uses_original_metadata_only(self) -> None:
+        class SearchClient:
+            def search_songs(self, context):
+                self.context = context
+                return []
+
+        client = SearchClient()
+
+        collect_ncm_music_metadata(
+            AudioMetadata(title="差一點", artists=["Ella陳嘉樺"], album="WHY NOT"),
+            client,
+        )
+
+        self.assertEqual(client.context.titles, ["差一點", "差一点"])
+        self.assertEqual(client.context.artists, ["Ella陳嘉樺", "Ella陈嘉桦"])
+        self.assertEqual(client.context.albums, ["WHY NOT"])
+
+    def test_ncm_client_adds_album_song_candidates_from_matching_artist_album(self) -> None:
+        requested_urls: list[str] = []
+
+        def read_json(url: str):
+            requested_urls.append(url)
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+
+            if parsed.path == "/cloudsearch" and params.get("type") == ["1"]:
+                return {
+                    "result": {
+                        "songs": [
+                            {
+                                "id": 1454005949,
+                                "name": "不再浪费眼泪",
+                                "ar": [{"name": "丁燕铃"}],
+                                "al": {"name": "等你等到白了头"},
+                            }
+                        ]
+                    }
+                }
+            if parsed.path == "/cloudsearch" and params.get("type") == ["100"]:
+                return {
+                    "result": {
+                        "artists": [
+                            {"id": 7647, "name": "陈嘉桦", "alias": ["Ella"]},
+                            {"id": 12709, "name": "S.H.E"},
+                        ]
+                    }
+                }
+            if parsed.path == "/artist/album":
+                return {
+                    "hotAlbums": [
+                        {"id": 3129832, "name": "Why Not"},
+                        {"id": 999, "name": "Other"},
+                    ]
+                }
+            if parsed.path == "/album":
+                return {
+                    "songs": [
+                        {
+                            "id": 31653812,
+                            "name": "浪费眼泪",
+                            "ar": [{"name": "陈嘉桦"}],
+                            "al": {"name": "Why Not"},
+                        },
+                        {
+                            "id": 31653810,
+                            "name": "差一点",
+                            "ar": [{"name": "陈嘉桦"}],
+                            "al": {"name": "Why Not"},
+                        },
+                    ]
+                }
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = NCMusicClient(api_bases=["https://music163.example"], read_json=read_json)
+
+        candidates = client.search_songs(
+            NCMusicSearchContext(
+                titles=["浪費眼淚", "浪费眼泪"],
+                artists=["Ella陳嘉樺", "Ella陈嘉桦"],
+                albums=["WHY NOT"],
+            )
+        )
+        result = collect_ncm_music_metadata(
+            AudioMetadata(title="浪費眼淚", artists=["Ella陳嘉樺"], album="WHY NOT"),
+            client,
+            qq_music_candidate=QQMusicCandidate(
+                "102347867",
+                "003Pbr2b1nKveQ",
+                "浪费眼泪",
+                "",
+                ["Ella陈嘉桦"],
+                "WHY NOT",
+                0,
+            ),
+        )
+
+        self.assertIn("31653812", [candidate.song_id for candidate in candidates])
+        self.assertEqual(result.candidates[0].song_id, "31653812")
+        self.assertIn("/artist/album", "\n".join(requested_urls))
+        self.assertIn("/album", "\n".join(requested_urls))
 
     def test_values_from_metadata_adds_ncm_id_and_changed_fields(self) -> None:
         values = values_from_metadata(
@@ -874,8 +1154,8 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
                 ]
 
         class NCMSearchClient:
-            def search_songs(self, query):
-                self.query = query
+            def search_songs(self, context):
+                self.context = context
                 return [
                     NCMusicCandidate("33894312", "玫瑰少年", [], ["五月天"], "玫瑰少年", 0),
                     NCMusicCandidate("1375248354", "玫瑰少年", [], ["蔡依林"], "UGLY BEAUTY", 1),
@@ -898,8 +1178,15 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
         self.assertEqual(pair.metadata.artists, ["蔡依林"])
         self.assertEqual(pair.metadata.album, "UGLY BEAUTY")
         self.assertEqual(qq_client.query, "玫瑰少年")
-        self.assertEqual(ncm_client.query, "玫瑰少年")
         self.assertEqual([candidate.song_id for candidate in pair.qq_music_metadata.candidates], ["224116257", "415233914", "235883438"])
+        self.assertFalse(hasattr(ncm_client, "context"))
+
+        pair.qq_music_metadata.selected = pair.qq_music_metadata.candidates[1]
+        _collect_ncm_music_metadata_for_pairs([pair], ncm_client)
+
+        self.assertEqual(ncm_client.context.titles, ["玫瑰少年", "玫瑰少年 - From THE FIRST TAKE"])
+        self.assertEqual(ncm_client.context.artists, ["蔡依林"])
+        self.assertEqual(ncm_client.context.albums, ["UGLY BEAUTY", "玫瑰少年 - From THE FIRST TAKE"])
         self.assertEqual([candidate.song_id for candidate in pair.ncm_music_metadata.candidates], ["1375248354", "33894312"])
 
     def test_ttml_only_cli_without_audio_is_accepted_and_reports_missing_title(self) -> None:
