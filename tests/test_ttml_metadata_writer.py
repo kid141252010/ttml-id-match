@@ -1,6 +1,7 @@
 import tempfile
 import time
 import unittest
+import urllib.parse
 from contextlib import redirect_stderr
 from io import StringIO, TextIOWrapper
 import json
@@ -601,6 +602,17 @@ class NCMusicMetadataTests(unittest.TestCase):
 
         self.assertEqual([candidate.song_id for candidate in candidates], ["2"])
 
+    def test_ncm_search_url_uses_documented_single_song_search_window(self) -> None:
+        url = NCMusicClient._build_search_url("https://music163.example", "玫瑰少年")
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        self.assertEqual(parsed.path, "/cloudsearch")
+        self.assertEqual(params["keywords"], ["玫瑰少年"])
+        self.assertEqual(params["limit"], ["100"])
+        self.assertEqual(params["offset"], ["0"])
+        self.assertEqual(params["type"], ["1"])
+
     def test_ncm_client_falls_back_when_fastest_response_fails(self) -> None:
         def read_json(url: str):
             if "fast-fail.invalid" in url:
@@ -643,6 +655,24 @@ class NCMusicMetadataTests(unittest.TestCase):
 
         self.assertEqual(client.query, "玫瑰少年")
         self.assertEqual([candidate.song_id for candidate in result.candidates], ["224116257", "415233914", "235883438"])
+
+    def test_ncm_ranking_considers_candidates_after_the_first_five_raw_results(self) -> None:
+        class SearchClient:
+            def search_songs(self, query):
+                self.query = query
+                return [
+                    NCMusicCandidate(str(index), f"Other {index}", [], ["Other"], "Other Album", index)
+                    for index in range(7)
+                ] + [
+                    NCMusicCandidate("1375248354", "玫瑰少年", [], ["蔡依林"], "UGLY BEAUTY", 7)
+                ]
+
+        result = collect_ncm_music_metadata(
+            AudioMetadata(title="玫瑰少年", artists=["蔡依林"], album="UGLY BEAUTY"),
+            SearchClient(),
+        )
+
+        self.assertEqual(result.candidates[0].song_id, "1375248354")
 
     def test_values_from_metadata_adds_ncm_id_and_changed_fields(self) -> None:
         values = values_from_metadata(
@@ -729,6 +759,33 @@ class NCMusicMetadataTests(unittest.TestCase):
 
         self.assertEqual(result.selected, result.candidates[2])
 
+    def test_rejecting_ncm_candidates_lists_sorted_top_five_options(self) -> None:
+        result = NCMusicSearchResult(
+            candidates=[
+                NCMusicCandidate("best", "玫瑰少年", [], ["蔡依林"], "UGLY BEAUTY", 7),
+                NCMusicCandidate("second", "玫瑰少年", [], ["蔡依林"], "Other", 6),
+                NCMusicCandidate("third", "玫瑰少年", [], ["Other"], "UGLY BEAUTY", 5),
+                NCMusicCandidate("fourth", "玫瑰少年", [], ["Other"], "Other", 4),
+                NCMusicCandidate("fifth", "Other", [], ["蔡依林"], "UGLY BEAUTY", 3),
+                NCMusicCandidate("sixth", "Other", [], ["Other"], "Other", 2),
+            ]
+        )
+        pair = PairMetadata(Path("song.flac"), Path("song.ttml"), AudioMetadata(title="Song"), AppleMusicMetadataResult(), QQMusicSearchResult(), result)
+        answers = iter(["N", "5"])
+        printed: list[str] = []
+
+        confirm_ncm_music_candidates(
+            [pair],
+            dry_run=False,
+            input_func=lambda prompt: next(answers),
+            print_func=lambda *values, **kwargs: printed.append(" ".join(str(value) for value in values)),
+        )
+
+        self.assertEqual(result.selected.song_id if result.selected else None, "fifth")
+        self.assertTrue(any("[best]" in line for line in printed))
+        self.assertTrue(any("[fifth]" in line for line in printed))
+        self.assertFalse(any("[sixth]" in line for line in printed))
+
 
 class TtmlOnlyMetadataTests(unittest.TestCase):
     def write_ttml(self, directory: Path, name: str = "song.ttml", body: str | None = None) -> Path:
@@ -762,6 +819,19 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
         self.assertIsNone(metadata.isrc)
         self.assertIsNone(metadata.catalog_id)
         self.assertIsNone(metadata.playlist_id)
+
+    def test_reads_ttml_metadata_with_missing_amll_namespace(self) -> None:
+        text = (
+            '<tt xmlns="http://www.w3.org/ns/ttml">'
+            '<head><metadata><amll:meta key="musicName" value="玫瑰少年"/></metadata></head>'
+            "<body/></tt>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(Path(tmp), body=text)
+
+            metadata = read_ttml_metadata(path)
+
+        self.assertEqual(metadata.title, "玫瑰少年")
 
     def test_batch_discovery_includes_unmatched_ttml_as_ttml_only_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

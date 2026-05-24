@@ -25,6 +25,7 @@ DEFAULT_NCM_API_BASES = [
     "https://neteasecloudmusicapi-main-api.vercel.app",
     "https://api-enhanced-six-beta.vercel.app",
 ]
+NCM_SEARCH_LIMIT = 100
 TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "ncmMusicId", "appleMusicId", "isrc"]
 AUDIO_EXTENSIONS = {
     ".aac",
@@ -364,7 +365,14 @@ class NCMusicClient:
 
     @staticmethod
     def _build_search_url(base: str, query: str) -> str:
-        params = urllib.parse.urlencode({"keywords": query})
+        params = urllib.parse.urlencode(
+            {
+                "keywords": query,
+                "limit": NCM_SEARCH_LIMIT,
+                "offset": 0,
+                "type": 1,
+            }
+        )
         return f"{base.rstrip('/')}/cloudsearch?{params}"
 
     def _read_json_from_url(self, url: str) -> dict[str, Any]:
@@ -419,9 +427,9 @@ def read_audio_metadata(path: Path) -> AudioMetadata:
 
 def read_ttml_metadata(path: Path) -> AudioMetadata:
     text = path.read_text(encoding="utf-8")
+    text, amll_prefix = _ensure_amll_namespace(text)
     metadata_start, metadata_end = _find_metadata_inner_bounds(text)
     metadata = text[metadata_start:metadata_end]
-    amll_prefix = _find_amll_prefix(text)
     values: dict[str, list[str]] = {}
 
     for tag in _iter_amll_meta_tags(metadata, amll_prefix):
