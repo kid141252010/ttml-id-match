@@ -214,15 +214,15 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
 
 网易云音乐查找只使用歌名作为搜索关键词。音频模式下歌名来自音频标签；TTML-only 模式下歌名来自已有 `amll:meta key="musicName"`。
 
-脚本会并发请求以下公开 API，优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API：
+脚本按网易云 API 文档的搜索参数并发请求以下公开 API，固定使用单曲搜索第一页最多 100 条候选。优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API：
 
 ```text
-https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}
-https://neteasecloudmusicapi-main-api.vercel.app/cloudsearch?keywords={歌名}
-https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}
+https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1
+https://neteasecloudmusicapi-main-api.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1
+https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1
 ```
 
-脚本读取 `result.songs` 候选，解析歌曲 ID、歌名、别名、歌手和专辑。匹配权重与 QQ 音乐一致：歌名最高，歌手其次，专辑再次。选中候选后只把网易云歌曲 ID 写入 `ncmMusicId`；候选里的新歌名、别名、歌手和专辑会按现有去重规则追加到对应元数据。
+脚本读取 `result.songs` 候选，解析歌曲 ID、歌名、别名、歌手和专辑。匹配权重与 QQ 音乐一致：歌名最高，歌手其次，专辑再次。脚本会先对最多 100 条候选整体排序，再只把匹配度最高的 5 条作为手动备选展示。选中候选后只把网易云歌曲 ID 写入 `ncmMusicId`；候选里的新歌名、别名、歌手和专辑会按现有去重规则追加到对应元数据。
 
 dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时会在 QQ 音乐确认之后单独确认网易云候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
 
