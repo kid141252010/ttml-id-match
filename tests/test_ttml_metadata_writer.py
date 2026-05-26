@@ -628,6 +628,43 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         for label in ["CN", "US", "KR", "JP", "TW"]:
             self.assertIn(f"{label}: ", output)
 
+    def test_apple_music_album_404_warning_is_suppressed_when_storefront_search_finds_candidate(self) -> None:
+        class SearchAfterAlbum404Client:
+            def fetch_album_tracks(self, store, album_id):
+                raise LookupError("HTTP Error 404: Not Found")
+
+            def search_songs(self, store, metadata):
+                return [
+                    AppleMusicTrackCandidate(
+                        f"{store}-best",
+                        "Song" if store == "cn" else f"Song {store}",
+                        ["Artist"],
+                        "Album",
+                        store,
+                        0,
+                        match_source="search",
+                    )
+                ]
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
+
+        result = collect_apple_music_metadata(
+            AudioMetadata(
+                title="Song",
+                artists=["Artist"],
+                album="Album",
+                playlist_id="album-only-in-one-region",
+            ),
+            SearchAfterAlbum404Client(),
+        )
+
+        self.assertEqual(set(result.candidates_by_storefront), set(DEFAULT_STORES))
+        self.assertEqual(result.errors, [])
+
     def test_values_from_metadata_dedupes_apple_music_id_but_keeps_storefront_metadata_variants(self) -> None:
         values = values_from_metadata(
             AudioMetadata(title="Amazing Grace", artists=["邓紫棋"], album="Amazing Grace - Single"),
