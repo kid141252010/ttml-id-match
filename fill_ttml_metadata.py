@@ -1200,9 +1200,10 @@ def collect_apple_music_metadata(
     all_candidates: list[AppleMusicTrackCandidate] = []
     for store in store_order:
         store_candidates: list[AppleMusicTrackCandidate] = []
+        album_errors: list[str] = []
 
         if metadata.playlist_id:
-            match = _match_album_store(metadata, client, store, metadata.playlist_id, result.errors)
+            match = _match_album_store(metadata, client, store, metadata.playlist_id, album_errors)
             if match.track:
                 candidate = _apple_music_candidate_from_flat_track(
                     match.track,
@@ -1250,6 +1251,8 @@ def collect_apple_music_metadata(
         if sorted_store_candidates:
             result.candidates_by_storefront[store] = sorted_store_candidates
             all_candidates.extend(sorted_store_candidates)
+        else:
+            result.errors.extend(album_errors)
 
     result.candidates = sorted(
         all_candidates,
@@ -3109,6 +3112,18 @@ def _apple_music_storefront_best_candidates(
                     selected_ids_by_store.add(key)
                 break
     return selected
+
+
+def _apple_music_storefront_top_candidates(
+    result: AppleMusicMetadataResult,
+) -> list[AppleMusicTrackCandidate]:
+    groups = result.candidates_by_storefront or _apple_music_candidates_grouped_by_storefront(result.candidates)
+    best: list[AppleMusicTrackCandidate] = []
+    for storefront in _apple_music_store_order(groups.keys()):
+        candidates = groups.get(storefront, [])
+        if candidates:
+            best.append(candidates[0])
+    return best
 
 
 def _apple_music_candidates_grouped_by_storefront(
