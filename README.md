@@ -18,6 +18,7 @@ python fill_ttml_metadata.py --help
 <amll:meta key="album" value="..."/>
 <amll:meta key="qqMusicId" value="..."/>
 <amll:meta key="ncmMusicId" value="..."/>
+<amll:meta key="spotifyId" value="..."/>
 <amll:meta key="isrc" value="..."/>
 <amll:meta key="appleMusicId" value="..."/>
 ```
@@ -28,17 +29,18 @@ python fill_ttml_metadata.py --help
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
 - 处理主语言为 `xml:lang="zh-Hant"` 的 TTML 时，会先自动改为 `zh-Hans`，并把歌词正文转换为简体。
-- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐和网易云音乐 ID。
+- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐、网易云音乐和 Spotify ID。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
 - 会用歌名搜索 QQ 音乐，按歌名、歌手、专辑匹配候选，并把选中结果的 songid 和 mid 分别写入 `qqMusicId`。
 - 会在 QQ 音乐候选确认后查找网易云音乐：先用歌名搜索，再用确认后的 QQ 歌手和专辑补充网易云歌手专辑回查，并把选中结果的歌曲 ID 写入 `ncmMusicId`。
+- 如果配置了 Spotify 凭据，会用官方 Web API 的 Client Credentials Flow 获取 token，并在 `US`、`KR`、`JP`、`TW` 四个市场搜索 track；普通搜索不足时会用艺人专辑、发行日期和时长做保守 fallback。每个市场取匹配度最高的候选，`spotifyId` 和 Spotify ISRC 按值去重写入；缺少凭据时自动跳过，不影响其它来源。
 
 ## 环境要求
 
 - Python 3.10 或更新版本。
-- 网络访问 Apple Music、QQ 音乐和网易云音乐公开 API，用于查找歌曲 ID。
+- 网络访问 Apple Music、QQ 音乐、网易云音乐公开 API 和 Spotify Web API，用于查找歌曲 ID。
 - Python 依赖：`mutagen`、`opencc-python-reimplemented`。
 
 安装依赖：
@@ -46,6 +48,17 @@ python fill_ttml_metadata.py --help
 ```powershell
 python -m pip install -r requirements.txt
 ```
+
+## Spotify 凭据
+
+Spotify 搜索默认启用，但需要本地凭据。复制 `.env.example` 为 `.env`，填入 Spotify Developer 后台创建应用得到的 Client ID 和 Client Secret：
+
+```text
+SPOTIFY_CLIENT_ID=
+SPOTIFY_CLIENT_SECRET=
+```
+
+脚本会先读取当前目录的 `.env`，再用系统环境变量覆盖同名值。`.env` 已在 `.gitignore` 中屏蔽，仓库只提交 `.env.example`。如果缺少任一变量，运行时会输出 `缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索`，Apple Music、QQ 音乐和网易云音乐流程会继续执行。
 
 ## 快速开始
 
@@ -104,7 +117,7 @@ PowerShell 里运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
 ```
 
-交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 QQ 音乐和网易云音乐最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 QQ 音乐、网易云音乐和 Spotify 最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
 
 ## 单首文件处理
 
@@ -125,7 +138,7 @@ python fill_ttml_metadata.py `
   --dry-run
 ```
 
-如果没有音频，也可以只指定 TTML。脚本会读取 TTML 已有的 `musicName`、`artists`、`album`，然后复用同一套 QQ 音乐和网易云音乐搜索及候选确认流程：
+如果没有音频，也可以只指定 TTML。脚本会读取 TTML 已有的 `musicName`、`artists`、`album`，然后复用同一套 QQ 音乐、网易云音乐和 Spotify 搜索流程：
 
 ```powershell
 python fill_ttml_metadata.py `
@@ -235,6 +248,24 @@ https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}&limit=100
 
 dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时会在 QQ 音乐确认之后单独确认网易云候选；输入 `Y` 会接受所有最佳候选，输入 `N` 会逐首展示最佳候选加 4 个备选供选择。
 
+### Spotify 元数据查找
+
+Spotify 查找使用官方 Web API：
+
+```text
+POST https://accounts.spotify.com/api/token
+GET https://api.spotify.com/v1/search?q={query}&type=track&market={market}&limit=20
+GET https://api.spotify.com/v1/search?q={artist}&type=artist&market={market}&limit=10
+GET https://api.spotify.com/v1/artists/{artistId}/albums?include_groups=album,single&market={market}&limit=10&offset={offset}
+GET https://api.spotify.com/v1/albums/{albumId}?market={market}
+```
+
+token 请求使用 Client Credentials Flow：`SPOTIFY_CLIENT_ID:SPOTIFY_CLIENT_SECRET` 组成 Basic Auth，body 为 `grant_type=client_credentials`。脚本会优先用 `isrc:{ISRC}` 搜索，然后用宽松普通关键词 `{歌名} {歌手...} {专辑}` 和 `{歌名}` 扩展候选池；如果候选仍不足，再 fallback 到三要素限定搜索：`track:{歌名} artist:{歌手...} album:{专辑}`。如果缺少歌手或专辑，会省略对应限定，但至少要求有歌名。
+
+脚本固定搜索 `US`、`KR`、`JP`、`TW` 四个市场。每个市场独立保留排序后的候选，并各取最佳候选组成默认写入集合；排序按 ISRC、歌名、歌手、专辑匹配度计算，歌名、歌手、专辑都支持包含匹配。普通 track search 没有候选或候选分数明显不足时，如果音频里同时有歌名、歌手、发行日期和时长，脚本会再搜索匹配艺人，读取该艺人最多 30 张最近 album/single，并按发行日期一致、艺人匹配、时长默认 2 秒内接近来接受曲目；这允许 HOYO-MiX 等多地区发行返回不同语言歌名和不同 ISRC。源歌名不是伴奏时，脚本会排除 `Instrumental`、`伴奏`、`インスト`、`반주` 等伴奏候选，避免混入伴奏版。TTML-only 没有音频日期和时长，不启用这个 fallback。
+
+dry-run 会自动展示并选择四区最佳候选但不询问。真实写入时会汇总 Spotify 四区最佳候选；输入 `Y` 接受全部市场最佳结果，输入 `N` 则按市场分别从 5 个候选里选择。选中的候选会写入 `spotifyId`；同一个 track id 只写一次 ID，但不同市场返回的歌名、艺术家名、专辑名和 ISRC 会按现有去重规则追加到 `musicName`、`artists`、`album`、`isrc`。
+
 ## 写入结构
 
 脚本不会用 XML 序列化器重写整份 TTML，避免命名空间前缀和属性顺序产生无关变化。
@@ -255,6 +286,7 @@ dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时
   <amll:meta key="album" value="..."/>
   <amll:meta key="qqMusicId" value="..."/>
   <amll:meta key="ncmMusicId" value="..."/>
+  <amll:meta key="spotifyId" value="..."/>
   <amll:meta key="appleMusicId" value="..."/>
   <amll:meta key="isrc" value="..."/>
   <iTunesMetadata>...</iTunesMetadata>
@@ -276,11 +308,14 @@ dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时
   qqMusicId: 123456, 001abc
   ncmMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [456789]
   ncmMusicId: 456789
+  spotifyBest: US: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [33e05cb33dd34eddb7d1d3b809dd44e1]
+  spotifyId: 33e05cb33dd34eddb7d1d3b809dd44e1
   added: musicName = Disease (Apple Music Live), Disease - Apple Music Live
   added: artists = Lady Gaga
   added: album = Apple Music Live: MAYHEM Requiem, Apple Music Live: MAYHEM
   added: qqMusicId = 123456, 001abc
   added: ncmMusicId = 456789
+  added: spotifyId = 33e05cb33dd34eddb7d1d3b809dd44e1
   added: appleMusicId = 6768201779, 6768201780
   added: isrc = USUM72603828
 ```
@@ -296,11 +331,14 @@ dry-run 会展示每首歌的最佳网易云候选但不询问。真实写入时
   qqMusicId: 123456, 001abc
   ncmMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [456789]
   ncmMusicId: 456789
+  spotifyBest: US: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [33e05cb33dd34eddb7d1d3b809dd44e1]
+  spotifyId: 33e05cb33dd34eddb7d1d3b809dd44e1
   skipped: musicName = Disease (Apple Music Live)
   skipped: artists = Lady Gaga
   skipped: album = Apple Music Live: MAYHEM Requiem
   skipped: qqMusicId = 123456, 001abc
   skipped: ncmMusicId = 456789
+  skipped: spotifyId = 33e05cb33dd34eddb7d1d3b809dd44e1
   skipped: appleMusicId = 6768201779, 6768201780
   skipped: isrc = USUM72603828
 ```
@@ -362,6 +400,15 @@ song-lyrics.ttml
 - 三个公开网易云 API 都不可用、超时或返回结构变化。
 - 网易云音乐搜索结果、歌手专辑列表或专辑详情没有带歌曲 ID 的候选。
 - 歌名、歌手或专辑标签太不一致，最佳候选需要在真实写入时输入 `N` 手动选择。
+
+### 找不到 Spotify ID
+
+常见原因：
+
+- 没有在 `.env` 或系统环境变量里配置 `SPOTIFY_CLIENT_ID` 和 `SPOTIFY_CLIENT_SECRET`。
+- 音频或 TTML 缺少歌名，无法发起 Spotify 搜索。
+- `US`、`KR`、`JP`、`TW` 四个市场都没有带 track id 的候选。
+- 当前网络无法访问 Spotify token endpoint 或 Search API。
 
 ### 不想覆盖原文件
 

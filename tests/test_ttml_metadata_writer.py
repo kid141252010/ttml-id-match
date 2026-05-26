@@ -2,15 +2,20 @@ import tempfile
 import time
 import unittest
 import urllib.parse
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO, TextIOWrapper
+import base64
 import json
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from fill_ttml_metadata import (
     AudioMetadata,
     AppleMusicMetadataResult,
     DEFAULT_STORES,
+    DEFAULT_SPOTIFY_MARKETS,
+    SPOTIFY_SEARCH_LIMIT,
     NCMusicCandidate,
     NCMusicClient,
     NCMusicSearchContext,
@@ -19,14 +24,22 @@ from fill_ttml_metadata import (
     QQMusicCandidate,
     QQMusicClient,
     QQMusicSearchResult,
+    SpotifyClient,
+    SpotifyCredentials,
+    SpotifySearchResult,
+    SpotifyTrackCandidate,
     collect_apple_music_metadata,
     collect_ncm_music_metadata,
     collect_qq_music_metadata,
+    collect_spotify_metadata,
     confirm_ncm_music_candidates,
     confirm_qq_music_candidates,
+    confirm_spotify_candidates,
     find_directory_work_items,
+    load_spotify_credentials,
     main,
     normalize_ttml_language,
+    read_audio_metadata,
     read_ttml_metadata,
     update_ttml_metadata,
     values_from_metadata,
@@ -36,6 +49,10 @@ from fill_ttml_metadata import (
     _prepare_work_item,
     _parse_ncm_music_candidates,
     _parse_qq_music_candidates,
+    _parse_spotify_candidates,
+    _process_prepared_pair,
+    _spotify_candidate_score,
+    _spotify_search_queries,
     _safe_print,
     _text_match_score,
 )
@@ -165,6 +182,7 @@ class TtmlMetadataWriterTests(unittest.TestCase):
                 {
                     "album": ["Album"],
                     "qqMusicId": ["235883438", "0035sVym0anwc4"],
+                    "spotifyId": ["33e05cb33dd34eddb7d1d3b809dd44e1"],
                     "appleMusicId": ["1691701944"],
                 },
                 dry_run=False,
@@ -175,6 +193,7 @@ class TtmlMetadataWriterTests(unittest.TestCase):
                 '<amll:meta key="album" value="Album"/>'
                 '<amll:meta key="qqMusicId" value="235883438"/>'
                 '<amll:meta key="qqMusicId" value="0035sVym0anwc4"/>'
+                '<amll:meta key="spotifyId" value="33e05cb33dd34eddb7d1d3b809dd44e1"/>'
                 '<amll:meta key="appleMusicId" value="1691701944"/>'
                 "<iTunesMetadata>"
             )
@@ -1065,6 +1084,954 @@ class NCMusicMetadataTests(unittest.TestCase):
         self.assertTrue(any("[best]" in line for line in printed))
         self.assertTrue(any("[fifth]" in line for line in printed))
         self.assertFalse(any("[sixth]" in line for line in printed))
+
+
+class SpotifyMetadataTests(unittest.TestCase):
+    def test_read_audio_metadata_reads_release_date_tags(self) -> None:
+        class FakeAudio:
+            tags = {"date": ["2024-06-19"], "title": ["I Ask"], "artist": ["Sān-Z"]}
+            info = type("Info", (), {"length": 185.2})()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song.flac"
+            path.write_bytes(b"")
+
+            with patch("mutagen.File", return_value=FakeAudio()):
+                metadata = read_audio_metadata(path)
+
+        self.assertEqual(metadata.release_date, "2024-06-19")
+        self.assertEqual(metadata.duration_seconds, 185.2)
+
+    def test_load_spotify_credentials_reads_dotenv_and_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "SPOTIFY_CLIENT_ID=from-file",
+                        'SPOTIFY_CLIENT_SECRET="file secret"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            file_credentials = load_spotify_credentials(env_path=env_path, environ={})
+            env_credentials = load_spotify_credentials(
+                env_path=env_path,
+                environ={
+                    "SPOTIFY_CLIENT_ID": "from-env",
+                    "SPOTIFY_CLIENT_SECRET": "env-secret",
+                },
+            )
+
+        self.assertTrue(file_credentials.enabled)
+        self.assertEqual(file_credentials.client_id, "from-file")
+        self.assertEqual(file_credentials.client_secret, "file secret")
+        self.assertTrue(env_credentials.enabled)
+        self.assertEqual(env_credentials.client_id, "from-env")
+        self.assertEqual(env_credentials.client_secret, "env-secret")
+
+    def test_load_spotify_credentials_is_disabled_when_either_secret_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text("SPOTIFY_CLIENT_ID=from-file\n", encoding="utf-8")
+
+            credentials = load_spotify_credentials(env_path=env_path, environ={})
+
+        self.assertFalse(credentials.enabled)
+        self.assertEqual(credentials.client_id, "from-file")
+        self.assertIsNone(credentials.client_secret)
+
+    def test_spotify_token_request_uses_client_credentials_flow(self) -> None:
+        request = SpotifyClient(SpotifyCredentials("client-id", "client-secret"))._build_token_request()
+
+        self.assertEqual(request.full_url, "https://accounts.spotify.com/api/token")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Content-type"), "application/x-www-form-urlencoded")
+        self.assertEqual(request.data.decode("utf-8"), "grant_type=client_credentials")
+        auth_scheme, auth_value = request.get_header("Authorization").split(" ", 1)
+        self.assertEqual(auth_scheme, "Basic")
+        self.assertEqual(base64.b64decode(auth_value).decode("utf-8"), "client-id:client-secret")
+
+    def test_spotify_search_queries_prefer_loose_candidate_pool_before_strict_metadata_query(self) -> None:
+        queries = _spotify_search_queries(
+            AudioMetadata(
+                title="Amazing Grace",
+                artists=["邓紫棋"],
+                album="Amazing Grace - Single",
+                isrc="HKA972401000",
+            )
+        )
+
+        self.assertEqual(
+            queries,
+            [
+                "isrc:HKA972401000",
+                "Amazing Grace 邓紫棋 Amazing Grace - Single",
+                "Amazing Grace",
+                "track:Amazing Grace artist:邓紫棋 album:Amazing Grace - Single",
+            ],
+        )
+
+    def test_spotify_search_url_uses_track_search_market_limit_and_supplied_query(self) -> None:
+        client = SpotifyClient(SpotifyCredentials("client-id", "client-secret"))
+        url = client._build_search_url_for_query(
+            "Amazing Grace 邓紫棋 Amazing Grace - Single",
+            "JP",
+        )
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.netloc, "api.spotify.com")
+        self.assertEqual(parsed.path, "/v1/search")
+        self.assertEqual(DEFAULT_SPOTIFY_MARKETS, ["US", "KR", "JP", "TW"])
+        self.assertEqual(params["type"], ["track"])
+        self.assertEqual(params["market"], ["JP"])
+        self.assertEqual(params["limit"], [str(SPOTIFY_SEARCH_LIMIT)])
+        self.assertEqual(params["q"], ["Amazing Grace 邓紫棋 Amazing Grace - Single"])
+
+    def test_spotify_artist_album_and_album_detail_urls_use_market_and_pagination(self) -> None:
+        client = SpotifyClient(SpotifyCredentials("client-id", "client-secret"))
+        artist_url = client._build_artist_search_url("HOYO-MiX", "KR")
+        albums_url = client._build_artist_albums_url("artist-1", "JP", offset=20)
+        album_url = client._build_album_url("album-1", "TW")
+        artist = urllib.parse.urlparse(artist_url)
+        artist_params = urllib.parse.parse_qs(artist.query)
+        albums = urllib.parse.urlparse(albums_url)
+        albums_params = urllib.parse.parse_qs(albums.query)
+        album = urllib.parse.urlparse(album_url)
+        album_params = urllib.parse.parse_qs(album.query)
+
+        self.assertEqual(artist.path, "/v1/search")
+        self.assertEqual(artist_params["type"], ["artist"])
+        self.assertEqual(artist_params["market"], ["KR"])
+        self.assertEqual(artist_params["q"], ["HOYO-MiX"])
+        self.assertEqual(albums.path, "/v1/artists/artist-1/albums")
+        self.assertEqual(albums_params["include_groups"], ["album,single"])
+        self.assertEqual(albums_params["market"], ["JP"])
+        self.assertEqual(albums_params["limit"], ["10"])
+        self.assertEqual(albums_params["offset"], ["20"])
+        self.assertEqual(album.path, "/v1/albums/album-1")
+        self.assertEqual(album_params["market"], ["TW"])
+
+    def test_spotify_search_keeps_collecting_loose_candidates_after_isrc_hit(self) -> None:
+        requested_queries: list[str] = []
+
+        def read_json(url: str, access_token: str) -> dict:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0]
+            requested_queries.append(query)
+            if query.startswith("isrc:"):
+                return {
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "5cofkYnlrYaXesdVpP6xeP",
+                                "name": "Amazing Grace",
+                                "artists": [{"name": "G.E.M."}],
+                                "album": {"name": "Amazing Grace"},
+                                "external_ids": {"isrc": "HKA972401000"},
+                            }
+                        ]
+                    }
+                }
+            return {
+                "tracks": {
+                    "items": [
+                        {
+                            "id": f"loose-{index}",
+                            "name": f"Amazing Grace {index}",
+                            "artists": [{"name": "Someone"}],
+                            "album": {"name": "Other"},
+                        }
+                        for index in range(5)
+                    ]
+                }
+            }
+
+        client = SpotifyClient(
+            SpotifyCredentials("client-id", "client-secret"),
+            markets=["TW"],
+            read_json=read_json,
+        )
+        client._access_token = "token"
+
+        candidates = client.search_tracks(
+            AudioMetadata(
+                title="Amazing Grace",
+                artists=["邓紫棋"],
+                album="Amazing Grace - Single",
+                isrc="HKA972401000",
+            )
+        )
+
+        self.assertEqual(
+            requested_queries,
+            [
+                "isrc:HKA972401000",
+                "Amazing Grace 邓紫棋 Amazing Grace - Single",
+            ],
+        )
+        self.assertEqual(
+            [candidate.track_id for candidate in candidates],
+            ["5cofkYnlrYaXesdVpP6xeP", "loose-0", "loose-1", "loose-2", "loose-3", "loose-4"],
+        )
+
+    def test_spotify_search_falls_back_to_title_and_strict_queries_when_loose_query_has_too_few_results(self) -> None:
+        requested_queries: list[str] = []
+
+        def read_json(url: str, access_token: str) -> dict:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0]
+            requested_queries.append(query)
+            if query.startswith("isrc:"):
+                return {"tracks": {"items": []}}
+            if query == "Amazing Grace 邓紫棋 Amazing Grace - Single":
+                return {"tracks": {"items": []}}
+            if query == "Amazing Grace":
+                return {
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "title-only",
+                                "name": "Amazing Grace",
+                                "artists": [{"name": "G.E.M."}],
+                                "album": {"name": "Amazing Grace"},
+                            }
+                        ]
+                    }
+                }
+            return {
+                "tracks": {
+                    "items": [
+                        {
+                            "id": "fallback-id",
+                            "name": "Amazing Grace",
+                            "artists": [{"name": "G.E.M."}],
+                            "album": {"name": "Amazing Grace"},
+                        }
+                    ]
+                }
+            }
+
+        client = SpotifyClient(
+            SpotifyCredentials("client-id", "client-secret"),
+            markets=["TW"],
+            read_json=read_json,
+        )
+        client._access_token = "token"
+
+        candidates = client.search_tracks(
+            AudioMetadata(
+                title="Amazing Grace",
+                artists=["邓紫棋"],
+                album="Amazing Grace - Single",
+                isrc="HKA972401000",
+            )
+        )
+
+        self.assertEqual(
+            requested_queries,
+            [
+                "isrc:HKA972401000",
+                "Amazing Grace 邓紫棋 Amazing Grace - Single",
+                "Amazing Grace",
+                "track:Amazing Grace artist:邓紫棋 album:Amazing Grace - Single",
+            ],
+        )
+        self.assertEqual([candidate.track_id for candidate in candidates], ["title-only", "fallback-id"])
+
+    def test_parse_spotify_candidates_from_tracks_items_and_requires_id(self) -> None:
+        payload = {
+            "tracks": {
+                "items": [
+                    {
+                        "id": "33e05cb33dd34eddb7d1d3b809dd44e1",
+                        "name": "玫瑰少年",
+                        "artists": [{"name": "蔡依林"}, {"name": "五月天"}],
+                        "album": {"name": "UGLY BEAUTY"},
+                        "external_ids": {"isrc": "TST000000001"},
+                    },
+                    {
+                        "name": "missing id",
+                        "artists": [{"name": "Nobody"}],
+                    },
+                ]
+            }
+        }
+
+        candidates = _parse_spotify_candidates(payload, market="TW")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].track_id, "33e05cb33dd34eddb7d1d3b809dd44e1")
+        self.assertEqual(candidates[0].title, "玫瑰少年")
+        self.assertEqual(candidates[0].artists, ["蔡依林", "五月天"])
+        self.assertEqual(candidates[0].album, "UGLY BEAUTY")
+        self.assertEqual(candidates[0].market, "TW")
+        self.assertEqual(candidates[0].isrc, "TST000000001")
+
+    def test_parse_spotify_candidates_includes_album_release_duration_and_match_source(self) -> None:
+        payload = {
+            "tracks": {
+                "items": [
+                    {
+                        "id": "track-1",
+                        "name": "I Ask",
+                        "duration_ms": 185000,
+                        "artists": [{"name": "Sān-Z"}],
+                        "album": {
+                            "id": "album-1",
+                            "name": "I Ask - Single",
+                            "release_date": "2024-06-19",
+                            "release_date_precision": "day",
+                        },
+                        "external_ids": {"isrc": "QZDA62401111"},
+                    }
+                ]
+            }
+        }
+
+        candidates = _parse_spotify_candidates(payload, market="US")
+
+        self.assertEqual(candidates[0].duration_ms, 185000)
+        self.assertEqual(candidates[0].release_date, "2024-06-19")
+        self.assertEqual(candidates[0].release_date_precision, "day")
+        self.assertEqual(candidates[0].album_id, "album-1")
+        self.assertEqual(candidates[0].match_source, "search")
+
+    def test_spotify_search_uses_artist_album_fallback_when_track_search_has_no_candidates(self) -> None:
+        requested: list[tuple[str, dict[str, list[str]]]] = []
+
+        def read_json(url: str, access_token: str) -> dict:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            requested.append((parsed.path, params))
+
+            if parsed.path == "/v1/search" and params.get("type") == ["track"]:
+                return {"tracks": {"items": []}}
+            if parsed.path == "/v1/search" and params.get("type") == ["artist"]:
+                return {"artists": {"items": [{"id": "artist-1", "name": "Sān-Z"}]}}
+            if parsed.path == "/v1/artists/artist-1/albums":
+                return {
+                    "items": [
+                        {
+                            "id": "album-old",
+                            "name": "Old",
+                            "release_date": "2023-01-01",
+                            "release_date_precision": "day",
+                        },
+                        {
+                            "id": "album-1",
+                            "name": "I Ask - Single",
+                            "release_date": "2024-06-19",
+                            "release_date_precision": "day",
+                        },
+                    ]
+                }
+            if parsed.path == "/v1/albums/album-1":
+                return {
+                    "id": "album-1",
+                    "name": "I Ask - Single",
+                    "release_date": "2024-06-19",
+                    "release_date_precision": "day",
+                    "artists": [{"name": "Sān-Z"}],
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "track-1",
+                                "name": "물음",
+                                "duration_ms": 185000,
+                                "artists": [{"name": "Sān-Z"}],
+                            },
+                            {
+                                "id": "wrong-duration",
+                                "name": "물음 - Instrumental",
+                                "duration_ms": 210000,
+                                "artists": [{"name": "Sān-Z"}],
+                            },
+                        ]
+                    },
+                }
+            if parsed.path == "/v1/tracks/track-1":
+                return {
+                    "id": "track-1",
+                    "name": "물음",
+                    "duration_ms": 185000,
+                    "artists": [{"name": "Sān-Z"}],
+                    "album": {
+                        "id": "album-1",
+                        "name": "물음",
+                        "release_date": "2024-06-19",
+                        "release_date_precision": "day",
+                    },
+                    "external_ids": {"isrc": "QZDA62401111"},
+                }
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = SpotifyClient(
+            SpotifyCredentials("client-id", "client-secret"),
+            markets=["US"],
+            read_json=read_json,
+        )
+        client._access_token = "token"
+
+        candidates = client.search_tracks(
+            AudioMetadata(
+                title="I Ask",
+                artists=["Sān-Z"],
+                album="I Ask - Single",
+                release_date="2024-06-19",
+                duration_seconds=185,
+            )
+        )
+
+        self.assertIn("/v1/artists/artist-1/albums", [path for path, _ in requested])
+        self.assertEqual([candidate.track_id for candidate in candidates], ["track-1"])
+        self.assertEqual(candidates[0].match_source, "artist-album")
+        self.assertEqual(candidates[0].title, "물음")
+        self.assertEqual(candidates[0].isrc, "QZDA62401111")
+
+    def test_spotify_search_does_not_use_artist_album_fallback_when_search_candidate_is_strong(self) -> None:
+        requested_paths: list[str] = []
+
+        def read_json(url: str, access_token: str) -> dict:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            requested_paths.append(parsed.path)
+            if parsed.path == "/v1/search" and params.get("type") == ["track"]:
+                return {
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "search-hit",
+                                "name": "I Ask",
+                                "duration_ms": 185000,
+                                "artists": [{"name": "Sān-Z"}],
+                                "album": {
+                                    "id": "album-1",
+                                    "name": "I Ask - Single",
+                                    "release_date": "2024-06-19",
+                                    "release_date_precision": "day",
+                                },
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(f"unexpected fallback URL: {url}")
+
+        client = SpotifyClient(
+            SpotifyCredentials("client-id", "client-secret"),
+            markets=["US"],
+            read_json=read_json,
+        )
+        client._access_token = "token"
+
+        candidates = client.search_tracks(
+            AudioMetadata(
+                title="I Ask",
+                artists=["Sān-Z"],
+                album="I Ask - Single",
+                release_date="2024-06-19",
+                duration_seconds=185,
+            )
+        )
+
+        self.assertEqual([candidate.track_id for candidate in candidates], ["search-hit"])
+        self.assertNotIn("/v1/artists", "\n".join(requested_paths))
+
+    def test_spotify_artist_album_fallback_rejects_date_or_duration_mismatch(self) -> None:
+        def read_json(url: str, access_token: str) -> dict:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            if parsed.path == "/v1/search" and params.get("type") == ["track"]:
+                return {"tracks": {"items": []}}
+            if parsed.path == "/v1/search" and params.get("type") == ["artist"]:
+                return {"artists": {"items": [{"id": "artist-1", "name": "Sān-Z"}]}}
+            if parsed.path == "/v1/artists/artist-1/albums":
+                return {
+                    "items": [
+                        {
+                            "id": "wrong-date",
+                            "name": "I Ask - Single",
+                            "release_date": "2024-06-18",
+                            "release_date_precision": "day",
+                        },
+                        {
+                            "id": "wrong-duration",
+                            "name": "I Ask - Single",
+                            "release_date": "2024-06-19",
+                            "release_date_precision": "day",
+                        },
+                    ]
+                }
+            if parsed.path == "/v1/albums/wrong-duration":
+                return {
+                    "id": "wrong-duration",
+                    "name": "I Ask - Single",
+                    "release_date": "2024-06-19",
+                    "release_date_precision": "day",
+                    "artists": [{"name": "Sān-Z"}],
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "track-1",
+                                "name": "I Ask",
+                                "duration_ms": 190000,
+                                "artists": [{"name": "Sān-Z"}],
+                            }
+                        ]
+                    },
+                }
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = SpotifyClient(
+            SpotifyCredentials("client-id", "client-secret"),
+            markets=["US"],
+            read_json=read_json,
+        )
+        client._access_token = "token"
+
+        candidates = client.search_tracks(
+            AudioMetadata(
+                title="I Ask",
+                artists=["Sān-Z"],
+                album="I Ask - Single",
+                release_date="2024-06-19",
+                duration_seconds=185,
+            )
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_collect_spotify_metadata_keeps_best_candidate_per_market_even_with_same_track_id(self) -> None:
+        class SearchClient:
+            def search_tracks(self, metadata):
+                self.metadata = metadata
+                return [
+                    SpotifyTrackCandidate(
+                        "same-id",
+                        "Amazing Grace",
+                        ["G.E.M."],
+                        "Amazing Grace",
+                        "US",
+                        1,
+                        isrc="HKA972401000",
+                    ),
+                    SpotifyTrackCandidate(
+                        "same-id",
+                        "어메이징 그레이스",
+                        ["G.E.M. 덩쯔치"],
+                        "어메이징 그레이스",
+                        "KR",
+                        2,
+                        isrc="HKA972401000",
+                    ),
+                    SpotifyTrackCandidate(
+                        "same-id",
+                        "アメイジング・グレイス",
+                        ["G.E.M."],
+                        "アメイジング・グレイス",
+                        "JP",
+                        3,
+                        isrc="HKA972401000",
+                    ),
+                    SpotifyTrackCandidate(
+                        "same-id",
+                        "Amazing Grace",
+                        ["G.E.M.邓紫棋"],
+                        "Amazing Grace",
+                        "TW",
+                        4,
+                        isrc="HKA972401000",
+                    ),
+                    SpotifyTrackCandidate(
+                        "unrelated",
+                        "Amazing Grace",
+                        ["Someone"],
+                        "Other",
+                        "US",
+                        5,
+                    ),
+                ]
+
+        client = SearchClient()
+
+        result = collect_spotify_metadata(
+            AudioMetadata(
+                title="Amazing Grace",
+                artists=["邓紫棋"],
+                album="Amazing Grace - Single",
+                isrc="HKA972401000",
+            ),
+            client,
+        )
+
+        self.assertEqual(client.metadata.title, "Amazing Grace")
+        self.assertEqual([candidate.track_id for candidate in result.candidates], ["same-id", "unrelated"])
+        self.assertEqual(list(result.candidates_by_market), ["US", "KR", "JP", "TW"])
+        self.assertEqual([candidate.market for candidate in result.selected], ["US", "KR", "JP", "TW"])
+        self.assertEqual([candidate.title for candidate in result.selected], ["Amazing Grace", "어메이징 그레이스", "アメイジング・グレイス", "Amazing Grace"])
+        self.assertGreater(
+            _spotify_candidate_score(client.metadata, result.candidates_by_market["US"][0]),
+            _spotify_candidate_score(client.metadata, result.candidates_by_market["US"][1]),
+        )
+
+    def test_dry_run_spotify_confirmation_selects_market_best_without_prompting(self) -> None:
+        result = SpotifySearchResult(
+            candidates=[
+                SpotifyTrackCandidate("us-best", "Amazing Grace", ["G.E.M."], "Amazing Grace", "US", 0, isrc="HKA972401000"),
+                SpotifyTrackCandidate("kr-best", "어메이징 그레이스", ["G.E.M."], "어메이징 그레이스", "KR", 0, isrc="HKA972401000"),
+                SpotifyTrackCandidate("backup", "Amazing Grace", ["Other"], "Other", "US", 1),
+            ],
+            candidates_by_market={
+                "US": [
+                    SpotifyTrackCandidate("us-best", "Amazing Grace", ["G.E.M."], "Amazing Grace", "US", 0, isrc="HKA972401000"),
+                    SpotifyTrackCandidate("us-backup", "Amazing Grace", ["Other"], "Other", "US", 1),
+                ],
+                "KR": [
+                    SpotifyTrackCandidate("kr-best", "어메이징 그레이스", ["G.E.M."], "어메이징 그레이스", "KR", 0, isrc="HKA972401000"),
+                ],
+            },
+        )
+        pair = PairMetadata(
+            Path("a.flac"),
+            Path("a.ttml"),
+            AudioMetadata(title="Amazing Grace", isrc="HKA972401000"),
+            AppleMusicMetadataResult(),
+            QQMusicSearchResult(),
+            NCMusicSearchResult(),
+            result,
+        )
+
+        confirm_spotify_candidates(
+            [pair],
+            dry_run=True,
+            input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual([candidate.track_id for candidate in result.selected], ["us-best", "kr-best"])
+
+    def test_dry_run_spotify_confirmation_does_not_auto_select_artist_only_mismatch(self) -> None:
+        result = SpotifySearchResult(
+            candidates=[
+                SpotifyTrackCandidate("wrong", "Fearless", ["Sān-Z"], "Fearless", "JP", 0),
+            ],
+            candidates_by_market={
+                "JP": [
+                    SpotifyTrackCandidate("wrong", "Fearless", ["Sān-Z"], "Fearless", "JP", 0),
+                ],
+            },
+        )
+        pair = PairMetadata(
+            Path("a.m4a"),
+            Path("a.ttml"),
+            AudioMetadata(title="I Ask", artists=["Sān-Z"], album="I Ask - Single"),
+            AppleMusicMetadataResult(),
+            QQMusicSearchResult(),
+            NCMusicSearchResult(),
+            result,
+        )
+
+        confirm_spotify_candidates(
+            [pair],
+            dry_run=True,
+            input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(result.selected, [])
+        self.assertEqual([candidate.track_id for candidate in result.candidates], ["wrong"])
+
+    def test_dry_run_spotify_confirmation_auto_selects_localized_title_by_date_duration(self) -> None:
+        result = SpotifySearchResult(
+            candidates=[
+                SpotifyTrackCandidate(
+                    "localized",
+                    "물음",
+                    ["Sān-Z", "HOYO-MiX"],
+                    "물음",
+                    "KR",
+                    0,
+                    isrc="FR10S2564999",
+                    duration_ms=192000,
+                    release_date="2025-12-18",
+                    release_date_precision="day",
+                ),
+                SpotifyTrackCandidate(
+                    "instrumental",
+                    "물음 - Instrumental",
+                    ["Sān-Z", "HOYO-MiX"],
+                    "물음",
+                    "KR",
+                    1,
+                    isrc="FR10S2565000",
+                    duration_ms=192000,
+                    release_date="2025-12-18",
+                    release_date_precision="day",
+                ),
+            ],
+            candidates_by_market={
+                "KR": [
+                    SpotifyTrackCandidate(
+                        "localized",
+                        "물음",
+                        ["Sān-Z", "HOYO-MiX"],
+                        "물음",
+                        "KR",
+                        0,
+                        isrc="FR10S2564999",
+                        duration_ms=192000,
+                        release_date="2025-12-18",
+                        release_date_precision="day",
+                    ),
+                    SpotifyTrackCandidate(
+                        "instrumental",
+                        "물음 - Instrumental",
+                        ["Sān-Z", "HOYO-MiX"],
+                        "물음",
+                        "KR",
+                        1,
+                        isrc="FR10S2565000",
+                        duration_ms=192000,
+                        release_date="2025-12-18",
+                        release_date_precision="day",
+                    ),
+                ]
+            },
+        )
+        pair = PairMetadata(
+            Path("a.m4a"),
+            Path("a.ttml"),
+            AudioMetadata(
+                title="I Ask",
+                artists=["Sān-Z & HOYO-MiX"],
+                album="I Ask - Single",
+                duration_seconds=192.1,
+                release_date="2025-12-18",
+            ),
+            AppleMusicMetadataResult(),
+            QQMusicSearchResult(),
+            NCMusicSearchResult(),
+            result,
+        )
+
+        confirm_spotify_candidates(
+            [pair],
+            dry_run=True,
+            input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual([(candidate.track_id, candidate.title) for candidate in result.selected], [("localized", "물음")])
+
+    def test_dry_run_spotify_confirmation_rejects_instrumental_when_source_is_not_instrumental(self) -> None:
+        result = SpotifySearchResult(
+            candidates=[
+                SpotifyTrackCandidate(
+                    "instrumental",
+                    "I Ask - Instrumental",
+                    ["Sān-Z", "HOYO-MiX"],
+                    "I Ask",
+                    "US",
+                    0,
+                    duration_ms=192000,
+                    release_date="2025-12-18",
+                    release_date_precision="day",
+                ),
+            ],
+            candidates_by_market={
+                "US": [
+                    SpotifyTrackCandidate(
+                        "instrumental",
+                        "I Ask - Instrumental",
+                        ["Sān-Z", "HOYO-MiX"],
+                        "I Ask",
+                        "US",
+                        0,
+                        duration_ms=192000,
+                        release_date="2025-12-18",
+                        release_date_precision="day",
+                    )
+                ]
+            },
+        )
+        pair = PairMetadata(
+            Path("a.m4a"),
+            Path("a.ttml"),
+            AudioMetadata(
+                title="I Ask",
+                artists=["Sān-Z & HOYO-MiX"],
+                album="I Ask - Single",
+                duration_seconds=192,
+                release_date="2025-12-18",
+            ),
+            AppleMusicMetadataResult(),
+            QQMusicSearchResult(),
+            NCMusicSearchResult(),
+            result,
+        )
+
+        confirm_spotify_candidates(
+            [pair],
+            dry_run=True,
+            input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+            print_func=lambda *values, **kwargs: None,
+        )
+
+        self.assertEqual(result.selected, [])
+
+    def test_rejecting_spotify_candidates_prompts_for_one_of_five_choices_per_market(self) -> None:
+        result = SpotifySearchResult(
+            candidates=[
+                SpotifyTrackCandidate(f"us-{index}", f"US Song {index}", ["A"], "Album", "US", index)
+                for index in range(1, 7)
+            ],
+            candidates_by_market={
+                "US": [
+                    SpotifyTrackCandidate(f"us-{index}", f"US Song {index}", ["A"], "Album", "US", index)
+                    for index in range(1, 7)
+                ],
+                "KR": [
+                    SpotifyTrackCandidate(f"kr-{index}", f"KR Song {index}", ["A"], "Album", "KR", index)
+                    for index in range(1, 4)
+                ],
+            },
+        )
+        pair = PairMetadata(
+            Path("song.flac"),
+            Path("song.ttml"),
+            AudioMetadata(title="Song"),
+            AppleMusicMetadataResult(),
+            QQMusicSearchResult(),
+            NCMusicSearchResult(),
+            result,
+        )
+        answers = iter(["N", "4", ""])
+        printed: list[str] = []
+
+        confirm_spotify_candidates(
+            [pair],
+            dry_run=False,
+            input_func=lambda prompt: next(answers),
+            print_func=lambda *values, **kwargs: printed.append(" ".join(str(value) for value in values)),
+        )
+
+        self.assertEqual([candidate.track_id for candidate in result.selected], ["us-4"])
+        self.assertTrue(any("US Spotify 候选" in line for line in printed))
+        self.assertTrue(any("KR Spotify 候选" in line for line in printed))
+        self.assertTrue(any("[us-1]" in line for line in printed))
+        self.assertTrue(any("[us-5]" in line for line in printed))
+        self.assertFalse(any("[us-6]" in line for line in printed))
+
+    def test_values_from_metadata_dedupes_spotify_id_but_keeps_market_metadata_variants(self) -> None:
+        values = values_from_metadata(
+            AudioMetadata(title="Amazing Grace", artists=["邓紫棋"], album="Amazing Grace - Single"),
+            spotify_candidates=[
+                SpotifyTrackCandidate("same-id", "Amazing Grace", ["G.E.M."], "Amazing Grace", "US", 0),
+                SpotifyTrackCandidate("same-id", "어메이징 그레이스", ["G.E.M. 덩쯔치"], "어메이징 그레이스", "KR", 1),
+                SpotifyTrackCandidate(
+                    "same-id",
+                    "アメイジング・グレイス",
+                    ["G.E.M."],
+                    "アメイジング・グレイス",
+                    "JP",
+                    2,
+                    isrc="HKA972401000",
+                ),
+            ],
+        )
+
+        self.assertEqual(values["spotifyId"], ["same-id"])
+        self.assertEqual(values["musicName"], ["Amazing Grace", "어메이징 그레이스", "アメイジング・グレイス"])
+        self.assertEqual(values["artists"], ["邓紫棋", "G.E.M.", "G.E.M. 덩쯔치"])
+        self.assertEqual(values["album"], ["Amazing Grace - Single", "Amazing Grace", "어메이징 그레이스", "アメイジング・グレイス"])
+        self.assertEqual(values["isrc"], ["HKA972401000"])
+
+    def test_process_prepared_pair_prints_market_best_and_deduped_spotify_ids(self) -> None:
+        result = SpotifySearchResult(
+            candidates=[
+                SpotifyTrackCandidate("same-id", "Amazing Grace", ["G.E.M."], "Amazing Grace", "US", 0),
+                SpotifyTrackCandidate("same-id", "어메이징 그레이스", ["G.E.M."], "어메이징 그레이스", "KR", 1),
+            ],
+            selected=[
+                SpotifyTrackCandidate("same-id", "Amazing Grace", ["G.E.M."], "Amazing Grace", "US", 0),
+                SpotifyTrackCandidate("same-id", "어메이징 그레이스", ["G.E.M."], "어메이징 그레이스", "KR", 1),
+            ],
+            candidates_by_market={
+                "US": [SpotifyTrackCandidate("same-id", "Amazing Grace", ["G.E.M."], "Amazing Grace", "US", 0)],
+                "KR": [SpotifyTrackCandidate("same-id", "어메이징 그레이스", ["G.E.M."], "어메이징 그레이스", "KR", 1)],
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song.ttml"
+            path.write_text(REFERENCE_STYLE_TTML, encoding="utf-8")
+            pair = PairMetadata(
+                Path("song.flac"),
+                path,
+                AudioMetadata(title="Amazing Grace"),
+                AppleMusicMetadataResult(),
+                QQMusicSearchResult(),
+                NCMusicSearchResult(),
+                result,
+            )
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                _process_prepared_pair(pair, dry_run=True)
+
+        output = stdout.getvalue()
+        self.assertIn("spotifyBest: US: Amazing Grace - G.E.M. - Amazing Grace [same-id], KR: 어메이징 그레이스 - G.E.M. - 어메이징 그레이스 [same-id]", output)
+        self.assertIn("spotifyId: same-id", output)
+        self.assertNotIn("spotifyId: same-id, same-id", output)
+
+    def test_main_dry_run_skips_spotify_when_credentials_are_missing(self) -> None:
+        class NoAppleLookupClient:
+            def fetch_album_tracks(self, store, album_id):
+                raise AssertionError("TTML-only work should not call Apple Music")
+
+        class NoQQCandidatesClient:
+            def search_songs(self, query):
+                return []
+
+        class NoNCMCandidatesClient:
+            def search_songs(self, context):
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = directory / "song.ttml"
+            path.write_text(
+                (
+                    '<tt xmlns="http://www.w3.org/ns/ttml" '
+                    'xmlns:amll="http://www.example.com/ns/amll">'
+                    '<head><metadata>'
+                    '<amll:meta key="musicName" value="玫瑰少年"/>'
+                    '<amll:meta key="artists" value="蔡依林"/>'
+                    '<amll:meta key="album" value="UGLY BEAUTY"/>'
+                    "</metadata></head><body/></tt>"
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            cwd = os.getcwd()
+
+            try:
+                os.chdir(directory)
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch("fill_ttml_metadata.AppleMusicClient", return_value=NoAppleLookupClient()),
+                    patch("fill_ttml_metadata.QQMusicClient", return_value=NoQQCandidatesClient()),
+                    patch("fill_ttml_metadata.NCMusicClient", return_value=NoNCMCandidatesClient()),
+                    redirect_stdout(stdout),
+                ):
+                    exit_code = main(["--ttml", str(path), "--dry-run"])
+            finally:
+                os.chdir(cwd)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("spotifyBest: -", stdout.getvalue())
+        self.assertIn("spotifyId: -", stdout.getvalue())
+        self.assertIn("缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索", stdout.getvalue())
 
 
 class TtmlOnlyMetadataTests(unittest.TestCase):

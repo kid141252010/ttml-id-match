@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import html
 import json
+import os
 import re
 import shutil
 import sys
@@ -23,15 +25,22 @@ from opencc import OpenCC
 AMLL_NS = "http://www.example.com/ns/amll"
 
 DEFAULT_STORES = ["cn", "tw", "jp", "kr", "us"]
+DEFAULT_SPOTIFY_MARKETS = ["US", "KR", "JP", "TW"]
 DEFAULT_NCM_API_BASES = [
     "https://music163.xuanmou.com.cn",
     "https://neteasecloudmusicapi-main-api.vercel.app",
     "https://api-enhanced-six-beta.vercel.app",
 ]
+SPOTIFY_SEARCH_LIMIT = 20
+SPOTIFY_CANDIDATE_TARGET = 5
+SPOTIFY_ARTIST_SEARCH_LIMIT = 10
+SPOTIFY_ARTIST_ALBUM_LIMIT = 10
+SPOTIFY_ARTIST_ALBUM_PAGE_LIMIT = 3
+SPOTIFY_STRONG_MATCH_SCORE = 260
 NCM_SEARCH_LIMIT = 100
 NCM_ARTIST_SEARCH_LIMIT = 10
 NCM_ARTIST_ALBUM_LIMIT = 50
-TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "ncmMusicId", "appleMusicId", "isrc"]
+TARGET_KEY_ORDER = ["musicName", "artists", "album", "qqMusicId", "ncmMusicId", "spotifyId", "appleMusicId", "isrc"]
 OPENCC_T2S = OpenCC("t2s")
 AUDIO_EXTENSIONS = {
     ".aac",
@@ -63,6 +72,7 @@ class AudioMetadata:
     track_number: int | None = None
     disc_number: int | None = None
     duration_seconds: float | None = None
+    release_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +131,56 @@ class NCMusicSearchResult:
 
 
 @dataclass(frozen=True)
+class SpotifyCredentials:
+    client_id: str | None = None
+    client_secret: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+
+@dataclass(frozen=True)
+class SpotifyTrackCandidate:
+    track_id: str
+    title: str | None = None
+    artists: list[str] = field(default_factory=list)
+    album: str | None = None
+    market: str = ""
+    source_index: int = 0
+    isrc: str | None = None
+    duration_ms: int | None = None
+    release_date: str | None = None
+    release_date_precision: str | None = None
+    album_id: str | None = None
+    match_source: str = "search"
+
+
+@dataclass
+class SpotifySearchResult:
+    candidates: list[SpotifyTrackCandidate] = field(default_factory=list)
+    selected: list[SpotifyTrackCandidate] = field(default_factory=list)
+    candidates_by_market: dict[str, list[SpotifyTrackCandidate]] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _SpotifyArtistCandidate:
+    artist_id: str
+    name: str | None = None
+    source_index: int = 0
+
+
+@dataclass(frozen=True)
+class _SpotifyAlbumCandidate:
+    album_id: str
+    name: str | None = None
+    release_date: str | None = None
+    release_date_precision: str | None = None
+    source_index: int = 0
+
+
+@dataclass(frozen=True)
 class _NCMusicArtistCandidate:
     artist_id: str
     name: str | None = None
@@ -143,6 +203,7 @@ class PairMetadata:
     apple_music_metadata: AppleMusicMetadataResult
     qq_music_metadata: QQMusicSearchResult
     ncm_music_metadata: NCMusicSearchResult = field(default_factory=NCMusicSearchResult)
+    spotify_metadata: SpotifySearchResult = field(default_factory=SpotifySearchResult)
 
 
 @dataclass(frozen=True)
@@ -207,6 +268,11 @@ class QQMusicClientProtocol(Protocol):
 
 class NCMusicClientProtocol(Protocol):
     def search_songs(self, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
+        ...
+
+
+class SpotifyClientProtocol(Protocol):
+    def search_tracks(self, metadata: AudioMetadata) -> list[SpotifyTrackCandidate]:
         ...
 
 
@@ -519,6 +585,327 @@ class NCMusicClient:
         return payload
 
 
+def load_spotify_credentials(
+    env_path: Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> SpotifyCredentials:
+    env_path = env_path or Path(".env")
+    environment = environ if environ is not None else os.environ
+    values = _read_dotenv_values(env_path)
+
+    client_id = _clean_env_value(environment.get("SPOTIFY_CLIENT_ID")) or values.get("SPOTIFY_CLIENT_ID")
+    client_secret = _clean_env_value(environment.get("SPOTIFY_CLIENT_SECRET")) or values.get("SPOTIFY_CLIENT_SECRET")
+    return SpotifyCredentials(client_id=client_id, client_secret=client_secret)
+
+
+class SpotifyClient:
+    TOKEN_URL = "https://accounts.spotify.com/api/token"
+    SEARCH_URL = "https://api.spotify.com/v1/search"
+    ARTIST_ALBUMS_URL = "https://api.spotify.com/v1/artists/{artist_id}/albums"
+    ALBUM_URL = "https://api.spotify.com/v1/albums/{album_id}"
+    TRACK_URL = "https://api.spotify.com/v1/tracks/{track_id}"
+
+    def __init__(
+        self,
+        credentials: SpotifyCredentials,
+        timeout: int = 20,
+        markets: Iterable[str] | None = None,
+        read_json: Callable[[str, str], dict[str, Any]] | None = None,
+    ):
+        self.credentials = credentials
+        self.timeout = timeout
+        self.markets = list(markets or DEFAULT_SPOTIFY_MARKETS)
+        self._read_json = read_json or self._read_json_from_url
+        self._access_token: str | None = None
+
+    def search_tracks(self, metadata: AudioMetadata) -> list[SpotifyTrackCandidate]:
+        if not metadata.title:
+            return []
+        access_token = self._get_access_token()
+        candidates: list[SpotifyTrackCandidate] = []
+        errors: list[str] = []
+        for market in self.markets:
+            market_candidates = self._search_market_tracks(metadata, access_token, market, len(candidates), errors)
+            if self._should_search_artist_albums(metadata, market_candidates):
+                market_candidates.extend(
+                    self._search_artist_album_tracks(
+                        metadata,
+                        access_token,
+                        market,
+                        len(candidates) + len(market_candidates),
+                    )
+                )
+            candidates.extend(_dedupe_spotify_candidates(market_candidates))
+        if errors and not candidates:
+            raise LookupError("; ".join(errors))
+        return candidates
+
+    def _search_market_tracks(
+        self,
+        metadata: AudioMetadata,
+        access_token: str,
+        market: str,
+        source_offset: int,
+        errors: list[str],
+    ) -> list[SpotifyTrackCandidate]:
+        market_candidates: list[SpotifyTrackCandidate] = []
+        for query in _spotify_search_queries(metadata):
+            try:
+                payload = self._read_json(self._build_search_url_for_query(query, market), access_token)
+            except Exception as exc:
+                errors.append(f"{market}:{query}: {exc}")
+                continue
+            parsed = _parse_spotify_candidates(payload, market=market)
+            if parsed:
+                local_offset = len(market_candidates)
+                market_candidates.extend(
+                    SpotifyTrackCandidate(
+                        track_id=candidate.track_id,
+                        title=candidate.title,
+                        artists=list(candidate.artists),
+                        album=candidate.album,
+                        market=candidate.market,
+                        source_index=source_offset + local_offset + index,
+                        isrc=candidate.isrc,
+                        duration_ms=candidate.duration_ms,
+                        release_date=candidate.release_date,
+                        release_date_precision=candidate.release_date_precision,
+                        album_id=candidate.album_id,
+                        match_source=candidate.match_source,
+                    )
+                    for index, candidate in enumerate(parsed)
+                )
+            if len(_dedupe_spotify_candidates(market_candidates)) >= SPOTIFY_CANDIDATE_TARGET:
+                break
+        return market_candidates
+
+    def _should_search_artist_albums(
+        self,
+        metadata: AudioMetadata,
+        candidates: list[SpotifyTrackCandidate],
+    ) -> bool:
+        if not (metadata.title and metadata.artists and metadata.release_date and metadata.duration_seconds is not None):
+            return False
+        if not candidates:
+            return True
+        return max((_spotify_candidate_score(metadata, candidate) for candidate in candidates), default=0) < SPOTIFY_STRONG_MATCH_SCORE
+
+    def _search_artist_album_tracks(
+        self,
+        metadata: AudioMetadata,
+        access_token: str,
+        market: str,
+        source_offset: int,
+    ) -> list[SpotifyTrackCandidate]:
+        artists = self._find_matching_artists(metadata, access_token, market)
+        if not artists:
+            return []
+
+        candidates: list[SpotifyTrackCandidate] = []
+        seen_album_ids: set[str] = set()
+        for artist in artists:
+            for album in self._iter_artist_albums(artist.artist_id, access_token, market):
+                if album.album_id in seen_album_ids:
+                    continue
+                seen_album_ids.add(album.album_id)
+                if not _release_date_matches(metadata.release_date, album.release_date, album.release_date_precision):
+                    continue
+                try:
+                    payload = self._read_json(self._build_album_url(album.album_id, market), access_token)
+                except Exception:
+                    continue
+                album_candidates = _parse_spotify_album_track_candidates(payload, market)
+                for candidate in album_candidates:
+                    if not _spotify_album_fallback_track_matches(metadata, candidate):
+                        continue
+                    candidate = self._hydrate_track_candidate(candidate, access_token, market) or candidate
+                    candidates.append(
+                        SpotifyTrackCandidate(
+                            track_id=candidate.track_id,
+                            title=candidate.title,
+                            artists=list(candidate.artists),
+                            album=candidate.album,
+                            market=candidate.market,
+                            source_index=source_offset + len(candidates),
+                            isrc=candidate.isrc,
+                            duration_ms=candidate.duration_ms,
+                            release_date=candidate.release_date,
+                            release_date_precision=candidate.release_date_precision,
+                            album_id=candidate.album_id,
+                            match_source="artist-album",
+                        )
+                    )
+        return _dedupe_spotify_candidates(candidates)
+
+    def _hydrate_track_candidate(
+        self,
+        candidate: SpotifyTrackCandidate,
+        access_token: str,
+        market: str,
+    ) -> SpotifyTrackCandidate | None:
+        try:
+            payload = self._read_json(self._build_track_url(candidate.track_id, market), access_token)
+        except Exception:
+            return None
+        hydrated = _spotify_track_candidate_from_track(
+            payload,
+            market,
+            candidate.source_index,
+            candidate.match_source,
+        )
+        if hydrated is None:
+            return None
+        return SpotifyTrackCandidate(
+            track_id=hydrated.track_id,
+            title=hydrated.title or candidate.title,
+            artists=list(hydrated.artists or candidate.artists),
+            album=hydrated.album or candidate.album,
+            market=candidate.market,
+            source_index=candidate.source_index,
+            isrc=hydrated.isrc or candidate.isrc,
+            duration_ms=hydrated.duration_ms or candidate.duration_ms,
+            release_date=hydrated.release_date or candidate.release_date,
+            release_date_precision=hydrated.release_date_precision or candidate.release_date_precision,
+            album_id=hydrated.album_id or candidate.album_id,
+            match_source=candidate.match_source,
+        )
+
+    def _find_matching_artists(
+        self,
+        metadata: AudioMetadata,
+        access_token: str,
+        market: str,
+    ) -> list[_SpotifyArtistCandidate]:
+        matches: list[_SpotifyArtistCandidate] = []
+        seen_artist_ids: set[str] = set()
+        for artist_name in metadata.artists:
+            try:
+                payload = self._read_json(self._build_artist_search_url(artist_name, market), access_token)
+            except Exception:
+                continue
+            for artist in _parse_spotify_artist_candidates(payload):
+                if artist.artist_id in seen_artist_ids or not _spotify_artist_matches(metadata, artist):
+                    continue
+                seen_artist_ids.add(artist.artist_id)
+                matches.append(artist)
+        return matches
+
+    def _iter_artist_albums(
+        self,
+        artist_id: str,
+        access_token: str,
+        market: str,
+    ) -> Iterable[_SpotifyAlbumCandidate]:
+        for page_index in range(SPOTIFY_ARTIST_ALBUM_PAGE_LIMIT):
+            offset = page_index * SPOTIFY_ARTIST_ALBUM_LIMIT
+            try:
+                payload = self._read_json(self._build_artist_albums_url(artist_id, market, offset), access_token)
+            except Exception:
+                return
+            albums = _parse_spotify_artist_album_candidates(payload)
+            if not albums:
+                return
+            yield from albums
+            total = _parse_number(payload.get("total"))
+            if total is not None and offset + SPOTIFY_ARTIST_ALBUM_LIMIT >= total:
+                return
+            if not payload.get("next") and total is None:
+                return
+
+    def _get_access_token(self) -> str:
+        if self._access_token:
+            return self._access_token
+        request = self._build_token_request()
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "ignore"))
+        token = _stringify_tag_value(payload.get("access_token")) if isinstance(payload, dict) else None
+        if not token:
+            raise ValueError("Spotify token response did not include access_token")
+        self._access_token = token
+        return token
+
+    def _build_token_request(self) -> urllib.request.Request:
+        if not self.credentials.client_id or not self.credentials.client_secret:
+            raise ValueError("missing Spotify client credentials")
+        token = base64.b64encode(
+            f"{self.credentials.client_id}:{self.credentials.client_secret}".encode("utf-8")
+        ).decode("ascii")
+        data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
+        return urllib.request.Request(
+            self.TOKEN_URL,
+            data=data,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Basic {token}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+
+    def _build_search_url(self, metadata: AudioMetadata, market: str) -> str:
+        queries = _spotify_search_queries(metadata)
+        query = queries[0] if queries else ""
+        if not query:
+            raise ValueError("Spotify search requires a title")
+        return self._build_search_url_for_query(query, market)
+
+    def _build_search_url_for_query(self, query: str, market: str) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "q": query,
+                "type": "track",
+                "market": market,
+                "limit": SPOTIFY_SEARCH_LIMIT,
+            }
+        )
+        return f"{self.SEARCH_URL}?{params}"
+
+    def _build_artist_search_url(self, query: str, market: str) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "q": query,
+                "type": "artist",
+                "market": market,
+                "limit": SPOTIFY_ARTIST_SEARCH_LIMIT,
+            }
+        )
+        return f"{self.SEARCH_URL}?{params}"
+
+    def _build_artist_albums_url(self, artist_id: str, market: str, offset: int = 0) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "include_groups": "album,single",
+                "market": market,
+                "limit": SPOTIFY_ARTIST_ALBUM_LIMIT,
+                "offset": offset,
+            }
+        )
+        return f"{self.ARTIST_ALBUMS_URL.format(artist_id=urllib.parse.quote(artist_id, safe=''))}?{params}"
+
+    def _build_album_url(self, album_id: str, market: str) -> str:
+        params = urllib.parse.urlencode({"market": market})
+        return f"{self.ALBUM_URL.format(album_id=urllib.parse.quote(album_id, safe=''))}?{params}"
+
+    def _build_track_url(self, track_id: str, market: str) -> str:
+        params = urllib.parse.urlencode({"market": market})
+        return f"{self.TRACK_URL.format(track_id=urllib.parse.quote(track_id, safe=''))}?{params}"
+
+    def _read_json_from_url(self, url: str, access_token: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "ignore"))
+        if not isinstance(payload, dict):
+            raise ValueError("Spotify API returned a non-object payload")
+        return payload
+
+
 def read_audio_metadata(path: Path) -> AudioMetadata:
     try:
         from mutagen import File
@@ -540,6 +927,20 @@ def read_audio_metadata(path: Path) -> AudioMetadata:
     playlist_id = _first_tag(tags, "itunesplaylistid")
     track_number = _parse_number(_first_tag(tags, "track", "tracknumber", "trkn"))
     disc_number = _parse_number(_first_tag(tags, "disc", "discnumber", "disk"))
+    release_date = _normalize_release_date(
+        _first_tag(
+            tags,
+            "date",
+            "year",
+            "originaldate",
+            "originalyear",
+            "releasedate",
+            "release_date",
+            "\xa9day",
+            "tdrc",
+            "tdor",
+        )
+    )
 
     return AudioMetadata(
         title=title,
@@ -551,6 +952,7 @@ def read_audio_metadata(path: Path) -> AudioMetadata:
         track_number=track_number,
         disc_number=disc_number,
         duration_seconds=float(duration) if duration is not None else None,
+        release_date=release_date,
     )
 
 
@@ -670,6 +1072,58 @@ def collect_ncm_music_metadata(
     return result
 
 
+def collect_spotify_metadata(
+    metadata: AudioMetadata,
+    client: SpotifyClientProtocol | None,
+) -> SpotifySearchResult:
+    result = SpotifySearchResult()
+    if client is None:
+        result.errors.append("缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索")
+        return result
+    if not metadata.title:
+        result.errors.append("未读取到歌名，跳过 Spotify 搜索")
+        return result
+
+    try:
+        candidates = client.search_tracks(metadata)
+    except Exception as exc:
+        result.errors.append(f"Spotify 搜索失败: {exc}")
+        return result
+
+    for market in _spotify_market_order(candidates):
+        market_candidates = [candidate for candidate in candidates if candidate.market == market]
+        if not market_candidates:
+            continue
+        result.candidates_by_market[market] = _dedupe_spotify_candidates(
+            sorted(
+                market_candidates,
+                key=lambda candidate: (-_spotify_candidate_score(metadata, candidate), candidate.source_index),
+            )
+        )
+
+    result.candidates = sorted(
+        _dedupe_spotify_candidates(
+            sorted(
+                candidates,
+                key=lambda candidate: (
+                    -_spotify_candidate_score(metadata, candidate),
+                    _spotify_market_index(candidate.market),
+                    candidate.source_index,
+                ),
+            )
+        ),
+        key=lambda candidate: (
+            -_spotify_candidate_score(metadata, candidate),
+            _spotify_market_index(candidate.market),
+            candidate.source_index,
+        ),
+    )
+    result.selected = _spotify_market_best_candidates(result, metadata)
+    if not result.candidates:
+        result.errors.append("Spotify 未找到带 track id 的候选")
+    return result
+
+
 def confirm_qq_music_candidates(
     pairs: list[PairMetadata],
     dry_run: bool,
@@ -766,6 +1220,62 @@ def confirm_ncm_music_candidates(
             print_func("Invalid selection.")
 
 
+def confirm_spotify_candidates(
+    pairs: list[PairMetadata],
+    dry_run: bool,
+    input_func: Callable[[str], str] = input,
+    print_func: Callable[..., None] | None = None,
+) -> None:
+    if print_func is None:
+        print_func = _safe_print
+
+    available = [pair for pair in pairs if pair.spotify_metadata.candidates]
+    for pair in available:
+        pair.spotify_metadata.selected = _spotify_market_best_candidates(pair.spotify_metadata, pair.metadata)
+
+    if dry_run or not available:
+        return
+
+    print_func("")
+    print_func("Spotify 最佳候选：")
+    for pair in available:
+        best = _spotify_market_best_candidates(pair.spotify_metadata, pair.metadata)
+        print_func(f"  {pair.ttml_path.name}: {_format_spotify_candidate_list(best)}")
+
+    while True:
+        answer = input_func("Accept all Spotify best candidates? Type Y to accept, N to choose alternatives: ").strip()
+        if answer.casefold() in {"y", "n"}:
+            break
+        print_func("Please type Y or N.")
+
+    if answer.casefold() == "y":
+        return
+
+    for pair in available:
+        selected: list[SpotifyTrackCandidate] = []
+        print_func("")
+        print_func(f"{pair.ttml_path.name} Spotify 候选：")
+        market_groups = pair.spotify_metadata.candidates_by_market or _spotify_candidates_grouped_by_market(
+            pair.spotify_metadata.candidates
+        )
+        for market in _spotify_market_order_from_mapping(market_groups):
+            options = market_groups.get(market, [])[:5]
+            if not options:
+                continue
+            print_func(f"  {market} Spotify 候选：")
+            for index, candidate in enumerate(options, start=1):
+                print_func(f"    {index}. {_format_spotify_candidate(candidate)}")
+            while True:
+                answer = input_func(f"Select {market} 1-5, or press Enter to skip this market: ").strip()
+                if not answer:
+                    break
+                if answer.isdigit() and 1 <= int(answer) <= len(options):
+                    selected.append(options[int(answer) - 1])
+                    break
+                print_func("Invalid selection.")
+        pair.spotify_metadata.selected = selected
+
+
 def update_ttml_metadata(
     path: Path,
     values: dict[str, list[str]],
@@ -840,6 +1350,7 @@ def values_from_metadata(
     apple_music_values: dict[str, list[str]] | None = None,
     qq_music_candidate: QQMusicCandidate | None = None,
     ncm_music_candidate: NCMusicCandidate | None = None,
+    spotify_candidates: Iterable[SpotifyTrackCandidate] | None = None,
 ) -> dict[str, list[str]]:
     values: dict[str, list[str]] = {}
     if metadata.title:
@@ -856,6 +1367,8 @@ def values_from_metadata(
         _merge_qq_music_metadata(values, metadata, qq_music_candidate)
     if ncm_music_candidate:
         _merge_ncm_music_metadata(values, metadata, ncm_music_candidate)
+    for spotify_candidate in spotify_candidates or []:
+        _merge_spotify_metadata(values, metadata, spotify_candidate)
     if metadata.isrc:
         _add_unique_value(values, "isrc", metadata.isrc)
     return values
@@ -927,6 +1440,8 @@ def main(argv: list[str] | None = None) -> int:
     apple_music_client = AppleMusicClient()
     qq_music_client = QQMusicClient()
     ncm_music_client = NCMusicClient()
+    spotify_credentials = load_spotify_credentials()
+    spotify_client = SpotifyClient(spotify_credentials) if spotify_credentials.enabled else None
     failures = 0
     backup_paths: dict[Path, Path] = {}
     prepared_pairs: list[PairMetadata] = []
@@ -940,7 +1455,15 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         try:
-            prepared_pairs.append(_prepare_work_item(work_item, apple_music_client, qq_music_client, ncm_music_client))
+            prepared_pairs.append(
+                _prepare_work_item(
+                    work_item,
+                    apple_music_client,
+                    qq_music_client,
+                    ncm_music_client,
+                    spotify_client,
+                )
+            )
         except Exception as exc:
             failures += 1
             _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
@@ -948,6 +1471,7 @@ def main(argv: list[str] | None = None) -> int:
     confirm_qq_music_candidates(prepared_pairs, dry_run=args.dry_run)
     _collect_ncm_music_metadata_for_pairs(prepared_pairs, ncm_music_client)
     confirm_ncm_music_candidates(prepared_pairs, dry_run=args.dry_run)
+    confirm_spotify_candidates(prepared_pairs, dry_run=args.dry_run)
 
     for pair in prepared_pairs:
         try:
@@ -965,11 +1489,21 @@ def _prepare_pair(
     apple_music_client: AppleMusicClientProtocol,
     qq_music_client: QQMusicClientProtocol,
     ncm_music_client: NCMusicClientProtocol | None = None,
+    spotify_client: SpotifyClientProtocol | None = None,
 ) -> PairMetadata:
     metadata = read_audio_metadata(audio_path)
     apple_music_metadata = collect_apple_music_metadata(metadata, apple_music_client)
     qq_music_metadata = collect_qq_music_metadata(metadata, qq_music_client)
-    return PairMetadata(audio_path, ttml_path, metadata, apple_music_metadata, qq_music_metadata, NCMusicSearchResult())
+    spotify_metadata = collect_spotify_metadata(metadata, spotify_client)
+    return PairMetadata(
+        audio_path,
+        ttml_path,
+        metadata,
+        apple_music_metadata,
+        qq_music_metadata,
+        NCMusicSearchResult(),
+        spotify_metadata,
+    )
 
 
 def _prepare_work_item(
@@ -977,13 +1511,21 @@ def _prepare_work_item(
     apple_music_client: AppleMusicClientProtocol,
     qq_music_client: QQMusicClientProtocol,
     ncm_music_client: NCMusicClientProtocol | None = None,
+    spotify_client: SpotifyClientProtocol | None = None,
 ) -> PairMetadata:
     if work_item.audio_path:
-        return _prepare_pair(work_item.audio_path, work_item.ttml_path, apple_music_client, qq_music_client, ncm_music_client)
+        return _prepare_pair(
+            work_item.audio_path,
+            work_item.ttml_path,
+            apple_music_client,
+            qq_music_client,
+            ncm_music_client,
+            spotify_client,
+        )
 
     metadata = read_ttml_metadata(work_item.ttml_path)
     if not metadata.title:
-        raise ValueError("TTML 中未读取到歌名，跳过 QQ 音乐搜索和网易云音乐搜索")
+        raise ValueError("TTML 中未读取到歌名，跳过 QQ 音乐搜索、网易云音乐搜索和 Spotify 搜索")
     return PairMetadata(
         None,
         work_item.ttml_path,
@@ -991,6 +1533,7 @@ def _prepare_work_item(
         AppleMusicMetadataResult(),
         collect_qq_music_metadata(metadata, qq_music_client),
         NCMusicSearchResult(),
+        collect_spotify_metadata(metadata, spotify_client),
     )
 
 
@@ -1001,8 +1544,16 @@ def _process_pair(
     dry_run: bool,
     qq_music_client: QQMusicClientProtocol | None = None,
     ncm_music_client: NCMusicClientProtocol | None = None,
+    spotify_client: SpotifyClientProtocol | None = None,
 ) -> None:
-    pair = _prepare_pair(audio_path, ttml_path, client, qq_music_client or QQMusicClient(), ncm_music_client)
+    pair = _prepare_pair(
+        audio_path,
+        ttml_path,
+        client,
+        qq_music_client or QQMusicClient(),
+        ncm_music_client,
+        spotify_client,
+    )
     confirm_qq_music_candidates([pair], dry_run=dry_run)
     _collect_ncm_music_metadata_for_pairs([pair], ncm_music_client or NCMusicClient())
     confirm_ncm_music_candidates([pair], dry_run=dry_run)
@@ -1031,12 +1582,14 @@ def _process_prepared_pair(
         pair.apple_music_metadata.values,
         qq_music_candidate=pair.qq_music_metadata.selected,
         ncm_music_candidate=pair.ncm_music_metadata.selected,
+        spotify_candidates=pair.spotify_metadata.selected,
     )
     audio_path = pair.audio_path
     ttml_path = pair.ttml_path
     apple_music_metadata = pair.apple_music_metadata
     qq_music_metadata = pair.qq_music_metadata
     ncm_music_metadata = pair.ncm_music_metadata
+    spotify_metadata = pair.spotify_metadata
     result = update_ttml_metadata(ttml_path, values, dry_run=dry_run, backup_paths=backup_paths)
 
     status = "dry-run" if dry_run else "updated"
@@ -1062,6 +1615,17 @@ def _process_prepared_pair(
     _safe_print(f"  ncmMusicId: {selected_ncm.song_id if selected_ncm else '-'}")
     if ncm_music_metadata.errors:
         for error in ncm_music_metadata.errors:
+            _safe_print(f"  lookup warning: {error}")
+    _safe_print(
+        "  spotifyBest: "
+        + (_format_spotify_candidate_list(spotify_metadata.selected) or "-")
+    )
+    _safe_print(
+        "  spotifyId: "
+        + (", ".join(_unique_spotify_ids(spotify_metadata.selected)) or "-")
+    )
+    if spotify_metadata.errors:
+        for error in spotify_metadata.errors:
             _safe_print(f"  lookup warning: {error}")
     _print_change_group("added", result.added)
     _print_change_group("replaced", result.replaced)
@@ -1157,6 +1721,27 @@ def _merge_ncm_music_metadata(
         if not any(_same_raw_text(artist, existing) for existing in metadata.artists):
             _add_unique_value(values, "artists", artist)
     if candidate.album and not _same_raw_text(candidate.album, metadata.album):
+        _add_unique_value(values, "album", candidate.album)
+
+
+def _merge_spotify_metadata(
+    values: dict[str, list[str]],
+    metadata: AudioMetadata,
+    candidate: SpotifyTrackCandidate,
+) -> None:
+    _add_unique_value(values, "spotifyId", candidate.track_id)
+    if candidate.isrc and not _same_identifier(candidate.isrc, metadata.isrc):
+        _add_unique_value(values, "isrc", candidate.isrc)
+    existing_titles = [metadata.title, *values.get("musicName", [])]
+    if candidate.title and not any(_same_raw_text(candidate.title, existing) for existing in existing_titles):
+        _add_unique_value(values, "musicName", candidate.title)
+    existing_artists = [*metadata.artists, *values.get("artists", [])]
+    for artist in candidate.artists:
+        if not any(_same_raw_text(artist, existing) for existing in existing_artists):
+            _add_unique_value(values, "artists", artist)
+            existing_artists.append(artist)
+    existing_albums = [metadata.album, *values.get("album", [])]
+    if candidate.album and not any(_same_raw_text(candidate.album, existing) for existing in existing_albums):
         _add_unique_value(values, "album", candidate.album)
 
 
@@ -1321,6 +1906,97 @@ def _parse_ncm_album_song_candidates(payload: dict[str, Any]) -> list[NCMusicCan
     return _parse_ncm_music_candidates({"result": {"songs": songs}})
 
 
+def _parse_spotify_candidates(payload: dict[str, Any], market: str) -> list[SpotifyTrackCandidate]:
+    tracks = _nested_get(payload, "tracks", "items")
+    if not isinstance(tracks, list):
+        return []
+
+    candidates: list[SpotifyTrackCandidate] = []
+    for index, track in enumerate(tracks):
+        if not isinstance(track, dict):
+            continue
+        candidate = _spotify_track_candidate_from_track(track, market, index, "search")
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _parse_spotify_artist_candidates(payload: dict[str, Any]) -> list[_SpotifyArtistCandidate]:
+    artists = _nested_get(payload, "artists", "items")
+    if not isinstance(artists, list):
+        return []
+
+    candidates: list[_SpotifyArtistCandidate] = []
+    for index, artist in enumerate(artists):
+        if not isinstance(artist, dict):
+            continue
+        artist_id = _stringify_tag_value(artist.get("id"))
+        if not artist_id:
+            continue
+        candidates.append(
+            _SpotifyArtistCandidate(
+                artist_id=artist_id,
+                name=_stringify_tag_value(artist.get("name")),
+                source_index=index,
+            )
+        )
+    return candidates
+
+
+def _parse_spotify_artist_album_candidates(payload: dict[str, Any]) -> list[_SpotifyAlbumCandidate]:
+    albums = payload.get("items")
+    if not isinstance(albums, list):
+        return []
+
+    candidates: list[_SpotifyAlbumCandidate] = []
+    for index, album in enumerate(albums):
+        if not isinstance(album, dict):
+            continue
+        album_id = _stringify_tag_value(album.get("id"))
+        if not album_id:
+            continue
+        candidates.append(
+            _SpotifyAlbumCandidate(
+                album_id=album_id,
+                name=_stringify_tag_value(album.get("name")),
+                release_date=_normalize_release_date(album.get("release_date")),
+                release_date_precision=_stringify_tag_value(album.get("release_date_precision")),
+                source_index=index,
+            )
+        )
+    return candidates
+
+
+def _parse_spotify_album_track_candidates(payload: dict[str, Any], market: str) -> list[SpotifyTrackCandidate]:
+    tracks = _nested_get(payload, "tracks", "items")
+    if not isinstance(tracks, list):
+        return []
+
+    album_id = _stringify_tag_value(payload.get("id"))
+    album_name = _stringify_tag_value(payload.get("name"))
+    album_artists = _spotify_artists(payload.get("artists"))
+    release_date = _normalize_release_date(payload.get("release_date"))
+    release_date_precision = _stringify_tag_value(payload.get("release_date_precision"))
+    candidates: list[SpotifyTrackCandidate] = []
+    for index, track in enumerate(tracks):
+        if not isinstance(track, dict):
+            continue
+        candidate = _spotify_track_candidate_from_track(
+            track,
+            market,
+            index,
+            "artist-album",
+            album_id=album_id,
+            album_name=album_name,
+            album_artists=album_artists,
+            release_date=release_date,
+            release_date_precision=release_date_precision,
+        )
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
 def _ncm_artist_aliases(artist: dict[str, Any]) -> list[str]:
     aliases: list[str] = []
     for key in ("alias", "alia", "trans"):
@@ -1375,6 +2051,91 @@ def _ncm_music_album(value: Any) -> str | None:
     return _stringify_tag_value(value)
 
 
+def _spotify_artists(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return split_artists([value.get("name")])
+    if not isinstance(value, list):
+        return split_artists([value]) if value else []
+    artists: list[str] = []
+    for item in value:
+        name = _stringify_tag_value(item.get("name") if isinstance(item, dict) else item)
+        for artist in split_artists([name]):
+            if artist not in artists:
+                artists.append(artist)
+    return artists
+
+
+def _spotify_track_candidate_from_track(
+    track: dict[str, Any],
+    market: str,
+    source_index: int,
+    match_source: str,
+    album_id: str | None = None,
+    album_name: str | None = None,
+    album_artists: list[str] | None = None,
+    release_date: str | None = None,
+    release_date_precision: str | None = None,
+) -> SpotifyTrackCandidate | None:
+    track_id = _stringify_tag_value(track.get("id"))
+    if not track_id:
+        return None
+
+    album = track.get("album")
+    parsed_album_name = album_name or _spotify_album(album)
+    parsed_album_id = album_id or _spotify_album_id(album)
+    parsed_release_date = release_date or _spotify_album_release_date(album)
+    parsed_release_date_precision = release_date_precision or _spotify_album_release_date_precision(album)
+    artists = _spotify_artists(track.get("artists"))
+    if not artists and album_artists:
+        artists = list(album_artists)
+
+    return SpotifyTrackCandidate(
+        track_id=track_id,
+        title=_stringify_tag_value(track.get("name")),
+        artists=artists,
+        album=parsed_album_name,
+        market=market,
+        source_index=source_index,
+        isrc=_spotify_isrc(track),
+        duration_ms=_parse_number(track.get("duration_ms")),
+        release_date=parsed_release_date,
+        release_date_precision=parsed_release_date_precision,
+        album_id=parsed_album_id,
+        match_source=match_source,
+    )
+
+
+def _spotify_album(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _stringify_tag_value(value.get("name") or value.get("title"))
+    return _stringify_tag_value(value)
+
+
+def _spotify_album_id(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _stringify_tag_value(value.get("id"))
+    return None
+
+
+def _spotify_album_release_date(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _normalize_release_date(value.get("release_date"))
+    return None
+
+
+def _spotify_album_release_date_precision(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _stringify_tag_value(value.get("release_date_precision"))
+    return None
+
+
+def _spotify_isrc(track: dict[str, Any]) -> str | None:
+    external_ids = track.get("external_ids")
+    if not isinstance(external_ids, dict):
+        return None
+    return _stringify_tag_value(external_ids.get("isrc"))
+
+
 def _qq_music_artists(value: Any) -> list[str]:
     if isinstance(value, dict):
         return split_artists([value.get("name")])
@@ -1409,6 +2170,17 @@ def _ncm_music_candidate_score(context: NCMusicSearchContext, candidate: NCMusic
     for artist in context.artists:
         score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 60
     score += max((_text_match_score(album, candidate.album) for album in context.albums), default=0) * 30
+    return score
+
+
+def _spotify_candidate_score(metadata: AudioMetadata, candidate: SpotifyTrackCandidate) -> int:
+    score = 0
+    if _same_identifier(metadata.isrc, candidate.isrc):
+        score += 1000
+    score += _text_match_score(metadata.title, candidate.title) * 100
+    for artist in metadata.artists:
+        score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 80
+    score += _text_match_score(metadata.album, candidate.album) * 40
     return score
 
 
@@ -1470,6 +2242,76 @@ def _ncm_album_matches(context: NCMusicSearchContext, album: _NCMusicAlbumCandid
     return any(_text_match_score(expected, album.name) > 0 for expected in context.albums)
 
 
+def _spotify_artist_matches(metadata: AudioMetadata, artist: _SpotifyArtistCandidate) -> bool:
+    return any(_text_match_score(expected, artist.name) > 0 for expected in metadata.artists)
+
+
+def _spotify_album_fallback_track_matches(metadata: AudioMetadata, candidate: SpotifyTrackCandidate) -> bool:
+    if not (
+        metadata.title
+        and metadata.release_date
+        and metadata.duration_seconds is not None
+        and candidate.release_date
+        and candidate.duration_ms is not None
+    ):
+        return False
+    if _instrumental_marker_conflicts(metadata.title, candidate.title):
+        return False
+    if metadata.artists and not any(
+        _text_match_score(expected, actual) > 0 for expected in metadata.artists for actual in candidate.artists
+    ):
+        return False
+    if not _release_date_matches(metadata.release_date, candidate.release_date, candidate.release_date_precision):
+        return False
+    return _duration_close(metadata.duration_seconds, candidate.duration_ms)
+
+
+def _spotify_candidate_auto_matches(metadata: AudioMetadata, candidate: SpotifyTrackCandidate) -> bool:
+    if _instrumental_marker_conflicts(metadata.title, candidate.title):
+        return False
+    if _same_identifier(metadata.isrc, candidate.isrc):
+        return True
+    artist_matches = not metadata.artists or any(
+        _text_match_score(expected, actual) > 0 for expected in metadata.artists for actual in candidate.artists
+    )
+    if not artist_matches:
+        return False
+    if _text_match_score(metadata.title, candidate.title) > 0:
+        return True
+    return (
+        metadata.release_date is not None
+        and metadata.duration_seconds is not None
+        and _release_date_matches(metadata.release_date, candidate.release_date, candidate.release_date_precision)
+        and _duration_close(metadata.duration_seconds, candidate.duration_ms)
+    )
+
+
+def _instrumental_marker_conflicts(expected_title: Any, candidate_title: Any) -> bool:
+    return not _has_instrumental_marker(expected_title) and _has_instrumental_marker(candidate_title)
+
+
+def _has_instrumental_marker(value: Any) -> bool:
+    text = _normalize_match_text(value)
+    if not text:
+        return False
+    markers = [
+        "instrumental",
+        " inst",
+        "inst.",
+        "off vocal",
+        "off-vocal",
+        "karaoke",
+        "伴奏",
+        "纯音乐",
+        "純音樂",
+        "インスト",
+        "カラオケ",
+        "반주",
+    ]
+    padded = f" {text} "
+    return any(marker in padded for marker in markers)
+
+
 def _dedupe_ncm_music_candidates(candidates: Iterable[NCMusicCandidate]) -> list[NCMusicCandidate]:
     unique: list[NCMusicCandidate] = []
     seen_song_ids: set[str] = set()
@@ -1488,6 +2330,127 @@ def _dedupe_ncm_music_candidates(candidates: Iterable[NCMusicCandidate]) -> list
             )
         )
     return unique
+
+
+def _dedupe_spotify_candidates(candidates: Iterable[SpotifyTrackCandidate]) -> list[SpotifyTrackCandidate]:
+    unique: list[SpotifyTrackCandidate] = []
+    seen_track_ids: set[str] = set()
+    for candidate in candidates:
+        if candidate.track_id in seen_track_ids:
+            continue
+        seen_track_ids.add(candidate.track_id)
+        unique.append(candidate)
+    return unique
+
+
+def _spotify_candidates_grouped_by_market(
+    candidates: Iterable[SpotifyTrackCandidate],
+) -> dict[str, list[SpotifyTrackCandidate]]:
+    grouped: dict[str, list[SpotifyTrackCandidate]] = {}
+    for candidate in candidates:
+        if not candidate.market:
+            continue
+        grouped.setdefault(candidate.market, []).append(candidate)
+    return grouped
+
+
+def _spotify_market_best_candidates(
+    result: SpotifySearchResult,
+    metadata: AudioMetadata | None = None,
+) -> list[SpotifyTrackCandidate]:
+    market_groups = result.candidates_by_market or _spotify_candidates_grouped_by_market(result.candidates)
+    selected_by_market: dict[str, SpotifyTrackCandidate] = {}
+    for market in _spotify_market_order_from_mapping(market_groups):
+        candidates = market_groups.get(market, [])
+        if not candidates:
+            continue
+        if metadata is None:
+            selected_by_market[market] = candidates[0]
+            continue
+        for candidate in candidates:
+            if _spotify_candidate_auto_matches(metadata, candidate):
+                selected_by_market[market] = candidate
+                break
+    if metadata is not None:
+        selected_ids = {candidate.track_id for candidate in selected_by_market.values()}
+        for market in _spotify_market_order_from_mapping(market_groups):
+            if market in selected_by_market:
+                continue
+            for candidate in market_groups.get(market, []):
+                if candidate.track_id in selected_ids:
+                    selected_by_market[market] = candidate
+                    break
+    return [
+        selected_by_market[market]
+        for market in _spotify_market_order_from_mapping(market_groups)
+        if market in selected_by_market
+    ]
+
+
+def _spotify_market_order_from_mapping(
+    market_groups: dict[str, list[SpotifyTrackCandidate]],
+) -> list[str]:
+    markets = [market for market in DEFAULT_SPOTIFY_MARKETS if market in market_groups]
+    for market in market_groups:
+        if market not in markets:
+            markets.append(market)
+    return markets
+
+
+def _unique_spotify_ids(candidates: Iterable[SpotifyTrackCandidate]) -> list[str]:
+    values: list[str] = []
+    for candidate in candidates:
+        if candidate.track_id not in values:
+            values.append(candidate.track_id)
+    return values
+
+
+def _spotify_market_order(candidates: Iterable[SpotifyTrackCandidate]) -> list[str]:
+    markets = list(DEFAULT_SPOTIFY_MARKETS)
+    for candidate in candidates:
+        if candidate.market and candidate.market not in markets:
+            markets.append(candidate.market)
+    return markets
+
+
+def _spotify_market_index(market: str) -> int:
+    try:
+        return DEFAULT_SPOTIFY_MARKETS.index(market)
+    except ValueError:
+        return len(DEFAULT_SPOTIFY_MARKETS)
+
+
+def _spotify_search_query(metadata: AudioMetadata) -> str:
+    parts: list[str] = []
+    if metadata.title:
+        parts.append(f"track:{metadata.title}")
+    if metadata.artists:
+        parts.append(f"artist:{' '.join(metadata.artists)}")
+    if metadata.album:
+        parts.append(f"album:{metadata.album}")
+    return " ".join(parts)
+
+
+def _spotify_search_queries(metadata: AudioMetadata) -> list[str]:
+    queries: list[str] = []
+    isrc = _stringify_tag_value(metadata.isrc)
+    if isrc:
+        queries.append(f"isrc:{isrc}")
+    loose_parts = [
+        _stringify_tag_value(metadata.title),
+        " ".join(metadata.artists) if metadata.artists else None,
+        _stringify_tag_value(metadata.album),
+    ]
+    loose_query = " ".join(part for part in loose_parts if part)
+    if loose_query:
+        queries.append(loose_query)
+    title_query = _stringify_tag_value(metadata.title)
+    if title_query and title_query not in queries:
+        queries.append(title_query)
+    metadata_query = _spotify_search_query(metadata)
+    if metadata_query and metadata_query not in queries:
+        queries.append(metadata_query)
+    return queries
 
 
 def _text_match_score(expected: Any, actual: Any) -> int:
@@ -1520,6 +2483,12 @@ def _same_raw_text(left: Any, right: Any) -> bool:
     return str(left).strip() == str(right).strip()
 
 
+def _same_identifier(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    return str(left).strip().casefold() == str(right).strip().casefold()
+
+
 def _nested_get(value: Any, *keys: str) -> Any:
     current = value
     for key in keys:
@@ -1527,6 +2496,36 @@ def _nested_get(value: Any, *keys: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _read_dotenv_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in {"SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"}:
+            continue
+        cleaned = _clean_env_value(value)
+        if cleaned:
+            values[key] = cleaned
+    return values
+
+
+def _clean_env_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text or None
 
 
 def _format_qq_music_candidate(candidate: QQMusicCandidate) -> str:
@@ -1543,6 +2542,18 @@ def _format_ncm_music_candidate(candidate: NCMusicCandidate) -> str:
     artists = "/".join(candidate.artists) or "-"
     album = candidate.album or "-"
     return f"{title}{aliases} - {artists} - {album} [{candidate.song_id}]"
+
+
+def _format_spotify_candidate(candidate: SpotifyTrackCandidate) -> str:
+    title = candidate.title or "-"
+    artists = "/".join(candidate.artists) or "-"
+    album = candidate.album or "-"
+    market = candidate.market or "-"
+    return f"{market}: {title} - {artists} - {album} [{candidate.track_id}]"
+
+
+def _format_spotify_candidate_list(candidates: Iterable[SpotifyTrackCandidate]) -> str:
+    return ", ".join(_format_spotify_candidate(candidate) for candidate in candidates)
 
 
 def _add_unique_value(values: dict[str, list[str]], key: str, value: str | None) -> None:
@@ -1934,6 +2945,41 @@ def _duration_close(seconds: float, millis: Any, tolerance_seconds: float = 2.0)
     except (TypeError, ValueError):
         return False
     return abs(track_seconds - seconds) <= tolerance_seconds
+
+
+def _normalize_release_date(value: Any) -> str | None:
+    text = _stringify_tag_value(value)
+    if not text:
+        return None
+    match = re.search(r"(\d{4})(?:[-./](\d{1,2})(?:[-./](\d{1,2}))?)?", text)
+    if not match:
+        return None
+    year, month, day = match.groups()
+    if day and month:
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    if month:
+        return f"{year}-{int(month):02d}"
+    return year
+
+
+def _release_date_matches(expected: Any, actual: Any, actual_precision: Any = None) -> bool:
+    expected_date = _normalize_release_date(expected)
+    actual_date = _normalize_release_date(actual)
+    if not expected_date or not actual_date:
+        return False
+
+    expected_parts = expected_date.split("-")
+    actual_parts = actual_date.split("-")
+    precision = (_stringify_tag_value(actual_precision) or "").casefold()
+    if len(expected_parts) == 3:
+        if precision and precision != "day":
+            return False
+        return len(actual_parts) == 3 and expected_parts == actual_parts
+    if len(expected_parts) == 2:
+        if precision == "year":
+            return False
+        return len(actual_parts) >= 2 and expected_parts[:2] == actual_parts[:2]
+    return expected_parts[0] == actual_parts[0]
 
 
 def is_valid_apple_music_song_id(value: str | None) -> bool:
