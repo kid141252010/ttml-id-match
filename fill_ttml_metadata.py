@@ -24,13 +24,17 @@ from opencc import OpenCC
 
 AMLL_NS = "http://www.example.com/ns/amll"
 
-DEFAULT_STORES = ["cn", "tw", "jp", "kr", "us"]
+DEFAULT_STORES = ["cn", "us", "kr", "jp", "tw"]
 DEFAULT_SPOTIFY_MARKETS = ["US", "KR", "JP", "TW"]
 DEFAULT_NCM_API_BASES = [
     "https://music163.xuanmou.com.cn",
     "https://neteasecloudmusicapi-main-api.vercel.app",
     "https://api-enhanced-six-beta.vercel.app",
 ]
+APPLE_MUSIC_SEARCH_LIMIT = 25
+APPLE_MUSIC_ARTIST_SEARCH_LIMIT = 10
+APPLE_MUSIC_ARTIST_ALBUM_LIMIT = 50
+APPLE_MUSIC_ARTIST_ALBUM_PAGE_LIMIT = 10
 SPOTIFY_SEARCH_LIMIT = 20
 SPOTIFY_CANDIDATE_TARGET = 5
 SPOTIFY_ARTIST_SEARCH_LIMIT = 10
@@ -81,10 +85,27 @@ class AppleMusicTrackMatch:
     source: str
 
 
+@dataclass(frozen=True)
+class AppleMusicTrackCandidate:
+    track_id: str
+    title: str | None = None
+    artists: list[str] = field(default_factory=list)
+    album: str | None = None
+    storefront: str = ""
+    source_index: int = 0
+    isrc: str | None = None
+    release_date: str | None = None
+    duration_ms: int | None = None
+    match_source: str = "search"
+
+
 @dataclass
 class AppleMusicMetadataResult:
     values: dict[str, list[str]] = field(default_factory=dict)
     sources: list[str] = field(default_factory=list)
+    candidates: list[AppleMusicTrackCandidate] = field(default_factory=list)
+    selected: list[AppleMusicTrackCandidate] = field(default_factory=list)
+    candidates_by_storefront: dict[str, list[AppleMusicTrackCandidate]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
 
@@ -195,6 +216,21 @@ class _NCMusicAlbumCandidate:
     source_index: int = 0
 
 
+@dataclass(frozen=True)
+class _AppleMusicArtistCandidate:
+    artist_id: str
+    name: str | None = None
+    source_index: int = 0
+
+
+@dataclass(frozen=True)
+class _AppleMusicAlbumCandidate:
+    album_id: str
+    name: str | None = None
+    release_date: str | None = None
+    source_index: int = 0
+
+
 @dataclass
 class PairMetadata:
     audio_path: Path | None
@@ -260,6 +296,15 @@ class AppleMusicClientProtocol(Protocol):
     def fetch_album_tracks(self, store: str, album_id: str) -> list[dict[str, Any]]:
         ...
 
+    def search_songs(self, store: str, metadata: AudioMetadata) -> list[AppleMusicTrackCandidate]:
+        ...
+
+    def search_artists(self, store: str, query: str) -> list[_AppleMusicArtistCandidate]:
+        ...
+
+    def fetch_artist_albums(self, store: str, artist_id: str) -> tuple[list[_AppleMusicAlbumCandidate], list[str]]:
+        ...
+
 
 class QQMusicClientProtocol(Protocol):
     def search_songs(self, query: str) -> list[QQMusicCandidate]:
@@ -277,14 +322,32 @@ class SpotifyClientProtocol(Protocol):
 
 
 class InMemoryAppleMusicClient:
-    def __init__(self, albums: dict[tuple[str, str], list[dict[str, Any]]]):
+    def __init__(
+        self,
+        albums: dict[tuple[str, str], list[dict[str, Any]]],
+        searches: dict[str, list[AppleMusicTrackCandidate]] | None = None,
+        artists: dict[tuple[str, str], list[_AppleMusicArtistCandidate]] | None = None,
+        artist_albums: dict[tuple[str, str], list[_AppleMusicAlbumCandidate]] | None = None,
+    ):
         self.albums = albums
+        self.searches = searches or {}
+        self.artists = artists or {}
+        self.artist_albums = artist_albums or {}
 
     def fetch_album_tracks(self, store: str, album_id: str) -> list[dict[str, Any]]:
         tracks = self.albums.get((store, album_id))
         if tracks is None:
             raise LookupError(f"album {album_id} not found in {store}")
         return tracks
+
+    def search_songs(self, store: str, metadata: AudioMetadata) -> list[AppleMusicTrackCandidate]:
+        return list(self.searches.get(store, []))
+
+    def search_artists(self, store: str, query: str) -> list[_AppleMusicArtistCandidate]:
+        return list(self.artists.get((store, query), []))
+
+    def fetch_artist_albums(self, store: str, artist_id: str) -> tuple[list[_AppleMusicAlbumCandidate], list[str]]:
+        return list(self.artist_albums.get((store, artist_id), [])), []
 
 
 class AppleMusicClient:
@@ -293,6 +356,7 @@ class AppleMusicClient:
         self._token: str | None = None
         self._page_cache: dict[tuple[str, str], str] = {}
         self._track_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._json_cache: dict[str, dict[str, Any]] = {}
 
     def fetch_album_tracks(self, store: str, album_id: str) -> list[dict[str, Any]]:
         cache_key = (store, album_id)
@@ -307,22 +371,92 @@ class AppleMusicClient:
         self._track_cache[cache_key] = tracks
         return tracks
 
-    def _fetch_album_tracks_from_amp_api(self, store: str, album_id: str) -> list[dict[str, Any]]:
-        token = self._get_bearer_token(store, album_id)
-        url = f"https://amp-api.music.apple.com/v1/catalog/{store}/albums/{album_id}"
-        data = self._read_text(
-            url,
-            {
-                "Authorization": f"Bearer {token}",
-                "Origin": "https://music.apple.com",
-                "Referer": "https://music.apple.com/",
-            },
+    def search_songs(self, store: str, metadata: AudioMetadata) -> list[AppleMusicTrackCandidate]:
+        query = _apple_music_search_query(metadata)
+        if not query:
+            return []
+        payload = self._read_catalog_json(
+            store,
+            self._build_search_url(store, query, "songs", APPLE_MUSIC_SEARCH_LIMIT),
         )
-        payload = json.loads(data)
+        songs = _nested_get(payload, "results", "songs", "data")
+        if not isinstance(songs, list):
+            return []
+        candidates: list[AppleMusicTrackCandidate] = []
+        for index, track in enumerate(songs):
+            if not isinstance(track, dict):
+                continue
+            candidate = _apple_music_candidate_from_track(track, store, index, "search")
+            if candidate:
+                candidates.append(candidate)
+        return candidates
+
+    def search_artists(self, store: str, query: str) -> list[_AppleMusicArtistCandidate]:
+        if not query:
+            return []
+        payload = self._read_catalog_json(
+            store,
+            self._build_search_url(store, query, "artists", APPLE_MUSIC_ARTIST_SEARCH_LIMIT),
+        )
+        artists = _nested_get(payload, "results", "artists", "data")
+        if not isinstance(artists, list):
+            return []
+        candidates: list[_AppleMusicArtistCandidate] = []
+        for index, artist in enumerate(artists):
+            if not isinstance(artist, dict):
+                continue
+            artist_id = _stringify_tag_value(artist.get("id"))
+            if not artist_id:
+                continue
+            candidates.append(
+                _AppleMusicArtistCandidate(
+                    artist_id,
+                    _stringify_tag_value(_nested_get(artist, "attributes", "name")),
+                    index,
+                )
+            )
+        return candidates
+
+    def fetch_artist_albums(self, store: str, artist_id: str) -> tuple[list[_AppleMusicAlbumCandidate], list[str]]:
+        albums: list[_AppleMusicAlbumCandidate] = []
+        warnings: list[str] = []
+        for page_index in range(APPLE_MUSIC_ARTIST_ALBUM_PAGE_LIMIT):
+            offset = page_index * APPLE_MUSIC_ARTIST_ALBUM_LIMIT
+            payload = self._read_catalog_json(
+                store,
+                self._build_artist_albums_url(store, artist_id, offset),
+            )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                return albums, warnings
+            page_albums = _parse_apple_music_artist_album_candidates(data, len(albums))
+            if not page_albums:
+                return albums, warnings
+            albums.extend(page_albums)
+
+            total = _parse_number(_nested_get(payload, "meta", "total"))
+            if total is not None and offset + APPLE_MUSIC_ARTIST_ALBUM_LIMIT >= total:
+                return albums, warnings
+            if not payload.get("next") and total is None:
+                return albums, warnings
+
+        warnings.append(f"{store}: artist {artist_id} albums truncated after {len(albums)} albums")
+        return albums, warnings
+
+    def _fetch_album_tracks_from_amp_api(self, store: str, album_id: str) -> list[dict[str, Any]]:
+        url = f"https://amp-api.music.apple.com/v1/catalog/{store}/albums/{album_id}"
+        payload = self._read_catalog_json(store, url, album_id=album_id)
         album = payload["data"][0]
-        album_name = album.get("attributes", {}).get("name")
+        album_attributes = album.get("attributes", {})
+        album_name = album_attributes.get("name")
+        album_artist = album_attributes.get("artistName")
+        release_date = album_attributes.get("releaseDate")
         tracks = album.get("relationships", {}).get("tracks", {}).get("data", [])
-        return [self._track_from_amp_api_track(track, album_name) for track in tracks if track.get("type") == "songs"]
+        return [
+            self._track_from_amp_api_track(track, album_name, album_id, album_artist, release_date)
+            for track in tracks
+            if track.get("type") == "songs"
+        ]
 
     def _fetch_album_tracks_from_json_ld(self, store: str, album_id: str) -> list[dict[str, Any]]:
         page = self._get_album_page(store, album_id)
@@ -352,10 +486,10 @@ class AppleMusicClient:
             raise LookupError(f"no Apple Music tracks found for {album_id} in {store}")
         return tracks
 
-    def _get_bearer_token(self, store: str, album_id: str) -> str:
+    def _get_bearer_token(self, store: str, album_id: str | None = None) -> str:
         if self._token:
             return self._token
-        page = self._get_album_page(store, album_id)
+        page = self._get_album_page(store, album_id) if album_id else self._get_search_page(store)
         script_sources = re.findall(
             r'<script[^>]+type=["\']module["\'][^>]+src=["\']([^"\']+)["\']',
             page,
@@ -378,6 +512,53 @@ class AppleMusicClient:
             )
         return self._page_cache[cache_key]
 
+    def _get_search_page(self, store: str) -> str:
+        cache_key = (store, "__search__")
+        if cache_key not in self._page_cache:
+            self._page_cache[cache_key] = self._read_text(f"https://music.apple.com/{store}/search")
+        return self._page_cache[cache_key]
+
+    def _read_catalog_json(self, store: str, url: str, album_id: str | None = None) -> dict[str, Any]:
+        if url in self._json_cache:
+            return self._json_cache[url]
+        token = self._get_bearer_token(store, album_id)
+        data = self._read_text(
+            url,
+            {
+                "Authorization": f"Bearer {token}",
+                "Origin": "https://music.apple.com",
+                "Referer": "https://music.apple.com/",
+            },
+        )
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            raise ValueError("Apple Music API returned a non-object payload")
+        self._json_cache[url] = payload
+        return payload
+
+    def _build_search_url(self, store: str, query: str, types: str, limit: int) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "term": query,
+                "types": types,
+                "limit": limit,
+            }
+        )
+        return f"https://amp-api.music.apple.com/v1/catalog/{store}/search?{params}"
+
+    def _build_artist_albums_url(self, store: str, artist_id: str, offset: int = 0) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "include": "tracks",
+                "limit": APPLE_MUSIC_ARTIST_ALBUM_LIMIT,
+                "offset": offset,
+            }
+        )
+        return (
+            f"https://amp-api.music.apple.com/v1/catalog/{store}/artists/"
+            f"{urllib.parse.quote(artist_id, safe='')}/albums?{params}"
+        )
+
     def _read_text(self, url: str, headers: dict[str, str] | None = None) -> str:
         request_headers = {
             "User-Agent": "Mozilla/5.0",
@@ -390,17 +571,25 @@ class AppleMusicClient:
             return response.read().decode("utf-8", "ignore")
 
     @staticmethod
-    def _track_from_amp_api_track(track: dict[str, Any], album_name: Any = None) -> dict[str, Any]:
+    def _track_from_amp_api_track(
+        track: dict[str, Any],
+        album_name: Any = None,
+        album_id: Any = None,
+        album_artist: Any = None,
+        release_date: Any = None,
+    ) -> dict[str, Any]:
         attributes = track.get("attributes", {})
         return {
             "id": str(track.get("id") or ""),
             "name": attributes.get("name"),
-            "artistName": attributes.get("artistName"),
-            "albumName": album_name,
+            "artistName": attributes.get("artistName") or album_artist,
+            "albumName": attributes.get("albumName") or album_name,
+            "albumId": album_id,
             "isrc": attributes.get("isrc"),
             "discNumber": attributes.get("discNumber"),
             "trackNumber": attributes.get("trackNumber"),
             "durationInMillis": attributes.get("durationInMillis"),
+            "releaseDate": attributes.get("releaseDate") or release_date,
         }
 
 
@@ -965,7 +1154,7 @@ def read_ttml_metadata(path: Path) -> AudioMetadata:
 
     for tag in _iter_amll_meta_tags(metadata, amll_prefix):
         key = _xml_attr_value(tag, "key")
-        if key not in {"musicName", "artists", "album"}:
+        if key not in {"musicName", "artists", "album", "appleMusicId", "isrc"}:
             continue
         value = _real_meta_value(_xml_attr_value(tag, "value"))
         if value:
@@ -975,6 +1164,8 @@ def read_ttml_metadata(path: Path) -> AudioMetadata:
         title=values.get("musicName", [None])[0],
         artists=split_artists(values.get("artists", [])),
         album=values.get("album", [None])[0],
+        isrc=values.get("isrc", [None])[0],
+        catalog_id=values.get("appleMusicId", [None])[0],
     )
 
 
@@ -997,28 +1188,83 @@ def collect_apple_music_metadata(
     stores: list[str] | None = None,
 ) -> AppleMusicMetadataResult:
     result = AppleMusicMetadataResult()
-    if is_valid_apple_music_song_id(metadata.catalog_id):
-        _add_unique_value(result.values, "appleMusicId", str(metadata.catalog_id))
-        result.sources.append("catalog")
+    store_order = _apple_music_store_order(stores)
 
-    if not metadata.playlist_id:
+    if not metadata.title and not metadata.playlist_id:
+        _sync_apple_music_result_values(result, metadata)
         if not result.values:
             result.sources.append("missing-apple-music-id")
             result.errors.append("音频中未读取到 Apple Music 歌曲 ID 或专辑 ID")
         return result
 
-    tried_stores: set[str] = set()
-    for store in stores or DEFAULT_STORES:
-        if not store or store in tried_stores:
-            continue
-        tried_stores.add(store)
-        match = _match_album_store(metadata, client, store, metadata.playlist_id, result.errors)
-        result.sources.append(match.source)
-        if match.track:
-            _merge_track_metadata(result.values, match.track)
+    all_candidates: list[AppleMusicTrackCandidate] = []
+    for store in store_order:
+        store_candidates: list[AppleMusicTrackCandidate] = []
 
-    if not result.values:
+        if metadata.playlist_id:
+            match = _match_album_store(metadata, client, store, metadata.playlist_id, result.errors)
+            if match.track:
+                candidate = _apple_music_candidate_from_flat_track(
+                    match.track,
+                    store,
+                    len(store_candidates),
+                    match.source,
+                )
+                if candidate:
+                    store_candidates.append(candidate)
+
+        if metadata.title:
+            try:
+                store_candidates.extend(
+                    _normalize_apple_music_candidates(
+                        client.search_songs(store, metadata),
+                        store,
+                        len(store_candidates),
+                        "search",
+                    )
+                )
+            except Exception as exc:
+                result.errors.append(f"{store}: Apple Music 搜索失败: {exc}")
+
+        if _apple_music_should_search_artist_albums(metadata, store_candidates):
+            store_candidates.extend(
+                _search_apple_music_artist_album_candidates(
+                    metadata,
+                    client,
+                    store,
+                    len(store_candidates),
+                    result.errors,
+                )
+            )
+
+        sorted_store_candidates = _dedupe_apple_music_candidates(
+            sorted(
+                store_candidates,
+                key=lambda candidate: (
+                    -_apple_music_candidate_score(metadata, candidate),
+                    _apple_music_source_priority(candidate.match_source),
+                    candidate.source_index,
+                ),
+            )
+        )
+        if sorted_store_candidates:
+            result.candidates_by_storefront[store] = sorted_store_candidates
+            all_candidates.extend(sorted_store_candidates)
+
+    result.candidates = sorted(
+        all_candidates,
+        key=lambda candidate: (
+            -_apple_music_candidate_score(metadata, candidate),
+            _apple_music_storefront_index(candidate.storefront),
+            _apple_music_source_priority(candidate.match_source),
+            candidate.source_index,
+        ),
+    )
+    result.selected = _apple_music_storefront_best_candidates(result, metadata)
+    _sync_apple_music_result_values(result, metadata)
+    if not result.values and not result.candidates:
         result.sources.append("not-found")
+        result.errors.append("Apple Music 未找到带歌曲 ID 的候选")
     return result
 
 
@@ -1122,6 +1368,69 @@ def collect_spotify_metadata(
     if not result.candidates:
         result.errors.append("Spotify 未找到带 track id 的候选")
     return result
+
+
+def confirm_apple_music_candidates(
+    pairs: list[PairMetadata],
+    dry_run: bool,
+    input_func: Callable[[str], str] = input,
+    print_func: Callable[..., None] | None = None,
+) -> None:
+    if print_func is None:
+        print_func = _safe_print
+
+    available = [pair for pair in pairs if pair.apple_music_metadata.candidates]
+    for pair in available:
+        pair.apple_music_metadata.selected = _apple_music_storefront_best_candidates(
+            pair.apple_music_metadata,
+            pair.metadata,
+        )
+        _sync_apple_music_result_values(pair.apple_music_metadata, pair.metadata)
+
+    if dry_run or not available:
+        return
+
+    print_func("")
+    print_func("Apple Music 最佳候选：")
+    for pair in available:
+        best = _apple_music_storefront_top_candidates(pair.apple_music_metadata)
+        print_func(f"  {pair.ttml_path.name}: {_format_apple_music_candidate_list(best) or '-'}")
+
+    while True:
+        answer = input_func("Accept all Apple Music best candidates? Type Y to accept, N to choose alternatives: ").strip()
+        if answer.casefold() in {"y", "n"}:
+            break
+        print_func("Please type Y or N.")
+
+    if answer.casefold() == "y":
+        return
+
+    for pair in available:
+        selected: list[AppleMusicTrackCandidate] = []
+        print_func("")
+        print_func(f"{pair.ttml_path.name} Apple Music 候选：")
+        storefront_groups = (
+            pair.apple_music_metadata.candidates_by_storefront
+            or _apple_music_candidates_grouped_by_storefront(pair.apple_music_metadata.candidates)
+        )
+        for storefront in _apple_music_store_order_from_mapping(storefront_groups):
+            options = storefront_groups.get(storefront, [])[:5]
+            if not options:
+                continue
+            label = storefront.upper()
+            print_func(f"  {label} Apple Music 候选：")
+            for index, candidate in enumerate(options, start=1):
+                print_func(f"    {index}. {_format_apple_music_candidate(candidate)}")
+            while True:
+                answer = input_func(f"Select {label} 1-5, or press Enter to skip this storefront: ").strip()
+                if not answer:
+                    break
+                if answer.isdigit() and 1 <= int(answer) <= len(options):
+                    selected.append(options[int(answer) - 1])
+                    break
+                print_func("Invalid selection.")
+        pair.apple_music_metadata.selected = selected
+        _sync_apple_music_result_values(pair.apple_music_metadata, pair.metadata)
 
 
 def confirm_qq_music_candidates(
@@ -1348,6 +1657,7 @@ def normalize_ttml_language(
 def values_from_metadata(
     metadata: AudioMetadata,
     apple_music_values: dict[str, list[str]] | None = None,
+    apple_music_candidates: Iterable[AppleMusicTrackCandidate] | None = None,
     qq_music_candidate: QQMusicCandidate | None = None,
     ncm_music_candidate: NCMusicCandidate | None = None,
     spotify_candidates: Iterable[SpotifyTrackCandidate] | None = None,
@@ -1363,6 +1673,8 @@ def values_from_metadata(
     for key, proposed_values in (apple_music_values or {}).items():
         for value in proposed_values:
             _add_unique_value(values, key, value)
+    for apple_music_candidate in apple_music_candidates or []:
+        _merge_apple_music_metadata(values, metadata, apple_music_candidate)
     if qq_music_candidate:
         _merge_qq_music_metadata(values, metadata, qq_music_candidate)
     if ncm_music_candidate:
@@ -1468,6 +1780,7 @@ def main(argv: list[str] | None = None) -> int:
             failures += 1
             _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
 
+    confirm_apple_music_candidates(prepared_pairs, dry_run=args.dry_run)
     confirm_qq_music_candidates(prepared_pairs, dry_run=args.dry_run)
     _collect_ncm_music_metadata_for_pairs(prepared_pairs, ncm_music_client)
     confirm_ncm_music_candidates(prepared_pairs, dry_run=args.dry_run)
@@ -1530,7 +1843,7 @@ def _prepare_work_item(
         None,
         work_item.ttml_path,
         metadata,
-        AppleMusicMetadataResult(),
+        collect_apple_music_metadata(metadata, apple_music_client),
         collect_qq_music_metadata(metadata, qq_music_client),
         NCMusicSearchResult(),
         collect_spotify_metadata(metadata, spotify_client),
@@ -1554,6 +1867,7 @@ def _process_pair(
         ncm_music_client,
         spotify_client,
     )
+    confirm_apple_music_candidates([pair], dry_run=dry_run)
     confirm_qq_music_candidates([pair], dry_run=dry_run)
     _collect_ncm_music_metadata_for_pairs([pair], ncm_music_client or NCMusicClient())
     confirm_ncm_music_candidates([pair], dry_run=dry_run)
@@ -1597,6 +1911,10 @@ def _process_prepared_pair(
         status = "unchanged"
     _safe_print(f"[{status}] {ttml_path.name}")
     _safe_print(f"  audio: {audio_path.name if audio_path else '-'}")
+    _safe_print(
+        "  appleMusicBest: "
+        + (_format_apple_music_candidate_list(_apple_music_storefront_top_candidates(apple_music_metadata)) or "-")
+    )
     _safe_print(f"  appleMusicId: {', '.join(apple_music_metadata.values.get('appleMusicId', [])) or '-'}")
     _safe_print(f"  appleMusicSources: {', '.join(apple_music_metadata.sources) or '-'}")
     if apple_music_metadata.errors:
@@ -1682,6 +2000,37 @@ def _merge_track_metadata(values: dict[str, list[str]], track: dict[str, Any]) -
     _add_unique_value(values, "album", _stringify_tag_value(track.get("albumName")))
     _add_unique_value(values, "appleMusicId", _track_id(track))
     _add_unique_value(values, "isrc", _stringify_tag_value(track.get("isrc")))
+
+
+def _merge_apple_music_metadata(
+    values: dict[str, list[str]],
+    metadata: AudioMetadata,
+    candidate: AppleMusicTrackCandidate,
+) -> None:
+    _add_unique_value(values, "appleMusicId", candidate.track_id)
+    _add_unique_value(values, "isrc", candidate.isrc)
+    _add_unique_value(values, "musicName", candidate.title)
+    existing_artists = list(values.get("artists", []))
+    for artist in candidate.artists:
+        if not any(_same_raw_text(artist, existing) for existing in existing_artists):
+            _add_unique_value(values, "artists", artist)
+            existing_artists.append(artist)
+    existing_albums = list(values.get("album", []))
+    if candidate.album and not any(_same_raw_text(candidate.album, existing) for existing in existing_albums):
+        _add_unique_value(values, "album", candidate.album)
+
+
+def _sync_apple_music_result_values(result: AppleMusicMetadataResult, metadata: AudioMetadata) -> None:
+    values: dict[str, list[str]] = {}
+    sources: list[str] = []
+    if is_valid_apple_music_song_id(metadata.catalog_id):
+        _add_unique_value(values, "appleMusicId", str(metadata.catalog_id))
+        _add_unique_list_value(sources, "catalog")
+    for candidate in result.selected:
+        _merge_apple_music_metadata(values, metadata, candidate)
+        _add_unique_list_value(sources, _apple_music_candidate_source(candidate))
+    result.values = values
+    result.sources = sources
 
 
 def _merge_qq_music_metadata(
@@ -2136,6 +2485,180 @@ def _spotify_isrc(track: dict[str, Any]) -> str | None:
     return _stringify_tag_value(external_ids.get("isrc"))
 
 
+def _apple_music_search_query(metadata: AudioMetadata) -> str:
+    parts = [
+        _stringify_tag_value(metadata.title),
+        " ".join(metadata.artists) if metadata.artists else None,
+        _stringify_tag_value(metadata.album),
+        _stringify_tag_value(metadata.isrc),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _apple_music_candidate_from_track(
+    track: dict[str, Any],
+    storefront: str,
+    source_index: int,
+    match_source: str,
+    album_id: str | None = None,
+    album_name: str | None = None,
+    album_artist: str | None = None,
+    release_date: str | None = None,
+) -> AppleMusicTrackCandidate | None:
+    flattened = AppleMusicClient._track_from_amp_api_track(track, album_name, album_id, album_artist, release_date)
+    return _apple_music_candidate_from_flat_track(flattened, storefront, source_index, match_source)
+
+
+def _apple_music_candidate_from_flat_track(
+    track: dict[str, Any],
+    storefront: str,
+    source_index: int,
+    match_source: str,
+) -> AppleMusicTrackCandidate | None:
+    track_id = _track_id(track)
+    if not track_id:
+        return None
+    return AppleMusicTrackCandidate(
+        track_id=track_id,
+        title=_stringify_tag_value(track.get("name")),
+        artists=split_artists([track.get("artistName")]),
+        album=_stringify_tag_value(track.get("albumName")),
+        storefront=storefront,
+        source_index=source_index,
+        isrc=_stringify_tag_value(track.get("isrc")),
+        release_date=_normalize_release_date(track.get("releaseDate")),
+        duration_ms=_parse_number(track.get("durationInMillis")),
+        match_source=match_source,
+    )
+
+
+def _parse_apple_music_artist_album_candidates(
+    albums: Iterable[Any],
+    source_offset: int = 0,
+) -> list[_AppleMusicAlbumCandidate]:
+    candidates: list[_AppleMusicAlbumCandidate] = []
+    for index, album in enumerate(albums):
+        if not isinstance(album, dict):
+            continue
+        album_id = _stringify_tag_value(album.get("id"))
+        if not album_id:
+            continue
+        attributes = album.get("attributes") if isinstance(album.get("attributes"), dict) else {}
+        candidates.append(
+            _AppleMusicAlbumCandidate(
+                album_id,
+                _stringify_tag_value(attributes.get("name")),
+                _normalize_release_date(attributes.get("releaseDate")),
+                source_offset + index,
+            )
+        )
+    return candidates
+
+
+def _normalize_apple_music_candidates(
+    candidates: Iterable[AppleMusicTrackCandidate],
+    storefront: str,
+    source_offset: int,
+    default_source: str,
+) -> list[AppleMusicTrackCandidate]:
+    normalized: list[AppleMusicTrackCandidate] = []
+    for index, candidate in enumerate(candidates):
+        if not candidate.track_id:
+            continue
+        normalized.append(
+            AppleMusicTrackCandidate(
+                track_id=candidate.track_id,
+                title=candidate.title,
+                artists=list(candidate.artists),
+                album=candidate.album,
+                storefront=candidate.storefront or storefront,
+                source_index=source_offset + index,
+                isrc=candidate.isrc,
+                release_date=candidate.release_date,
+                duration_ms=candidate.duration_ms,
+                match_source=candidate.match_source or default_source,
+            )
+        )
+    return normalized
+
+
+def _search_apple_music_artist_album_candidates(
+    metadata: AudioMetadata,
+    client: AppleMusicClientProtocol,
+    storefront: str,
+    source_offset: int,
+    errors: list[str],
+) -> list[AppleMusicTrackCandidate]:
+    candidates: list[AppleMusicTrackCandidate] = []
+    seen_artist_ids: set[str] = set()
+    for artist_name in metadata.artists:
+        try:
+            artists = client.search_artists(storefront, artist_name)
+        except Exception as exc:
+            errors.append(f"{storefront}: Apple Music 歌手搜索失败: {exc}")
+            continue
+        for artist in artists:
+            if artist.artist_id in seen_artist_ids or not _apple_music_artist_matches(metadata, artist):
+                continue
+            seen_artist_ids.add(artist.artist_id)
+            try:
+                albums, warnings = client.fetch_artist_albums(storefront, artist.artist_id)
+            except Exception as exc:
+                errors.append(f"{storefront}: Apple Music 歌手专辑读取失败: {exc}")
+                continue
+            errors.extend(warnings)
+            for album in _sort_apple_music_albums_for_fallback(metadata, albums):
+                if not _release_date_matches(metadata.release_date, album.release_date, "day"):
+                    continue
+                try:
+                    tracks = client.fetch_album_tracks(storefront, album.album_id)
+                except Exception as exc:
+                    errors.append(f"{storefront}: Apple Music fallback 专辑 {album.album_id} 读取失败: {exc}")
+                    continue
+                for track in tracks:
+                    candidate = _apple_music_candidate_from_flat_track(
+                        track,
+                        storefront,
+                        source_offset + len(candidates),
+                        "artist-album",
+                    )
+                    if candidate and _apple_music_album_fallback_track_matches(metadata, candidate):
+                        candidates.append(candidate)
+                if candidates:
+                    return _dedupe_apple_music_candidates(candidates)
+    return _dedupe_apple_music_candidates(candidates)
+
+
+def _sort_apple_music_albums_for_fallback(
+    metadata: AudioMetadata,
+    albums: Iterable[_AppleMusicAlbumCandidate],
+) -> list[_AppleMusicAlbumCandidate]:
+    return sorted(
+        albums,
+        key=lambda album: (
+            _release_date_distance(metadata.release_date, album.release_date),
+            album.source_index,
+        ),
+    )
+
+
+def _release_date_distance(expected: Any, actual: Any) -> int:
+    expected_date = _normalize_release_date(expected)
+    actual_date = _normalize_release_date(actual)
+    if not expected_date or not actual_date:
+        return 10_000_000
+    expected_parts = [int(part) for part in expected_date.split("-")]
+    actual_parts = [int(part) for part in actual_date.split("-")]
+    while len(expected_parts) < 3:
+        expected_parts.append(1)
+    while len(actual_parts) < 3:
+        actual_parts.append(1)
+    return abs(
+        (expected_parts[0] * 372 + expected_parts[1] * 31 + expected_parts[2])
+        - (actual_parts[0] * 372 + actual_parts[1] * 31 + actual_parts[2])
+    )
+
+
 def _qq_music_artists(value: Any) -> list[str]:
     if isinstance(value, dict):
         return split_artists([value.get("name")])
@@ -2242,6 +2765,94 @@ def _ncm_album_matches(context: NCMusicSearchContext, album: _NCMusicAlbumCandid
     return any(_text_match_score(expected, album.name) > 0 for expected in context.albums)
 
 
+def _apple_music_artist_matches(metadata: AudioMetadata, artist: _AppleMusicArtistCandidate) -> bool:
+    return any(_text_match_score(expected, artist.name) > 0 for expected in metadata.artists)
+
+
+def _apple_music_candidate_score(metadata: AudioMetadata, candidate: AppleMusicTrackCandidate) -> int:
+    if _instrumental_marker_conflicts(metadata.title, candidate.title):
+        return -10_000 + candidate.source_index
+    score = 0
+    if _same_identifier(metadata.isrc, candidate.isrc):
+        score += 500
+    score += _text_match_score(metadata.title, candidate.title) * 100
+    for artist in metadata.artists:
+        score += max((_text_match_score(artist, candidate_artist) for candidate_artist in candidate.artists), default=0) * 80
+    score += _text_match_score(metadata.album, candidate.album) * 40
+    if _release_date_matches(metadata.release_date, candidate.release_date, "day"):
+        score += 30
+    if metadata.duration_seconds is not None and _duration_close(
+        metadata.duration_seconds,
+        candidate.duration_ms,
+        tolerance_seconds=1.0,
+    ):
+        score += 30
+    return score
+
+
+def _apple_music_should_search_artist_albums(
+    metadata: AudioMetadata,
+    candidates: list[AppleMusicTrackCandidate],
+) -> bool:
+    if not (
+        metadata.title
+        and metadata.artists
+        and metadata.release_date
+        and metadata.duration_seconds is not None
+    ):
+        return False
+    return not any(_apple_music_candidate_auto_matches(metadata, candidate) for candidate in candidates)
+
+
+def _apple_music_album_fallback_track_matches(
+    metadata: AudioMetadata,
+    candidate: AppleMusicTrackCandidate,
+) -> bool:
+    if not (
+        metadata.release_date
+        and metadata.duration_seconds is not None
+        and candidate.release_date
+        and candidate.duration_ms is not None
+    ):
+        return False
+    if _instrumental_marker_conflicts(metadata.title, candidate.title):
+        return False
+    if metadata.artists and not any(
+        _text_match_score(expected, actual) > 0 for expected in metadata.artists for actual in candidate.artists
+    ):
+        return False
+    if not _release_date_matches(metadata.release_date, candidate.release_date, "day"):
+        return False
+    return _duration_close(metadata.duration_seconds, candidate.duration_ms, tolerance_seconds=1.0)
+
+
+def _apple_music_candidate_auto_matches(
+    metadata: AudioMetadata,
+    candidate: AppleMusicTrackCandidate,
+) -> bool:
+    if _instrumental_marker_conflicts(metadata.title, candidate.title):
+        return False
+    if _same_identifier(metadata.isrc, candidate.isrc):
+        return True
+    if (candidate.match_source or "").startswith("album:"):
+        return True
+    artist_matches = not metadata.artists or any(
+        _text_match_score(expected, actual) > 0 for expected in metadata.artists for actual in candidate.artists
+    )
+    if not artist_matches:
+        return False
+    if _instrumental_titles_match(metadata.title, candidate.title):
+        return True
+    if _text_match_score(metadata.title, candidate.title) > 0:
+        return True
+    return (
+        metadata.release_date is not None
+        and metadata.duration_seconds is not None
+        and _release_date_matches(metadata.release_date, candidate.release_date, "day")
+        and _duration_close(metadata.duration_seconds, candidate.duration_ms, tolerance_seconds=1.0)
+    )
+
+
 def _spotify_artist_matches(metadata: AudioMetadata, artist: _SpotifyArtistCandidate) -> bool:
     return any(_text_match_score(expected, artist.name) > 0 for expected in metadata.artists)
 
@@ -2290,11 +2901,33 @@ def _instrumental_marker_conflicts(expected_title: Any, candidate_title: Any) ->
     return not _has_instrumental_marker(expected_title) and _has_instrumental_marker(candidate_title)
 
 
+def _instrumental_titles_match(expected_title: Any, candidate_title: Any) -> bool:
+    if not (_has_instrumental_marker(expected_title) and _has_instrumental_marker(candidate_title)):
+        return False
+    return _text_match_score(
+        _strip_instrumental_markers(expected_title),
+        _strip_instrumental_markers(candidate_title),
+    ) > 0
+
+
+def _strip_instrumental_markers(value: Any) -> str:
+    text = _normalize_match_text(value)
+    for marker in _instrumental_markers():
+        text = text.replace(marker.strip(), " ")
+    text = re.sub(r"[-_()[\]{}]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _has_instrumental_marker(value: Any) -> bool:
     text = _normalize_match_text(value)
     if not text:
         return False
-    markers = [
+    padded = f" {text} "
+    return any(marker in padded for marker in _instrumental_markers())
+
+
+def _instrumental_markers() -> list[str]:
+    return [
         "instrumental",
         " inst",
         "inst.",
@@ -2308,8 +2941,6 @@ def _has_instrumental_marker(value: Any) -> bool:
         "カラオケ",
         "반주",
     ]
-    padded = f" {text} "
-    return any(marker in padded for marker in markers)
 
 
 def _dedupe_ncm_music_candidates(candidates: Iterable[NCMusicCandidate]) -> list[NCMusicCandidate]:
@@ -2418,6 +3049,98 @@ def _spotify_market_index(market: str) -> int:
         return DEFAULT_SPOTIFY_MARKETS.index(market)
     except ValueError:
         return len(DEFAULT_SPOTIFY_MARKETS)
+
+
+def _apple_music_store_order(stores: Iterable[str] | None = None) -> list[str]:
+    ordered: list[str] = []
+    for store in stores if stores is not None else DEFAULT_STORES:
+        normalized = str(store).strip().lower()
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return ordered
+
+
+def _apple_music_storefront_index(storefront: str) -> int:
+    try:
+        return DEFAULT_STORES.index(storefront.lower())
+    except ValueError:
+        return len(DEFAULT_STORES)
+
+
+def _apple_music_source_priority(match_source: str) -> int:
+    source = (match_source or "").casefold()
+    if source.startswith("album"):
+        return 0
+    if source == "search":
+        return 1
+    if source == "artist-album":
+        return 2
+    return 3
+
+
+def _dedupe_apple_music_candidates(
+    candidates: Iterable[AppleMusicTrackCandidate],
+) -> list[AppleMusicTrackCandidate]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[AppleMusicTrackCandidate] = []
+    for candidate in candidates:
+        key = (candidate.storefront, candidate.track_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _apple_music_storefront_best_candidates(
+    result: AppleMusicMetadataResult,
+    metadata: AudioMetadata,
+) -> list[AppleMusicTrackCandidate]:
+    selected: list[AppleMusicTrackCandidate] = []
+    groups = result.candidates_by_storefront or _apple_music_candidates_grouped_by_storefront(result.candidates)
+    selected_ids_by_store: set[tuple[str, str]] = set()
+    for storefront in _apple_music_store_order(groups.keys()):
+        candidates = groups.get(storefront, [])
+        for candidate in candidates:
+            if _apple_music_candidate_auto_matches(metadata, candidate):
+                key = (candidate.storefront, candidate.track_id)
+                if key not in selected_ids_by_store:
+                    selected.append(candidate)
+                    selected_ids_by_store.add(key)
+                break
+    return selected
+
+
+def _apple_music_candidates_grouped_by_storefront(
+    candidates: Iterable[AppleMusicTrackCandidate],
+) -> dict[str, list[AppleMusicTrackCandidate]]:
+    grouped: dict[str, list[AppleMusicTrackCandidate]] = {}
+    for candidate in candidates:
+        if not candidate.storefront:
+            continue
+        grouped.setdefault(candidate.storefront, []).append(candidate)
+    return grouped
+
+
+def _apple_music_store_order_from_mapping(
+    groups: dict[str, list[AppleMusicTrackCandidate]],
+) -> list[str]:
+    return _apple_music_store_order(groups.keys())
+
+
+def _unique_apple_music_ids(candidates: Iterable[AppleMusicTrackCandidate]) -> list[str]:
+    values: list[str] = []
+    for candidate in candidates:
+        if candidate.track_id not in values:
+            values.append(candidate.track_id)
+    return values
+
+
+def _apple_music_candidate_source(candidate: AppleMusicTrackCandidate) -> str:
+    source = candidate.match_source or "search"
+    if source.startswith("album:"):
+        return source
+    return f"{source}:{candidate.storefront}"
 
 
 def _spotify_search_query(metadata: AudioMetadata) -> str:
@@ -2544,6 +3267,18 @@ def _format_ncm_music_candidate(candidate: NCMusicCandidate) -> str:
     return f"{title}{aliases} - {artists} - {album} [{candidate.song_id}]"
 
 
+def _format_apple_music_candidate(candidate: AppleMusicTrackCandidate) -> str:
+    title = candidate.title or "-"
+    artists = "/".join(candidate.artists) or "-"
+    album = candidate.album or "-"
+    storefront = candidate.storefront.upper() if candidate.storefront else "-"
+    return f"{storefront}: {title} - {artists} - {album} [{candidate.track_id}]"
+
+
+def _format_apple_music_candidate_list(candidates: Iterable[AppleMusicTrackCandidate]) -> str:
+    return ", ".join(_format_apple_music_candidate(candidate) for candidate in candidates)
+
+
 def _format_spotify_candidate(candidate: SpotifyTrackCandidate) -> str:
     title = candidate.title or "-"
     artists = "/".join(candidate.artists) or "-"
@@ -2561,6 +3296,11 @@ def _add_unique_value(values: dict[str, list[str]], key: str, value: str | None)
         return
     if value not in values.setdefault(key, []):
         values[key].append(value)
+
+
+def _add_unique_list_value(values: list[str], value: str | None) -> None:
+    if value and value not in values:
+        values.append(value)
 
 
 def _real_meta_value(value: str | None) -> str | None:

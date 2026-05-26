@@ -29,10 +29,10 @@ python fill_ttml_metadata.py --help
 - `value="*"` 或空值会被视为占位符并替换。
 - 写入前自动生成 `.bak` 备份。
 - 处理主语言为 `xml:lang="zh-Hant"` 的 TTML 时，会先自动改为 `zh-Hans`，并把歌词正文转换为简体。
-- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album` 填充 QQ 音乐、网易云音乐和 Spotify ID。
+- 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album`、`appleMusicId`、`isrc` 填充 Apple Music、QQ 音乐、网易云音乐和 Spotify ID。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
-- 会用 `ITUNESPLAYLISTID` 作为 Apple Music 专辑 ID，在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域查找曲目元数据。
+- 会在 `cn`、`us`、`kr`、`jp`、`tw` 五个区域执行 Apple Music 匹配；已有 `ITUNESCATALOGID` 或 TTML `appleMusicId` 仍会保留并继续搜索其它区域候选。
 - 会用歌名搜索 QQ 音乐，按歌名、歌手、专辑匹配候选，并把选中结果的 songid 和 mid 分别写入 `qqMusicId`。
 - 会在 QQ 音乐候选确认后查找网易云音乐：先用歌名搜索，再用确认后的 QQ 歌手和专辑补充网易云歌手专辑回查，并把选中结果的歌曲 ID 写入 `ncmMusicId`。
 - 如果配置了 Spotify 凭据，会用官方 Web API 的 Client Credentials Flow 获取 token，并在 `US`、`KR`、`JP`、`TW` 四个市场搜索 track；普通搜索不足时会用艺人专辑、发行日期和时长做保守 fallback。每个市场取匹配度最高的候选，`spotifyId` 和 Spotify ISRC 按值去重写入；缺少凭据时自动跳过，不影响其它来源。
@@ -117,7 +117,7 @@ PowerShell 里运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
 ```
 
-交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 QQ 音乐、网易云音乐和 Spotify 最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 Apple Music、QQ 音乐、网易云音乐和 Spotify 最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择；Apple Music 和 Spotify 会按区域/市场分别选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
 
 ## 单首文件处理
 
@@ -151,10 +151,10 @@ python fill_ttml_metadata.py `
 默认区域查找顺序：
 
 1. `cn`
-2. `tw`
-3. `jp`
-4. `kr`
-5. `us`
+2. `us`
+3. `kr`
+4. `jp`
+5. `tw`
 
 脚本固定查询这五个区域，不再提供单区域、兜底区域或交互输入区域参数。
 
@@ -194,21 +194,33 @@ A, B, C & D
 
 ### Apple Music 元数据查找
 
-音频标签中的 `ITUNESCATALOGID` 只有看起来像有效歌曲 ID 时才直接写入。
+音频标签中的 `ITUNESCATALOGID` 只有看起来像有效歌曲 ID 时才直接写入；TTML-only 模式下也会读取已有 `amll:meta key="appleMusicId"` 和 `isrc`。已有 Apple Music 歌曲 ID 不会让查询提前结束，脚本仍会按 `cn`、`us`、`kr`、`jp`、`tw` 搜索其它区域候选，用来补充本地化歌名、歌手、专辑和 ISRC。
 
-多地区元数据查找使用 `ITUNESPLAYLISTID` 作为专辑 ID：
+音频有 `ITUNESPLAYLISTID` 时，脚本会先把它作为专辑 ID 查曲目：
 
 ```text
 https://music.apple.com/{store}/album/{ITUNESPLAYLISTID}
 ```
 
-脚本参考 `Ame (Apple Music).user.js` 的做法，从 Apple Music 页面提取 Bearer token，然后请求：
+脚本参考 `Ame (Apple Music).user.js` 的做法，从 Apple Music 页面提取 Bearer token，不需要 Apple Developer Token。专辑曲目读取请求：
 
 ```text
 https://amp-api.music.apple.com/v1/catalog/{store}/albums/{albumId}
 ```
 
-脚本会在 `cn`、`tw`、`jp`、`kr`、`us` 五个区域分别读取专辑曲目。匹配曲目时优先使用碟号和曲目号；缺少曲目号时会使用规范化曲名和时长辅助匹配。
+脚本会在 `cn`、`us`、`kr`、`jp`、`tw` 五个区域分别读取专辑曲目。匹配曲目时优先使用碟号和曲目号；缺少曲目号时会使用规范化曲名和时长辅助匹配。
+
+无论是否有专辑 ID，只要有歌名，脚本还会请求 Apple Music catalog search：
+
+```text
+https://amp-api.music.apple.com/v1/catalog/{store}/search?types=songs&term=...
+```
+
+普通搜索候选按 ISRC、歌名、歌手、专辑、发行日期和时长排序。普通搜索标题明显弱、且音频里同时有歌手、发行日期和时长时，脚本会再搜索 Apple Music artist，分页读取该艺人的 album/single 列表；分页最多读取 10 页、每页 50 张，达到上限会输出 `lookup warning:`。fallback 只接受发行日期匹配、歌手匹配且时长误差不超过 1 秒的曲目。
+
+源歌名不含伴奏标记时，带 `Instrumental`、`伴奏`、`インスト`、`반주` 等标记的 Apple Music 候选会大幅降权且不会自动选中；源歌名本身带伴奏标记时允许匹配。TTML-only 没有音频发行日期和时长，因此不会启用 artist-album fallback，只保留普通搜索候选和手动选择。
+
+dry-run 会展示五区最佳 Apple Music 候选但不询问。真实写入时会先汇总 Apple Music 最佳候选；输入 `Y` 接受全部区域最佳结果，输入 `N` 则按 `CN`、`US`、`KR`、`JP`、`TW` 每区最多展示 5 首候选。选中候选会写入 `appleMusicId`；同一个 Apple Music ID 只写一次，但不同区域返回的歌名、艺术家名、专辑名和 ISRC 会按现有去重规则追加到 `musicName`、`artists`、`album`、`isrc`。
 
 示例验证：
 
@@ -302,8 +314,9 @@ dry-run 会自动展示并选择四区最佳候选但不询问。真实写入时
 ```text
 [dry-run] 2. Disease (Apple Music Live).ttml
   audio: 2. Disease (Apple Music Live).flac
+  appleMusicBest: CN: Disease (Apple Music Live) - Lady Gaga - Apple Music Live: MAYHEM Requiem [6768201779], US: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [6768201780]
   appleMusicId: 6768201779, 6768201780
-  appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
+  appleMusicSources: album:cn:track, album:us:track, album:kr:track, album:jp:track, album:tw:track
   qqMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [123456, 001abc]
   qqMusicId: 123456, 001abc
   ncmMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [456789]
@@ -325,8 +338,9 @@ dry-run 会自动展示并选择四区最佳候选但不询问。真实写入时
 ```text
 [unchanged] 2. Disease (Apple Music Live).ttml
   audio: 2. Disease (Apple Music Live).flac
+  appleMusicBest: CN: Disease (Apple Music Live) - Lady Gaga - Apple Music Live: MAYHEM Requiem [6768201779], US: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [6768201780]
   appleMusicId: 6768201779, 6768201780
-  appleMusicSources: album:cn:track, album:tw:track, album:jp:track, album:kr:track, album:us:track
+  appleMusicSources: album:cn:track, album:us:track, album:kr:track, album:jp:track, album:tw:track
   qqMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [123456, 001abc]
   qqMusicId: 123456, 001abc
   ncmMusicBest: Disease - Lady Gaga - Apple Music Live: MAYHEM Requiem [456789]
@@ -364,7 +378,7 @@ song.m4a
 song.ttml
 ```
 
-下面这组不会自动匹配音频，但会进入 TTML-only 模式；如果 TTML 里已有有效 `musicName`，脚本仍会尝试查找 QQ 音乐和网易云音乐 ID：
+下面这组不会自动匹配音频，但会进入 TTML-only 模式；如果 TTML 里已有有效 `musicName`，脚本仍会尝试查找 Apple Music、QQ 音乐、网易云音乐和 Spotify ID。TTML-only 会读取已有 `musicName`、`artists`、`album`、`appleMusicId`、`isrc`，但因为没有音频发行日期和时长，不启用 Apple Music 或 Spotify 的 artist-album fallback：
 
 ```text
 song-audio.flac
@@ -377,9 +391,10 @@ song-lyrics.ttml
 
 常见原因：
 
-- 音频缺少 `ITUNESPLAYLISTID`。
-- 固定查询的 `cn`、`tw`、`jp`、`kr`、`us` 区域都没有该专辑。
-- 专辑页存在，但曲名或曲目号和音频标签不一致。
+- 音频缺少 `ITUNESPLAYLISTID`，且普通 song search 没有合适候选。
+- 固定查询的 `cn`、`us`、`kr`、`jp`、`tw` 区域都没有该专辑或歌曲。
+- 专辑页存在，但曲名、曲目号、发行日期、歌手或时长和音频标签不一致。
+- 最佳候选是伴奏版，但源歌名不含伴奏标记。
 - 当前网络无法访问 Apple Music。
 
 ### 找不到 QQ 音乐 ID

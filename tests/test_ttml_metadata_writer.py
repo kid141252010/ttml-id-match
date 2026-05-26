@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fill_ttml_metadata import (
     AudioMetadata,
     AppleMusicMetadataResult,
+    AppleMusicTrackCandidate,
     DEFAULT_STORES,
     DEFAULT_SPOTIFY_MARKETS,
     SPOTIFY_SEARCH_LIMIT,
@@ -32,6 +33,7 @@ from fill_ttml_metadata import (
     collect_ncm_music_metadata,
     collect_qq_music_metadata,
     collect_spotify_metadata,
+    confirm_apple_music_candidates,
     confirm_ncm_music_candidates,
     confirm_qq_music_candidates,
     confirm_spotify_candidates,
@@ -46,6 +48,8 @@ from fill_ttml_metadata import (
     WorkItem,
     _collect_ncm_music_metadata_for_pairs,
     _flatten_tags,
+    _AppleMusicAlbumCandidate,
+    _AppleMusicArtistCandidate,
     _prepare_work_item,
     _parse_ncm_music_candidates,
     _parse_qq_music_candidates,
@@ -276,10 +280,10 @@ class TtmlMetadataWriterTests(unittest.TestCase):
                 self.calls.append((store, album_id))
                 names = {
                     "cn": ("Song", "Artist", "Album", "111"),
-                    "tw": ("Song", "Artist", "Album", "111"),
-                    "jp": ("曲", "Artist JP", "アルバム", "222"),
-                    "kr": ("노래", "Artist KR", "앨범", "333"),
                     "us": ("Song", "Artist", "Album", "444"),
+                    "kr": ("노래", "Artist KR", "앨범", "333"),
+                    "jp": ("曲", "Artist JP", "アルバム", "222"),
+                    "tw": ("Song", "Artist", "Album", "111"),
                 }
                 name, artist, album, track_id = names[store]
                 return [
@@ -295,6 +299,15 @@ class TtmlMetadataWriterTests(unittest.TestCase):
                     }
                 ]
 
+            def search_songs(self, store, metadata):
+                return []
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
+
         client = RecordingClient()
 
         result = collect_apple_music_metadata(
@@ -309,26 +322,341 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         )
 
         self.assertEqual(client.calls, [(store, "999") for store in DEFAULT_STORES])
-        self.assertEqual(result.values["musicName"], ["Song", "曲", "노래"])
-        self.assertEqual(result.values["artists"], ["Artist", "Artist JP", "Artist KR"])
-        self.assertEqual(result.values["album"], ["Album", "アルバム", "앨범"])
-        self.assertEqual(result.values["appleMusicId"], ["111", "222", "333", "444"])
+        self.assertEqual(result.values["musicName"], ["Song", "노래", "曲"])
+        self.assertEqual(result.values["artists"], ["Artist", "Artist KR", "Artist JP"])
+        self.assertEqual(result.values["album"], ["Album", "앨범", "アルバム"])
+        self.assertEqual(result.values["appleMusicId"], ["111", "444", "333", "222"])
         self.assertEqual(result.values["isrc"], ["TST000000001"])
         self.assertEqual(
             result.sources,
             [
                 "album:cn:track",
-                "album:tw:track",
-                "album:jp:track",
-                "album:kr:track",
                 "album:us:track",
+                "album:kr:track",
+                "album:jp:track",
+                "album:tw:track",
             ],
         )
+
+    def test_existing_apple_music_id_still_searches_all_storefronts_and_appends_localized_metadata(self) -> None:
+        class SearchClient:
+            def __init__(self):
+                self.search_calls = []
+
+            def fetch_album_tracks(self, store, album_id):
+                raise AssertionError("catalog-only metadata should not require album lookup")
+
+            def search_songs(self, store, metadata):
+                self.search_calls.append((store, metadata.catalog_id))
+                names = {
+                    "cn": ("song-cn", "Song", "Artist", "Album"),
+                    "us": ("song-us", "Song", "Artist", "Album"),
+                    "kr": ("song-kr", "노래", "Artist KR", "앨범"),
+                    "jp": ("song-jp", "曲", "Artist JP", "アルバム"),
+                    "tw": ("song-tw", "Song", "Artist", "Album"),
+                }
+                track_id, title, artist, album = names[store]
+                return [
+                    AppleMusicTrackCandidate(
+                        track_id=track_id,
+                        title=title,
+                        artists=[artist],
+                        album=album,
+                        storefront=store,
+                        source_index=0,
+                        isrc="TST000000001",
+                        match_source="search",
+                    )
+                ]
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
+
+        client = SearchClient()
+
+        result = collect_apple_music_metadata(
+            AudioMetadata(
+                title="Song",
+                artists=["Artist"],
+                album="Album",
+                isrc="TST000000001",
+                catalog_id="1691701944",
+            ),
+            client,
+        )
+
+        self.assertEqual(client.search_calls, [(store, "1691701944") for store in DEFAULT_STORES])
+        self.assertEqual(result.values["appleMusicId"], ["1691701944", "song-cn", "song-us", "song-kr", "song-jp", "song-tw"])
+        self.assertEqual(result.values["musicName"], ["Song", "노래", "曲"])
+        self.assertEqual(result.values["artists"], ["Artist", "Artist KR", "Artist JP"])
+        self.assertEqual(result.values["album"], ["Album", "앨범", "アルバム"])
+        self.assertEqual(result.values["isrc"], ["TST000000001"])
+        self.assertEqual([candidate.storefront for candidate in result.selected], DEFAULT_STORES)
+
+    def test_apple_music_artist_album_fallback_selects_localized_title_by_date_artist_and_one_second_duration(self) -> None:
+        class FallbackClient:
+            def fetch_album_tracks(self, store, album_id):
+                self.fetched_album = (store, album_id)
+                return [
+                    {
+                        "id": "localized",
+                        "name": "물음",
+                        "artistName": "Sān-Z, HOYO-MiX",
+                        "albumName": "물음",
+                        "isrc": "FR10S2564999",
+                        "durationInMillis": 192000,
+                        "releaseDate": "2025-12-18",
+                    }
+                ]
+
+            def search_songs(self, store, metadata):
+                return [
+                    AppleMusicTrackCandidate(
+                        "weak",
+                        "Fearless",
+                        ["Sān-Z"],
+                        "Fearless",
+                        store,
+                        0,
+                        duration_ms=200000,
+                        release_date="2024-01-01",
+                        match_source="search",
+                    )
+                ]
+
+            def search_artists(self, store, query):
+                return [_AppleMusicArtistCandidate("artist-1", "Sān-Z", 0)]
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [
+                    _AppleMusicAlbumCandidate("old-album", "Old", "2024-01-01", 0),
+                    _AppleMusicAlbumCandidate("album-1", "I Ask - Single", "2025-12-18", 1),
+                ], []
+
+        client = FallbackClient()
+
+        result = collect_apple_music_metadata(
+            AudioMetadata(
+                title="I Ask",
+                artists=["Sān-Z & HOYO-MiX"],
+                album="I Ask - Single",
+                duration_seconds=192.4,
+                release_date="2025-12-18",
+            ),
+            client,
+            stores=["kr"],
+        )
+
+        self.assertEqual(client.fetched_album, ("kr", "album-1"))
+        self.assertEqual([(candidate.track_id, candidate.title, candidate.match_source) for candidate in result.selected], [("localized", "물음", "artist-album")])
+        self.assertEqual(result.values["musicName"], ["물음"])
+        self.assertEqual(result.values["appleMusicId"], ["localized"])
+
+    def test_apple_music_artist_album_fallback_rejects_date_artist_or_duration_mismatch(self) -> None:
+        cases = [
+            ("bad-date", "2025-12-19", "Sān-Z, HOYO-MiX", 192000),
+            ("bad-artist", "2025-12-18", "Other Artist", 192000),
+            ("bad-duration", "2025-12-18", "Sān-Z, HOYO-MiX", 194000),
+        ]
+
+        for label, release_date, artist_name, duration_ms in cases:
+            with self.subTest(label=label):
+                class FallbackClient:
+                    def fetch_album_tracks(self, store, album_id):
+                        return [
+                            {
+                                "id": label,
+                                "name": "물음",
+                                "artistName": artist_name,
+                                "albumName": "물음",
+                                "durationInMillis": duration_ms,
+                                "releaseDate": release_date,
+                            }
+                        ]
+
+                    def search_songs(self, store, metadata):
+                        return [
+                            AppleMusicTrackCandidate(
+                                "weak",
+                                "Fearless",
+                                ["Sān-Z"],
+                                "Fearless",
+                                store,
+                                0,
+                                match_source="search",
+                            )
+                        ]
+
+                    def search_artists(self, store, query):
+                        return [_AppleMusicArtistCandidate("artist-1", "Sān-Z", 0)]
+
+                    def fetch_artist_albums(self, store, artist_id):
+                        return [_AppleMusicAlbumCandidate("album-1", "I Ask - Single", "2025-12-18", 0)], []
+
+                result = collect_apple_music_metadata(
+                    AudioMetadata(
+                        title="I Ask",
+                        artists=["Sān-Z & HOYO-MiX"],
+                        album="I Ask - Single",
+                        duration_seconds=192,
+                        release_date="2025-12-18",
+                    ),
+                    FallbackClient(),
+                    stores=["kr"],
+                )
+
+                self.assertEqual(result.selected, [])
+                self.assertEqual(result.values, {})
+
+    def test_apple_music_instrumental_candidate_is_ranked_low_and_not_auto_selected_unless_source_is_instrumental(self) -> None:
+        class SearchClient:
+            def __init__(self, candidates):
+                self.candidates = candidates
+
+            def fetch_album_tracks(self, store, album_id):
+                return []
+
+            def search_songs(self, store, metadata):
+                return self.candidates
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
+
+        regular = collect_apple_music_metadata(
+            AudioMetadata(title="I Ask", artists=["Sān-Z"]),
+            SearchClient(
+                [
+                    AppleMusicTrackCandidate("instrumental", "I Ask - Instrumental", ["Sān-Z"], "I Ask", "us", 0, match_source="search"),
+                    AppleMusicTrackCandidate("normal", "I Ask", ["Sān-Z"], "I Ask", "us", 1, match_source="search"),
+                ]
+            ),
+            stores=["us"],
+        )
+        instrumental_source = collect_apple_music_metadata(
+            AudioMetadata(title="I Ask Instrumental", artists=["Sān-Z"]),
+            SearchClient(
+                [
+                    AppleMusicTrackCandidate("instrumental", "I Ask - Instrumental", ["Sān-Z"], "I Ask", "us", 0, match_source="search"),
+                ]
+            ),
+            stores=["us"],
+        )
+
+        self.assertEqual([candidate.track_id for candidate in regular.candidates_by_storefront["us"]], ["normal", "instrumental"])
+        self.assertEqual([candidate.track_id for candidate in regular.selected], ["normal"])
+        self.assertEqual([candidate.track_id for candidate in instrumental_source.selected], ["instrumental"])
+
+    def test_rejecting_apple_music_best_prompts_for_five_choices_per_storefront_and_updates_values(self) -> None:
+        result = AppleMusicMetadataResult(
+            candidates_by_storefront={
+                "cn": [
+                    AppleMusicTrackCandidate(f"cn-{index}", f"CN Song {index}", ["A"], "Album", "cn", index, match_source="search")
+                    for index in range(1, 7)
+                ],
+                "us": [
+                    AppleMusicTrackCandidate(f"us-{index}", f"US Song {index}", ["A"], "Album", "us", index, match_source="search")
+                    for index in range(1, 4)
+                ],
+            }
+        )
+        result.candidates = [candidate for candidates in result.candidates_by_storefront.values() for candidate in candidates]
+        pair = PairMetadata(
+            Path("song.flac"),
+            Path("song.ttml"),
+            AudioMetadata(title="Song"),
+            result,
+            QQMusicSearchResult(),
+        )
+        answers = iter(["N", "4", ""])
+        printed: list[str] = []
+
+        confirm_apple_music_candidates(
+            [pair],
+            dry_run=False,
+            input_func=lambda prompt: next(answers),
+            print_func=lambda *values, **kwargs: printed.append(" ".join(str(value) for value in values)),
+        )
+
+        self.assertEqual([candidate.track_id for candidate in result.selected], ["cn-4"])
+        self.assertEqual(result.values["appleMusicId"], ["cn-4"])
+        self.assertTrue(any("CN Apple Music 候选" in line for line in printed))
+        self.assertTrue(any("US Apple Music 候选" in line for line in printed))
+        self.assertTrue(any("[cn-1]" in line for line in printed))
+        self.assertTrue(any("[cn-5]" in line for line in printed))
+        self.assertFalse(any("[cn-6]" in line for line in printed))
+
+    def test_apple_music_best_output_lists_each_storefront_best_even_when_manual_only(self) -> None:
+        result = AppleMusicMetadataResult(
+            candidates_by_storefront={
+                "cn": [AppleMusicTrackCandidate("cn-best", "Song", ["Artist"], "Album", "cn", 0, match_source="search")],
+                "us": [AppleMusicTrackCandidate("us-best", "Localized US", ["Artist"], "Album", "us", 0, match_source="search")],
+                "kr": [AppleMusicTrackCandidate("kr-best", "현지화", ["Artist"], "Album", "kr", 0, match_source="search")],
+                "jp": [AppleMusicTrackCandidate("jp-best", "ローカライズ", ["Artist"], "Album", "jp", 0, match_source="search")],
+                "tw": [AppleMusicTrackCandidate("tw-best", "本地化", ["Artist"], "Album", "tw", 0, match_source="search")],
+            }
+        )
+        result.candidates = [candidate for candidates in result.candidates_by_storefront.values() for candidate in candidates]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song.ttml"
+            path.write_text(REFERENCE_STYLE_TTML, encoding="utf-8")
+            pair = PairMetadata(
+                Path("song.flac"),
+                path,
+                AudioMetadata(title="Song", artists=["Artist"], album="Album"),
+                result,
+                QQMusicSearchResult(),
+            )
+            stdout = StringIO()
+
+            confirm_apple_music_candidates(
+                [pair],
+                dry_run=True,
+                input_func=lambda prompt: (_ for _ in ()).throw(AssertionError("dry-run should not prompt")),
+                print_func=lambda *values, **kwargs: None,
+            )
+            with redirect_stdout(stdout):
+                _process_prepared_pair(pair, dry_run=True)
+
+        output = stdout.getvalue()
+        self.assertEqual([candidate.track_id for candidate in result.selected], ["cn-best"])
+        for label in ["CN", "US", "KR", "JP", "TW"]:
+            self.assertIn(f"{label}: ", output)
+
+    def test_values_from_metadata_dedupes_apple_music_id_but_keeps_storefront_metadata_variants(self) -> None:
+        values = values_from_metadata(
+            AudioMetadata(title="Amazing Grace", artists=["邓紫棋"], album="Amazing Grace - Single"),
+            apple_music_candidates=[
+                AppleMusicTrackCandidate("same-id", "Amazing Grace", ["G.E.M."], "Amazing Grace", "us", 0),
+                AppleMusicTrackCandidate("same-id", "어메이징 그레이스", ["G.E.M. 덩쯔치"], "어메이징 그레이스", "kr", 1),
+                AppleMusicTrackCandidate("same-id", "アメイジング・グレイス", ["G.E.M."], "アメイジング・グレイス", "jp", 2, isrc="HKA972401000"),
+            ],
+        )
+
+        self.assertEqual(values["appleMusicId"], ["same-id"])
+        self.assertEqual(values["musicName"], ["Amazing Grace", "어메이징 그레이스", "アメイジング・グレイス"])
+        self.assertEqual(values["artists"], ["邓紫棋", "G.E.M.", "G.E.M. 덩쯔치"])
+        self.assertEqual(values["album"], ["Amazing Grace - Single", "Amazing Grace", "어메이징 그레이스", "アメイジング・グレイス"])
+        self.assertEqual(values["isrc"], ["HKA972401000"])
 
     def test_catalog_id_without_playlist_only_writes_existing_song_id(self) -> None:
         class NoLookupClient:
             def fetch_album_tracks(self, store, album_id):
                 raise AssertionError("catalog-only metadata should not require album lookup")
+
+            def search_songs(self, store, metadata):
+                return []
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
 
         result = collect_apple_music_metadata(
             AudioMetadata(catalog_id="1691701944"),
@@ -343,6 +671,15 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         class NoLookupClient:
             def fetch_album_tracks(self, store, album_id):
                 raise AssertionError("missing ids should not require album lookup")
+
+            def search_songs(self, store, metadata):
+                return []
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
 
         result = collect_apple_music_metadata(
             AudioMetadata(),
@@ -2067,6 +2404,25 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
         self.assertIsNone(metadata.catalog_id)
         self.assertIsNone(metadata.playlist_id)
 
+    def test_reads_apple_music_id_and_isrc_from_ttml_metadata(self) -> None:
+        text = self.metadata_ttml(
+            '<amll:meta key="musicName" value="玫瑰少年"/>'
+            '<amll:meta key="artists" value="蔡依林"/>'
+            '<amll:meta key="album" value="UGLY BEAUTY"/>'
+            '<amll:meta key="appleMusicId" value="1458862568"/>'
+            '<amll:meta key="isrc" value="TWA471900001"/>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(Path(tmp), body=text)
+
+            metadata = read_ttml_metadata(path)
+
+        self.assertEqual(metadata.title, "玫瑰少年")
+        self.assertEqual(metadata.artists, ["蔡依林"])
+        self.assertEqual(metadata.album, "UGLY BEAUTY")
+        self.assertEqual(metadata.catalog_id, "1458862568")
+        self.assertEqual(metadata.isrc, "TWA471900001")
+
     def test_reads_ttml_metadata_with_missing_amll_namespace(self) -> None:
         text = (
             '<tt xmlns="http://www.w3.org/ns/ttml">'
@@ -2099,9 +2455,32 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
         self.assertEqual(warnings, ["ambiguous.ttml: multiple same-stem audio files found: ambiguous.m4a, ambiguous.mp3"])
 
     def test_ttml_only_preparation_reuses_title_query_and_artist_album_ranking(self) -> None:
-        class NoAppleLookupClient:
+        class AppleSearchClient:
+            def __init__(self):
+                self.search_calls = []
+
             def fetch_album_tracks(self, store, album_id):
-                raise AssertionError("TTML-only work should not call Apple Music")
+                raise AssertionError("TTML-only work without playlist should not call Apple Music album lookup")
+
+            def search_songs(self, store, metadata):
+                self.search_calls.append((store, metadata.title, metadata.catalog_id))
+                return [
+                    AppleMusicTrackCandidate(
+                        f"{store}-apple",
+                        "玫瑰少年" if store in {"cn", "tw"} else f"玫瑰少年 {store}",
+                        ["蔡依林"],
+                        "UGLY BEAUTY",
+                        store,
+                        0,
+                        match_source="search",
+                    )
+                ]
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
 
         class SearchClient:
             def search_songs(self, query):
@@ -2132,18 +2511,23 @@ class TtmlOnlyMetadataTests(unittest.TestCase):
             '<amll:meta key="musicName" value="玫瑰少年"/>'
             '<amll:meta key="artists" value="蔡依林"/>'
             '<amll:meta key="album" value="UGLY BEAUTY"/>'
+            '<amll:meta key="appleMusicId" value="1458862568"/>'
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_ttml(Path(tmp), body=text)
+            apple_client = AppleSearchClient()
             qq_client = SearchClient()
             ncm_client = NCMSearchClient()
 
-            pair = _prepare_work_item(WorkItem(ttml_path=path), NoAppleLookupClient(), qq_client, ncm_client)
+            pair = _prepare_work_item(WorkItem(ttml_path=path), apple_client, qq_client, ncm_client)
 
         self.assertIsNone(pair.audio_path)
         self.assertEqual(pair.metadata.title, "玫瑰少年")
         self.assertEqual(pair.metadata.artists, ["蔡依林"])
         self.assertEqual(pair.metadata.album, "UGLY BEAUTY")
+        self.assertEqual(pair.metadata.catalog_id, "1458862568")
+        self.assertEqual(apple_client.search_calls, [(store, "玫瑰少年", "1458862568") for store in DEFAULT_STORES])
+        self.assertEqual(pair.apple_music_metadata.values["appleMusicId"], ["1458862568", "cn-apple", "us-apple", "kr-apple", "jp-apple", "tw-apple"])
         self.assertEqual(qq_client.query, "玫瑰少年")
         self.assertEqual([candidate.song_id for candidate in pair.qq_music_metadata.candidates], ["224116257", "415233914", "235883438"])
         self.assertFalse(hasattr(ncm_client, "context"))
