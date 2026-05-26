@@ -1669,7 +1669,7 @@ def values_from_metadata(
     if metadata.title:
         _add_unique_value(values, "musicName", metadata.title)
     if metadata.artists:
-        for artist in metadata.artists:
+        for artist in split_artists(metadata.artists):
             _add_unique_value(values, "artists", artist)
     if metadata.album:
         _add_unique_value(values, "album", metadata.album)
@@ -2594,7 +2594,7 @@ def _search_apple_music_artist_album_candidates(
 ) -> list[AppleMusicTrackCandidate]:
     candidates: list[AppleMusicTrackCandidate] = []
     seen_artist_ids: set[str] = set()
-    for artist_name in metadata.artists:
+    for artist_name in split_artists(metadata.artists):
         try:
             artists = client.search_artists(storefront, artist_name)
         except Exception as exc:
@@ -3759,14 +3759,11 @@ def _normalize_title(value: Any) -> str:
 
 
 def _split_artist_value(value: str) -> list[str]:
-    if ";" in value:
-        return [part.strip() for part in value.split(";") if part.strip()]
-    if "," not in value:
-        return [value]
-    pieces: list[str] = []
-    for comma_part in value.split(","):
-        pieces.extend(part.strip() for part in re.split(r"\s+&\s+", comma_part) if part.strip())
-    return pieces
+    return [
+        part.strip()
+        for part in re.split(r"\s*(?:,|;|；|、|&|＆)\s*", value)
+        if part.strip()
+    ]
 
 
 def _flatten_tags(tags: Any) -> dict[str, list[Any]]:

@@ -43,6 +43,7 @@ from fill_ttml_metadata import (
     normalize_ttml_language,
     read_audio_metadata,
     read_ttml_metadata,
+    split_artists,
     update_ttml_metadata,
     values_from_metadata,
     WorkItem,
@@ -271,6 +272,13 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         self.assertEqual(flattened["itunesalbumtitleid"], ["152678183"])
         self.assertEqual(flattened["isrc"], ["TWA472368001"])
 
+    def test_splits_ampersand_joined_artists_for_metadata_writing(self) -> None:
+        self.assertEqual(split_artists(["Sān-Z & HOYO-MiX"]), ["Sān-Z", "HOYO-MiX"])
+
+        values = values_from_metadata(AudioMetadata(title="I Ask", artists=["Sān-Z & HOYO-MiX"]))
+
+        self.assertEqual(values["artists"], ["Sān-Z", "HOYO-MiX"])
+
     def test_collects_metadata_from_all_default_storefronts_without_stopping_at_first_match(self) -> None:
         class RecordingClient:
             def __init__(self):
@@ -398,6 +406,9 @@ class TtmlMetadataWriterTests(unittest.TestCase):
 
     def test_apple_music_artist_album_fallback_selects_localized_title_by_date_artist_and_one_second_duration(self) -> None:
         class FallbackClient:
+            def __init__(self):
+                self.artist_queries = []
+
             def fetch_album_tracks(self, store, album_id):
                 self.fetched_album = (store, album_id)
                 return [
@@ -428,7 +439,10 @@ class TtmlMetadataWriterTests(unittest.TestCase):
                 ]
 
             def search_artists(self, store, query):
-                return [_AppleMusicArtistCandidate("artist-1", "Sān-Z", 0)]
+                self.artist_queries.append(query)
+                if query == "Sān-Z":
+                    return [_AppleMusicArtistCandidate("artist-1", "Sān-Z", 0)]
+                return [_AppleMusicArtistCandidate("wrong-artist", "Camila Cabello", 0)]
 
             def fetch_artist_albums(self, store, artist_id):
                 return [
@@ -451,6 +465,7 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         )
 
         self.assertEqual(client.fetched_album, ("kr", "album-1"))
+        self.assertIn("Sān-Z", client.artist_queries)
         self.assertEqual([(candidate.track_id, candidate.title, candidate.match_source) for candidate in result.selected], [("localized", "물음", "artist-album")])
         self.assertEqual(result.values["musicName"], ["물음"])
         self.assertEqual(result.values["appleMusicId"], ["localized"])

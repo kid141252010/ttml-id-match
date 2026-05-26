@@ -190,7 +190,7 @@ A, B, C & D
 <amll:meta key="artists" value="D"/>
 ```
 
-单个乐队名如 `Florence & The Machine` 不会因为 `&` 被拆开。
+`,`、`;`、`、`、`&`、`＆` 都按多艺术家分隔符处理；例如 `Sān-Z & HOYO-MiX` 会写成 `Sān-Z` 和 `HOYO-MiX` 两个 `artists` 节点。
 
 ### Apple Music 元数据查找
 
