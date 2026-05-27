@@ -86,6 +86,15 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def test_split_package_exports_are_available_through_compatibility_shim(self) -> None:
+        import fill_ttml_metadata as shim
+        import ttml_metadata
+
+        self.assertIs(shim.main, ttml_metadata.main)
+        self.assertIs(shim.update_ttml_metadata, ttml_metadata.update_ttml_metadata)
+        self.assertIs(shim.split_artists, ttml_metadata.split_artists)
+        self.assertTrue(callable(shim._safe_print))
+
     def test_adds_meta_before_itunes_metadata_without_rewriting_outer_ttml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_ttml(REFERENCE_STYLE_TTML, Path(tmp))
