@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
@@ -1198,6 +1199,40 @@ class NCMusicMetadataTests(unittest.TestCase):
         candidates = client.search_songs("玫瑰少年")
 
         self.assertEqual([candidate.song_id for candidate in candidates], ["3"])
+
+    def test_collect_ncm_metadata_for_pairs_uses_configured_workers(self) -> None:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        class SearchClient:
+            def search_songs(self, context):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    time.sleep(0.03)
+                    return [NCMusicCandidate(str(context.titles[0]), context.titles[0])]
+                finally:
+                    with lock:
+                        active -= 1
+
+        pairs = [
+            PairMetadata(
+                None,
+                Path(f"{index}.ttml"),
+                AudioMetadata(title=str(index)),
+                AppleMusicMetadataResult(),
+                QQMusicSearchResult(),
+            )
+            for index in range(4)
+        ]
+
+        _collect_ncm_music_metadata_for_pairs(pairs, SearchClient(), max_workers=3)
+
+        self.assertEqual(max_active, 3)
+        self.assertEqual([pair.ncm_music_metadata.candidates[0].song_id for pair in pairs], ["0", "1", "2", "3"])
 
     def test_ranks_ncm_candidates_by_title_artist_album_and_contains(self) -> None:
         class SearchClient:
@@ -2430,6 +2465,147 @@ class SpotifyMetadataTests(unittest.TestCase):
         self.assertIn("spotifyBest: -", stdout.getvalue())
         self.assertIn("spotifyId: -", stdout.getvalue())
         self.assertIn("缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索", stdout.getvalue())
+
+    def test_main_uses_three_search_workers_by_default_and_preserves_output_order(self) -> None:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+        processed: list[str] = []
+
+        def prepare(work_item, *args):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.03)
+                return PairMetadata(
+                    None,
+                    work_item.ttml_path,
+                    AudioMetadata(title=work_item.ttml_path.stem),
+                    AppleMusicMetadataResult(),
+                    QQMusicSearchResult(),
+                    NCMusicSearchResult(),
+                    SpotifySearchResult(),
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for index in range(4):
+                (directory / f"{index + 1:02d}.ttml").write_text(REFERENCE_STYLE_TTML, encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("fill_ttml_metadata._prepare_work_item", side_effect=prepare),
+                patch("fill_ttml_metadata._collect_ncm_music_metadata_for_pairs"),
+                patch("fill_ttml_metadata.confirm_apple_music_candidates"),
+                patch("fill_ttml_metadata.confirm_qq_music_candidates"),
+                patch("fill_ttml_metadata.confirm_ncm_music_candidates"),
+                patch("fill_ttml_metadata.confirm_spotify_candidates"),
+                patch("fill_ttml_metadata._process_prepared_pair", side_effect=lambda pair, **kwargs: processed.append(pair.ttml_path.name)),
+            ):
+                exit_code = main([str(directory), "--dry-run"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(max_active, 3)
+        self.assertEqual(processed, ["01.ttml", "02.ttml", "03.ttml", "04.ttml"])
+
+    def test_main_search_workers_can_be_reduced_to_one(self) -> None:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def prepare(work_item, *args):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)
+                return PairMetadata(
+                    None,
+                    work_item.ttml_path,
+                    AudioMetadata(title=work_item.ttml_path.stem),
+                    AppleMusicMetadataResult(),
+                    QQMusicSearchResult(),
+                    NCMusicSearchResult(),
+                    SpotifySearchResult(),
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for index in range(3):
+                (directory / f"{index + 1:02d}.ttml").write_text(REFERENCE_STYLE_TTML, encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("fill_ttml_metadata._prepare_work_item", side_effect=prepare),
+                patch("fill_ttml_metadata._collect_ncm_music_metadata_for_pairs"),
+                patch("fill_ttml_metadata.confirm_apple_music_candidates"),
+                patch("fill_ttml_metadata.confirm_qq_music_candidates"),
+                patch("fill_ttml_metadata.confirm_ncm_music_candidates"),
+                patch("fill_ttml_metadata.confirm_spotify_candidates"),
+                patch("fill_ttml_metadata._process_prepared_pair"),
+            ):
+                exit_code = main([str(directory), "--dry-run", "--search-workers", "1"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(max_active, 1)
+
+    def test_main_rejects_non_positive_search_workers(self) -> None:
+        stderr = StringIO()
+
+        with self.assertRaises(SystemExit) as raised:
+            with redirect_stderr(stderr):
+                main([".", "--dry-run", "--search-workers", "0"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--search-workers must be at least 1", stderr.getvalue())
+
+    def test_main_parallel_prepare_failure_does_not_drop_successful_items(self) -> None:
+        processed: list[str] = []
+
+        def prepare(work_item, *args):
+            if work_item.ttml_path.name == "02.ttml":
+                raise RuntimeError("boom")
+            return PairMetadata(
+                None,
+                work_item.ttml_path,
+                AudioMetadata(title=work_item.ttml_path.stem),
+                AppleMusicMetadataResult(),
+                QQMusicSearchResult(),
+                NCMusicSearchResult(),
+                SpotifySearchResult(),
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for index in range(3):
+                (directory / f"{index + 1:02d}.ttml").write_text(REFERENCE_STYLE_TTML, encoding="utf-8")
+            stderr = StringIO()
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("fill_ttml_metadata._prepare_work_item", side_effect=prepare),
+                patch("fill_ttml_metadata._collect_ncm_music_metadata_for_pairs"),
+                patch("fill_ttml_metadata.confirm_apple_music_candidates"),
+                patch("fill_ttml_metadata.confirm_qq_music_candidates"),
+                patch("fill_ttml_metadata.confirm_ncm_music_candidates"),
+                patch("fill_ttml_metadata.confirm_spotify_candidates"),
+                patch("fill_ttml_metadata._process_prepared_pair", side_effect=lambda pair, **kwargs: processed.append(pair.ttml_path.name)),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main([str(directory), "--dry-run", "--search-workers", "3"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(processed, ["01.ttml", "03.ttml"])
+        self.assertIn("[error] 02.ttml: boom", stderr.getvalue())
 
 
 class TtmlOnlyMetadataTests(unittest.TestCase):

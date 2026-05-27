@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -73,6 +74,7 @@ class SpotifyClient:
         self.markets = list(markets or DEFAULT_SPOTIFY_MARKETS)
         self._read_json = read_json or self._read_json_from_url
         self._access_token: str | None = None
+        self._token_lock = threading.Lock()
 
     def search_tracks(self, metadata: AudioMetadata) -> list[SpotifyTrackCandidate]:
         if not metadata.title:
@@ -271,14 +273,17 @@ class SpotifyClient:
     def _get_access_token(self) -> str:
         if self._access_token:
             return self._access_token
-        request = self._build_token_request()
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode("utf-8", "ignore"))
-        token = _stringify_tag_value(payload.get("access_token")) if isinstance(payload, dict) else None
-        if not token:
-            raise ValueError("Spotify token response did not include access_token")
-        self._access_token = token
-        return token
+        with self._token_lock:
+            if self._access_token:
+                return self._access_token
+            request = self._build_token_request()
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8", "ignore"))
+            token = _stringify_tag_value(payload.get("access_token")) if isinstance(payload, dict) else None
+            if not token:
+                raise ValueError("Spotify token response did not include access_token")
+            self._access_token = token
+            return token
 
     def _build_token_request(self) -> urllib.request.Request:
         if not self.credentials.client_id or not self.credentials.client_secret:

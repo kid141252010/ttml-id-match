@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import threading
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable
@@ -52,19 +53,22 @@ class AppleMusicClient:
         self._page_cache: dict[tuple[str, str], str] = {}
         self._track_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._json_cache: dict[str, dict[str, Any]] = {}
+        self._cache_lock = threading.RLock()
 
     def fetch_album_tracks(self, store: str, album_id: str) -> list[dict[str, Any]]:
         cache_key = (store, album_id)
-        if cache_key in self._track_cache:
-            return self._track_cache[cache_key]
+        with self._cache_lock:
+            cached = self._track_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         try:
             tracks = self._fetch_album_tracks_from_amp_api(store, album_id)
         except Exception:
             tracks = self._fetch_album_tracks_from_json_ld(store, album_id)
 
-        self._track_cache[cache_key] = tracks
-        return tracks
+        with self._cache_lock:
+            return self._track_cache.setdefault(cache_key, tracks)
 
     def search_songs(self, store: str, metadata: AudioMetadata) -> list[AppleMusicTrackCandidate]:
         query = _apple_music_search_query(metadata)
@@ -182,40 +186,49 @@ class AppleMusicClient:
         return tracks
 
     def _get_bearer_token(self, store: str, album_id: str | None = None) -> str:
-        if self._token:
-            return self._token
-        page = self._get_album_page(store, album_id) if album_id else self._get_search_page(store)
-        script_sources = re.findall(
-            r'<script[^>]+type=["\']module["\'][^>]+src=["\']([^"\']+)["\']',
-            page,
-            flags=re.IGNORECASE,
-        )
-        for source in script_sources:
-            script_url = urllib.parse.urljoin("https://music.apple.com/", html.unescape(source))
-            script = self._read_text(script_url)
-            match = re.search(r'eyJhbGciOiJ[^"\']+', script)
-            if match:
-                self._token = match.group(0)
+        with self._cache_lock:
+            if self._token:
                 return self._token
+            page = self._get_album_page(store, album_id) if album_id else self._get_search_page(store)
+            script_sources = re.findall(
+                r'<script[^>]+type=["\']module["\'][^>]+src=["\']([^"\']+)["\']',
+                page,
+                flags=re.IGNORECASE,
+            )
+            for source in script_sources:
+                script_url = urllib.parse.urljoin("https://music.apple.com/", html.unescape(source))
+                script = self._read_text(script_url)
+                match = re.search(r'eyJhbGciOiJ[^"\']+', script)
+                if match:
+                    self._token = match.group(0)
+                    return self._token
         raise LookupError("failed to find Apple Music bearer token")
 
     def _get_album_page(self, store: str, album_id: str) -> str:
         cache_key = (store, album_id)
-        if cache_key not in self._page_cache:
-            self._page_cache[cache_key] = self._read_text(
-                f"https://music.apple.com/{store}/album/{album_id}"
-            )
-        return self._page_cache[cache_key]
+        with self._cache_lock:
+            cached = self._page_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        page = self._read_text(f"https://music.apple.com/{store}/album/{album_id}")
+        with self._cache_lock:
+            return self._page_cache.setdefault(cache_key, page)
 
     def _get_search_page(self, store: str) -> str:
         cache_key = (store, "__search__")
-        if cache_key not in self._page_cache:
-            self._page_cache[cache_key] = self._read_text(f"https://music.apple.com/{store}/search")
-        return self._page_cache[cache_key]
+        with self._cache_lock:
+            cached = self._page_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        page = self._read_text(f"https://music.apple.com/{store}/search")
+        with self._cache_lock:
+            return self._page_cache.setdefault(cache_key, page)
 
     def _read_catalog_json(self, store: str, url: str, album_id: str | None = None) -> dict[str, Any]:
-        if url in self._json_cache:
-            return self._json_cache[url]
+        with self._cache_lock:
+            cached = self._json_cache.get(url)
+        if cached is not None:
+            return cached
         token = self._get_bearer_token(store, album_id)
         data = self._read_text(
             url,
@@ -228,8 +241,8 @@ class AppleMusicClient:
         payload = json.loads(data)
         if not isinstance(payload, dict):
             raise ValueError("Apple Music API returned a non-object payload")
-        self._json_cache[url] = payload
-        return payload
+        with self._cache_lock:
+            return self._json_cache.setdefault(url, payload)
 
     def _build_search_url(self, store: str, query: str, types: str, limit: int) -> str:
         params = urllib.parse.urlencode(

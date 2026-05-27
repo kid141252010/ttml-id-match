@@ -1,5 +1,6 @@
 param(
     [string]$TargetDir,
+    [int]$SearchWorkers = 3,
     [switch]$NoPause
 )
 
@@ -56,7 +57,12 @@ try {
         Exit-WithCode 1
     }
 
-    & python $pythonScript $resolvedTarget.Path --dry-run
+    if ($SearchWorkers -lt 1) {
+        Write-Host "[ERROR] SearchWorkers must be at least 1."
+        Exit-WithCode 1
+    }
+
+    & python $pythonScript $resolvedTarget.Path --dry-run --search-workers $SearchWorkers
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
         Write-Host "[ERROR] dry-run failed. Fix the errors above and try again."
@@ -68,7 +74,7 @@ try {
     if ($confirm -ieq "Y") {
         Write-Host ""
         Write-Host "[WRITE] Updating TTML files. The Python script will create .bak backups."
-        & python $pythonScript $resolvedTarget.Path
+        & python $pythonScript $resolvedTarget.Path --search-workers $SearchWorkers
         if ($LASTEXITCODE -ne 0) {
             Write-Host ""
             Write-Host "[ERROR] write failed. Fix the errors above and try again."

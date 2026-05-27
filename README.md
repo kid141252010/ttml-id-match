@@ -30,6 +30,7 @@ python fill_ttml_metadata.py --help
 - 写入前自动生成 `.bak` 备份。
 - 处理主语言为 `xml:lang="zh-Hant"` 的 TTML 时，会先自动改为 `zh-Hans`，并把歌词正文转换为简体。
 - 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album`、`appleMusicId`、`isrc` 填充 Apple Music、QQ 音乐、网易云音乐和 Spotify ID。
+- 批量模式的网络搜索默认一次并行处理 3 个文件；如果遇到限流或需要复现旧式串行行为，可以用 `--search-workers 1` 降级。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会在 `cn`、`us`、`kr`、`jp`、`tw` 五个区域执行 Apple Music 匹配；已有 `ITUNESCATALOGID` 或 TTML `appleMusicId` 仍会保留并继续搜索其它区域候选。
@@ -95,6 +96,12 @@ python fill_ttml_metadata.py example --dry-run
 python fill_ttml_metadata.py example
 ```
 
+如果网络服务限流，或想把批量搜索改回单文件串行，可以加：
+
+```powershell
+python fill_ttml_metadata.py example --dry-run --search-workers 1
+```
+
 ## Windows 交互脚本
 
 仓库根目录提供 `fill_metadata.bat`，适合在 Windows 上双击或从 CMD/PowerShell 里运行。
@@ -117,7 +124,7 @@ PowerShell 里运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
 ```
 
-交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。真实写入阶段会分别汇总 Apple Music、QQ 音乐、网易云音乐和 Spotify 最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择；Apple Music 和 Spotify 会按区域/市场分别选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
+交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。默认会把 `-SearchWorkers 3` 传给 Python 脚本；需要串行搜索时可传 `-SearchWorkers 1`。真实写入阶段会分别汇总 Apple Music、QQ 音乐、网易云音乐和 Spotify 最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择；Apple Music 和 Spotify 会按区域/市场分别选择。真实写入仍由 Python 脚本生成 `.bak` 备份。脚本不会自动安装依赖，如果缺少 Python 依赖，请先按上面的环境要求执行 `python -m pip install -r requirements.txt`。
 
 ## 单首文件处理
 
@@ -240,7 +247,7 @@ dry-run 会展示每首歌的最佳 QQ 候选但不询问。真实写入时先�
 
 网易云音乐查找会在 QQ 音乐候选确认后执行。脚本先用歌名搜索网易云，再用已确认的 QQ 音乐候选补充歌名、歌手和专辑线索；如果有歌手和专辑，会额外走网易云歌手专辑回查。匹配前会把繁体和简体文本统一到简体比较，因此 `浪費眼淚` 和 `浪费眼泪` 会被视为同一歌名，但写入 TTML 时仍保留原始返回文本。
 
-脚本按网易云 API 文档的搜索参数并发请求以下公开 API，固定使用单曲搜索第一页最多 100 条候选。优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API。直接歌名搜索会同时尝试原歌名和繁简归一后的歌名：
+脚本按网易云 API 文档的搜索参数并发请求以下公开 API，固定使用单曲搜索第一页最多 100 条候选。优先使用最快返回且能解析出候选的结果；最快响应失败或没有候选时，会继续等待其它 API。这里的 3 个 API 基址并发是每首歌内部的竞速，不是全局 HTTP 请求上限；批量模式还会受 `--search-workers` 控制。直接歌名搜索会同时尝试原歌名和繁简归一后的歌名：
 
 ```text
 https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1

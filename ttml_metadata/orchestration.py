@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 from pathlib import Path
 
 from .apple_music import (
@@ -145,13 +146,30 @@ def _process_pair(
 def _collect_ncm_music_metadata_for_pairs(
     pairs: list[PairMetadata],
     ncm_music_client: NCMusicClientProtocol,
+    max_workers: int = 1,
 ) -> None:
-    for pair in pairs:
-        pair.ncm_music_metadata = collect_ncm_music_metadata(
-            pair.metadata,
-            ncm_music_client,
-            qq_music_candidate=pair.qq_music_metadata.selected,
-        )
+    if max_workers <= 1 or len(pairs) <= 1:
+        for pair in pairs:
+            pair.ncm_music_metadata = collect_ncm_music_metadata(
+                pair.metadata,
+                ncm_music_client,
+                qq_music_candidate=pair.qq_music_metadata.selected,
+            )
+        return
+
+    worker_count = min(max_workers, len(pairs))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                collect_ncm_music_metadata,
+                pair.metadata,
+                ncm_music_client,
+                qq_music_candidate=pair.qq_music_metadata.selected,
+            ): pair
+            for pair in pairs
+        }
+        for future in concurrent.futures.as_completed(futures):
+            futures[future].ncm_music_metadata = future.result()
 
 
 def _process_prepared_pair(
