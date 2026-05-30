@@ -462,3 +462,42 @@ python -B fill_ttml_metadata.py example --dry-run
 此仓库使用 **GNU Affero General Public License v3.0（AGPLv3）** 授权。
 
 如果你分发、修改、部署或通过网络提供本仓库代码产生的服务，需要遵守 AGPLv3 的源代码开放要求。仓库的 [LICENSE](https://github.com/kid141252010/ttml-id-match/blob/main/LICENSE) 文件已包含 AGPLv3 全文。
+
+## Web GUI
+
+仓库现在包含一个前后端分离的 Web 骨架：
+
+- 后端：FastAPI，入口为 `server.main:app`。
+- 前端：Vue 3 + Vite + Naive UI，目录为 `web/`。
+- 前端默认请求 `/api`，开发时由 Vite 代理到 `http://127.0.0.1:8000`。
+
+安装依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+cd web
+npm install
+```
+
+启动后端：
+
+```powershell
+uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+启动前端：
+
+```powershell
+cd web
+npm run dev
+```
+
+打开 `http://127.0.0.1:5173`。上传 TTML-only 文件时，TTML 中需要已有 `musicName`，否则后端会沿用 CLI 规则拒绝搜索；上传同名音频后会走音频标签读取路径。
+
+前端也保留 mock 模式，适合只看界面：
+
+```powershell
+cd web
+$env:VITE_USE_MOCK_API="1"
+npm run dev
+```
