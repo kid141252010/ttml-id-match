@@ -27,10 +27,11 @@ python fill_ttml_metadata.py --help
 
 - 追加缺失的元数据值，不覆盖已有真实值，重复值会跳过。
 - `value="*"` 或空值会被视为占位符并替换。
-- 写入前自动生成 `.bak` 备份。
+- 写入前会校验更新后的 TTML 是否仍是有效 XML，校验通过后才生成 `.bak` 备份并替换原文件，避免半写坏文件。
 - 处理主语言为 `xml:lang="zh-Hant"` 的 TTML 时，会先自动改为 `zh-Hans`，并把歌词正文转换为简体。
 - 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album`、`appleMusicId`、`isrc` 填充 Apple Music、QQ 音乐、网易云音乐和 Spotify ID。
 - 批量模式的网络搜索默认一次并行处理 3 个文件；如果遇到限流或需要复现旧式串行行为，可以用 `--search-workers 1` 降级。
+- Apple Music、QQ 音乐、网易云音乐和 Spotify 的网络请求默认会对临时网络错误、HTTP 408/429 和 5xx 响应重试最多 3 次；单个来源重试耗尽会显示 `lookup warning:`，不会阻止其它来源已确认或自动选中的元数据继续写入。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
 - 会在 `cn`、`us`、`kr`、`jp`、`tw` 五个区域执行 Apple Music 匹配；已有 `ITUNESCATALOGID` 或 TTML `appleMusicId` 仍会保留并继续搜索其它区域候选。

@@ -22,6 +22,7 @@ from .models import (
     _NCMusicAlbumCandidate,
     _NCMusicArtistCandidate,
 )
+from .network import urlopen_with_retry
 from .text_utils import (
     _add_text_with_simplified_variants,
     _add_unique_value,
@@ -182,7 +183,7 @@ class NCMusicClient:
                 "User-Agent": "Mozilla/5.0",
             },
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         if not isinstance(payload, dict):
             raise ValueError("NCM API returned a non-object payload")

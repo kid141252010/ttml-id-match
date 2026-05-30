@@ -27,6 +27,7 @@ from .models import (
     _SpotifyAlbumCandidate,
     _SpotifyArtistCandidate,
 )
+from .network import urlopen_with_retry
 from .text_utils import (
     _add_unique_value,
     _duration_close,
@@ -277,7 +278,7 @@ class SpotifyClient:
             if self._access_token:
                 return self._access_token
             request = self._build_token_request()
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen_with_retry(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8", "ignore"))
             token = _stringify_tag_value(payload.get("access_token")) if isinstance(payload, dict) else None
             if not token:
@@ -360,7 +361,7 @@ class SpotifyClient:
                 "User-Agent": "Mozilla/5.0",
             },
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         if not isinstance(payload, dict):
             raise ValueError("Spotify API returned a non-object payload")

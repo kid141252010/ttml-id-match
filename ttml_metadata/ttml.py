@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable
@@ -53,10 +54,21 @@ def update_ttml_metadata(
         metadata = _apply_meta_values(metadata, amll_prefix, key, proposed_values, result)
 
     if result.changed and not dry_run:
-        backup_path = _ensure_backup(path, backup_paths)
-        result.backup_path = backup_path
         output = text[:metadata_start] + metadata + text[metadata_end:]
-        path.write_text(output, encoding="utf-8")
+        try:
+            ET.fromstring(output)
+        except ET.ParseError as exc:
+            raise ValueError(f"updated TTML is not valid XML: {exc}") from exc
+
+        temp_path = _write_temp_text(path, output)
+        try:
+            backup_path = _ensure_backup(path, backup_paths)
+            result.backup_path = backup_path
+            temp_path.replace(path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
     return result
 
@@ -397,3 +409,14 @@ def _backup_path(path: Path) -> Path:
         if not numbered.exists():
             return numbered
         counter += 1
+
+
+def _write_temp_text(path: Path, text: str) -> Path:
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        delete=False,
+    ) as temp_file:
+        temp_file.write(text)
+        return Path(temp_file.name)

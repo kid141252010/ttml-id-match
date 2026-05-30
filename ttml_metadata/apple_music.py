@@ -24,6 +24,7 @@ from .models import (
     _AppleMusicAlbumCandidate,
     _AppleMusicArtistCandidate,
 )
+from .network import urlopen_with_retry
 from .text_utils import (
     _add_unique_list_value,
     _add_unique_value,
@@ -275,7 +276,7 @@ class AppleMusicClient:
         if headers:
             request_headers.update(headers)
         request = urllib.request.Request(url, headers=request_headers)
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout) as response:
             return response.read().decode("utf-8", "ignore")
 
     @staticmethod

@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .console import _safe_print
 from .models import AudioMetadata, PairMetadata, QQMusicCandidate, QQMusicClientProtocol, QQMusicSearchResult
+from .network import urlopen_with_retry
 from .text_utils import _add_unique_value, _nested_get, _same_raw_text, _stringify_tag_value, _text_match_score, split_artists
 
 class QQMusicClient:
@@ -15,7 +16,7 @@ class QQMusicClient:
 
     def search_songs(self, query: str) -> list[QQMusicCandidate]:
         request = self._build_search_request(query)
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         return _parse_qq_music_candidates(payload)
 

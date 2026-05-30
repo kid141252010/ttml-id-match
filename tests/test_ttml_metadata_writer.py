@@ -2,9 +2,10 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO, TextIOWrapper
+from io import BytesIO, StringIO, TextIOWrapper
 import base64
 import json
 import os
@@ -14,6 +15,7 @@ from unittest.mock import patch
 from fill_ttml_metadata import (
     AudioMetadata,
     AppleMusicMetadataResult,
+    AppleMusicClient,
     AppleMusicTrackCandidate,
     DEFAULT_STORES,
     DEFAULT_SPOTIFY_MARKETS,
@@ -64,6 +66,20 @@ from fill_ttml_metadata import (
 )
 
 
+class FakeHttpResponse:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self) -> bytes:
+        return self.payload
+
+
 REFERENCE_STYLE_TTML = (
     '<tt xmlns="http://www.w3.org/ns/ttml" '
     'xmlns:ttm="http://www.w3.org/ns/ttml#metadata" '
@@ -79,6 +95,77 @@ REFERENCE_STYLE_TTML = (
     '<body dur="01:00.000"><div><p begin="00:00.000" end="00:01.000">x</p></div></body>'
     '</tt>'
 )
+
+
+class NetworkRetryTests(unittest.TestCase):
+    def test_retry_call_returns_after_transient_url_error(self) -> None:
+        from ttml_metadata.network import retry_call
+
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError("temporary outage")
+            return "ok"
+
+        result = retry_call(operation, sleep_func=lambda delay: None)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts, 2)
+
+    def test_retry_call_retries_http_429_and_500(self) -> None:
+        from ttml_metadata.network import retry_call
+
+        errors = [
+            urllib.error.HTTPError("https://example.invalid", 429, "rate limited", {}, BytesIO()),
+            urllib.error.HTTPError("https://example.invalid", 500, "server error", {}, BytesIO()),
+        ]
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= len(errors):
+                raise errors[attempts - 1]
+            return "ok"
+
+        result = retry_call(operation, sleep_func=lambda delay: None)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts, 3)
+
+    def test_retry_call_does_not_retry_http_404(self) -> None:
+        from ttml_metadata.network import retry_call
+
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            raise urllib.error.HTTPError("https://example.invalid", 404, "not found", {}, BytesIO())
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            retry_call(operation, sleep_func=lambda delay: None)
+
+        raised.exception.close()
+        self.assertEqual(attempts, 1)
+
+    def test_retry_call_raises_last_error_after_attempts(self) -> None:
+        from ttml_metadata.network import retry_call
+
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            raise urllib.error.URLError(f"temporary outage {attempts}")
+
+        with self.assertRaisesRegex(urllib.error.URLError, "temporary outage 3"):
+            retry_call(operation, sleep_func=lambda delay: None)
+
+        self.assertEqual(attempts, 3)
 
 
 class TtmlMetadataWriterTests(unittest.TestCase):
@@ -227,6 +314,21 @@ class TtmlMetadataWriterTests(unittest.TestCase):
 
             self.assertEqual(path.read_text(encoding="utf-8"), text)
 
+    def test_invalid_updated_ttml_is_not_written_or_backed_up(self) -> None:
+        text = (
+            '<tt xmlns="http://www.w3.org/ns/ttml" '
+            'xmlns:amll="http://www.example.com/ns/amll">'
+            "<head><metadata></metadata></head><body><p></body></tt>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_ttml(text, Path(tmp))
+
+            with self.assertRaisesRegex(ValueError, "updated TTML is not valid XML"):
+                update_ttml_metadata(path, {"musicName": ["Song"]}, dry_run=False)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            self.assertFalse(path.with_suffix(path.suffix + ".bak").exists())
+
     def test_missing_amll_namespace_adds_namespace_to_root_tt(self) -> None:
         text = (
             '<tt xmlns="http://www.w3.org/ns/ttml">'
@@ -288,6 +390,22 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         values = values_from_metadata(AudioMetadata(title="I Ask", artists=["Sān-Z & HOYO-MiX"]))
 
         self.assertEqual(values["artists"], ["Sān-Z", "HOYO-MiX"])
+
+    def test_apple_music_read_text_retries_transient_urlopen_error(self) -> None:
+        attempts = 0
+
+        def fake_urlopen(request, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError("connection reset")
+            return FakeHttpResponse(b"apple page")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            text = AppleMusicClient(timeout=1)._read_text("https://music.apple.com/us/search")
+
+        self.assertEqual(text, "apple page")
+        self.assertEqual(attempts, 2)
 
     def test_collects_metadata_from_all_default_storefronts_without_stopping_at_first_match(self) -> None:
         class RecordingClient:
@@ -952,6 +1070,39 @@ class QQMusicMetadataTests(unittest.TestCase):
             },
         )
 
+    def test_qq_music_search_retries_transient_urlopen_error(self) -> None:
+        attempts = 0
+        payload = {
+            "req": {
+                "data": {
+                    "body": {
+                        "item_song": [
+                            {
+                                "id": 224116257,
+                                "mid": "001hrIGe3flaPr",
+                                "name": "玫瑰少年",
+                                "singer": [{"name": "蔡依林"}],
+                                "album": {"name": "UGLY BEAUTY"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+        def fake_urlopen(request, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError("temporary outage")
+            return FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            candidates = QQMusicClient(timeout=1).search_songs("玫瑰少年")
+
+        self.assertEqual([candidate.song_id for candidate in candidates], ["224116257"])
+        self.assertEqual(attempts, 2)
+
     def test_parses_qq_music_candidates_from_item_song_and_requires_id_and_mid(self) -> None:
         payload = {
             "req": {
@@ -1146,6 +1297,28 @@ class NCMusicMetadataTests(unittest.TestCase):
         candidates = client.search_songs("玫瑰少年")
 
         self.assertEqual([candidate.song_id for candidate in candidates], ["2"])
+
+    def test_ncm_search_retries_transient_urlopen_error(self) -> None:
+        attempts = 0
+        payload = {"result": {"songs": [{"id": 224116257, "name": "玫瑰少年"}]}}
+
+        def fake_urlopen(request, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError("temporary outage")
+            return FakeHttpResponse(json.dumps(payload).encode("utf-8"))
+
+        client = NCMusicClient(
+            timeout=1,
+            api_bases=["https://music163.example"],
+        )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            candidates = client.search_songs(NCMusicSearchContext(titles=["玫瑰少年"]))
+
+        self.assertEqual([candidate.song_id for candidate in candidates], ["224116257"])
+        self.assertEqual(attempts, 2)
 
     def test_ncm_search_url_uses_documented_single_song_search_window(self) -> None:
         url = NCMusicClient._build_search_url("https://music163.example", "玫瑰少年")
@@ -1585,6 +1758,42 @@ class SpotifyMetadataTests(unittest.TestCase):
         auth_scheme, auth_value = request.get_header("Authorization").split(" ", 1)
         self.assertEqual(auth_scheme, "Basic")
         self.assertEqual(base64.b64decode(auth_value).decode("utf-8"), "client-id:client-secret")
+
+    def test_spotify_token_request_retries_transient_urlopen_error(self) -> None:
+        attempts = 0
+        token_payload = json.dumps({"access_token": "token"}).encode("utf-8")
+        client = SpotifyClient(SpotifyCredentials("client-id", "client-secret"), timeout=1)
+
+        def fake_urlopen(request, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError("temporary outage")
+            return FakeHttpResponse(token_payload)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            token = client._get_access_token()
+
+        self.assertEqual(token, "token")
+        self.assertEqual(attempts, 2)
+
+    def test_spotify_api_json_request_retries_transient_urlopen_error(self) -> None:
+        attempts = 0
+        api_payload = json.dumps({"tracks": {"items": []}}).encode("utf-8")
+        client = SpotifyClient(SpotifyCredentials("client-id", "client-secret"), timeout=1)
+
+        def fake_urlopen(request, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError("temporary outage")
+            return FakeHttpResponse(api_payload)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            payload = client._read_json_from_url("https://api.spotify.com/v1/search?q=song", "token")
+
+        self.assertEqual(payload, {"tracks": {"items": []}})
+        self.assertEqual(attempts, 2)
 
     def test_spotify_search_queries_prefer_loose_candidate_pool_before_strict_metadata_query(self) -> None:
         queries = _spotify_search_queries(
@@ -2416,6 +2625,36 @@ class SpotifyMetadataTests(unittest.TestCase):
         self.assertIn("spotifyBest: US: Amazing Grace - G.E.M. - Amazing Grace [same-id], KR: 어메이징 그레이스 - G.E.M. - 어메이징 그레이스 [same-id]", output)
         self.assertIn("spotifyId: same-id", output)
         self.assertNotIn("spotifyId: same-id, same-id", output)
+
+    def test_process_prepared_pair_writes_successful_source_when_another_source_warns(self) -> None:
+        qq_result = QQMusicSearchResult(
+            candidates=[QQMusicCandidate("224116257", "001hrIGe3flaPr", "玫瑰少年", "", ["蔡依林"], "UGLY BEAUTY", 0)],
+            selected=QQMusicCandidate("224116257", "001hrIGe3flaPr", "玫瑰少年", "", ["蔡依林"], "UGLY BEAUTY", 0),
+            errors=["QQ 音乐搜索曾短暂失败后恢复"],
+        )
+        apple_result = AppleMusicMetadataResult(errors=["Apple Music 搜索失败: temporary outage"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song.ttml"
+            path.write_text(REFERENCE_STYLE_TTML, encoding="utf-8")
+            pair = PairMetadata(
+                Path("song.flac"),
+                path,
+                AudioMetadata(title="玫瑰少年"),
+                apple_result,
+                qq_result,
+                NCMusicSearchResult(),
+                SpotifySearchResult(),
+            )
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                _process_prepared_pair(pair, dry_run=False)
+
+            after = path.read_text(encoding="utf-8")
+
+        self.assertIn('<amll:meta key="qqMusicId" value="224116257"/>', after)
+        self.assertIn("lookup warning: Apple Music 搜索失败: temporary outage", stdout.getvalue())
+        self.assertIn("lookup warning: QQ 音乐搜索曾短暂失败后恢复", stdout.getvalue())
 
     def test_main_dry_run_skips_spotify_when_credentials_are_missing(self) -> None:
         class NoAppleLookupClient:
