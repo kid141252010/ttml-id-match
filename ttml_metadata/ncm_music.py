@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable
 
-from .console import _safe_print
+from .console import _safe_print, _color_text
 from .models import (
     DEFAULT_NCM_API_BASES,
     NCM_ARTIST_ALBUM_LIMIT,
@@ -232,14 +232,27 @@ def confirm_ncm_music_candidates(
     if dry_run or not available:
         return
 
+    use_color = (print_func is _safe_print) and (input_func is input)
+
     print_func("")
-    print_func("网易云音乐最佳候选：")
+    header_text = "网易云音乐最佳候选："
+    if use_color:
+        header_text = _color_text(header_text, "header")
+    print_func(header_text)
+
     for pair in available:
         best = pair.ncm_music_metadata.candidates[0]
-        print_func(f"  {pair.ttml_path.name}: {_format_ncm_music_candidate(best)}")
+        cand_str = _format_ncm_music_candidate(best)
+        if use_color:
+            cand_str = _color_text(cand_str, "highlight")
+        print_func(f"  {pair.ttml_path.name}:")
+        print_func(f"    - {cand_str}")
 
     while True:
-        answer = input_func("Accept all NetEase Cloud Music best candidates? Type Y to accept, N to choose alternatives: ").strip()
+        prompt_text = "Accept all NetEase Cloud Music best candidates? Type Y to accept, N to choose alternatives: "
+        if use_color:
+            prompt_text = _color_text(prompt_text, "prompt")
+        answer = input_func(prompt_text).strip()
         if answer.casefold() in {"y", "n"}:
             break
         print_func("Please type Y or N.")
@@ -250,11 +263,21 @@ def confirm_ncm_music_candidates(
     for pair in available:
         options = pair.ncm_music_metadata.candidates[:5]
         print_func("")
-        print_func(f"{pair.ttml_path.name} 网易云音乐候选：")
+        cand_title = f"{pair.ttml_path.name} 网易云音乐候选："
+        if use_color:
+            cand_title = _color_text(cand_title, "info")
+        print_func(cand_title)
+
         for index, candidate in enumerate(options, start=1):
-            print_func(f"  {index}. {_format_ncm_music_candidate(candidate)}")
+            idx_str = f"  {index}."
+            if use_color:
+                idx_str = _color_text(idx_str, "info")
+            print_func(f"{idx_str} {_format_ncm_music_candidate(candidate)}")
         while True:
-            answer = input_func("Select 1-5, or press Enter to skip this song: ").strip()
+            sel_prompt = "Select 1-5, or press Enter to skip this song: "
+            if use_color:
+                sel_prompt = _color_text(sel_prompt, "prompt")
+            answer = input_func(sel_prompt).strip()
             if not answer:
                 pair.ncm_music_metadata.selected = None
                 break

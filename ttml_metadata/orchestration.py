@@ -5,13 +5,13 @@ from pathlib import Path
 
 from .apple_music import (
     _apple_music_storefront_top_candidates,
-    _format_apple_music_candidate_list,
+    _format_apple_music_candidate,
     _merge_apple_music_metadata,
     collect_apple_music_metadata,
     confirm_apple_music_candidates,
 )
 from .audio import read_audio_metadata
-from .console import _safe_print
+from .console import _safe_print, _color_text
 from .models import (
     AppleMusicClientProtocol,
     AppleMusicTrackCandidate,
@@ -29,7 +29,7 @@ from .models import (
 )
 from .ncm_music import NCMusicClient, _format_ncm_music_candidate, _merge_ncm_music_metadata, collect_ncm_music_metadata, confirm_ncm_music_candidates
 from .qq_music import QQMusicClient, _format_qq_music_candidate, _merge_qq_music_metadata, collect_qq_music_metadata, confirm_qq_music_candidates
-from .spotify import _format_spotify_candidate_list, _merge_spotify_metadata, _unique_spotify_ids, collect_spotify_metadata
+from .spotify import _format_spotify_candidate, _merge_spotify_metadata, _unique_spotify_ids, collect_spotify_metadata
 from .text_utils import _add_unique_value, split_artists
 from .ttml import read_ttml_metadata, update_ttml_metadata
 
@@ -195,42 +195,93 @@ def _process_prepared_pair(
     status = "dry-run" if dry_run else "updated"
     if not result.changed:
         status = "unchanged"
-    _safe_print(f"[{status}] {ttml_path.name}")
+    status_colored = _color_text(f"[{status}]", status)
+    _safe_print(f"{status_colored} {ttml_path.name}")
     _safe_print(f"  audio: {audio_path.name if audio_path else '-'}")
-    _safe_print(
-        "  appleMusicBest: "
-        + (_format_apple_music_candidate_list(_apple_music_storefront_top_candidates(apple_music_metadata)) or "-")
-    )
-    _safe_print(f"  appleMusicId: {', '.join(apple_music_metadata.values.get('appleMusicId', [])) or '-'}")
-    _safe_print(f"  appleMusicSources: {', '.join(apple_music_metadata.sources) or '-'}")
+
+    # Apple Music Best
+    am_best = _apple_music_storefront_top_candidates(apple_music_metadata)
+    if not am_best:
+        _safe_print("  appleMusicBest: -")
+    else:
+        _safe_print("  appleMusicBest:")
+        for candidate in am_best:
+            _safe_print(f"    - {_format_apple_music_candidate(candidate)}")
+
+    # Apple Music ID
+    am_ids = apple_music_metadata.values.get('appleMusicId', [])
+    if not am_ids:
+        _safe_print("  appleMusicId: -")
+    elif len(am_ids) == 1:
+        _safe_print(f"  appleMusicId: {am_ids[0]}")
+    else:
+        _safe_print("  appleMusicId:")
+        for item_id in am_ids:
+            _safe_print(f"    - {item_id}")
+
+    # Apple Music Sources
+    am_sources = apple_music_metadata.sources
+    if not am_sources:
+        _safe_print("  appleMusicSources: -")
+    elif len(am_sources) == 1:
+        _safe_print(f"  appleMusicSources: {am_sources[0]}")
+    else:
+        _safe_print("  appleMusicSources:")
+        for src in am_sources:
+            _safe_print(f"    - {src}")
+
     if apple_music_metadata.errors:
         for error in apple_music_metadata.errors:
-            _safe_print(f"  lookup warning: {error}")
-    best = qq_music_metadata.candidates[0] if qq_music_metadata.candidates else None
-    _safe_print(f"  qqMusicBest: {_format_qq_music_candidate(best) if best else '-'}")
-    selected = qq_music_metadata.selected
-    _safe_print(f"  qqMusicId: {', '.join([selected.song_id, selected.mid]) if selected else '-'}")
+            _safe_print(f"  {_color_text('lookup warning:', 'warning')} {error}")
+
+    # QQ Music
+    best_qq = qq_music_metadata.candidates[0] if qq_music_metadata.candidates else None
+    _safe_print(f"  qqMusicBest: {_format_qq_music_candidate(best_qq) if best_qq else '-'}")
+    selected_qq = qq_music_metadata.selected
+    if not selected_qq:
+        _safe_print("  qqMusicId: -")
+    else:
+        _safe_print("  qqMusicId:")
+        _safe_print(f"    - {selected_qq.song_id}")
+        _safe_print(f"    - {selected_qq.mid}")
+
     if qq_music_metadata.errors:
         for error in qq_music_metadata.errors:
-            _safe_print(f"  lookup warning: {error}")
-    best = ncm_music_metadata.candidates[0] if ncm_music_metadata.candidates else None
-    _safe_print(f"  ncmMusicBest: {_format_ncm_music_candidate(best) if best else '-'}")
+            _safe_print(f"  {_color_text('lookup warning:', 'warning')} {error}")
+
+    # NetEase Cloud Music
+    best_ncm = ncm_music_metadata.candidates[0] if ncm_music_metadata.candidates else None
+    _safe_print(f"  ncmMusicBest: {_format_ncm_music_candidate(best_ncm) if best_ncm else '-'}")
     selected_ncm = ncm_music_metadata.selected
     _safe_print(f"  ncmMusicId: {selected_ncm.song_id if selected_ncm else '-'}")
+
     if ncm_music_metadata.errors:
         for error in ncm_music_metadata.errors:
-            _safe_print(f"  lookup warning: {error}")
-    _safe_print(
-        "  spotifyBest: "
-        + (_format_spotify_candidate_list(spotify_metadata.selected) or "-")
-    )
-    _safe_print(
-        "  spotifyId: "
-        + (", ".join(_unique_spotify_ids(spotify_metadata.selected)) or "-")
-    )
+            _safe_print(f"  {_color_text('lookup warning:', 'warning')} {error}")
+
+    # Spotify Best
+    if not spotify_metadata.selected:
+        _safe_print("  spotifyBest: -")
+    else:
+        _safe_print("  spotifyBest:")
+        for candidate in spotify_metadata.selected:
+            _safe_print(f"    - {_format_spotify_candidate(candidate)}")
+
+    # Spotify ID
+    sp_ids = _unique_spotify_ids(spotify_metadata.selected)
+    if not sp_ids:
+        _safe_print("  spotifyId: -")
+    elif len(sp_ids) == 1:
+        _safe_print(f"  spotifyId: {sp_ids[0]}")
+    else:
+        _safe_print("  spotifyId:")
+        for s_id in sp_ids:
+            _safe_print(f"    - {s_id}")
+
     if spotify_metadata.errors:
         for error in spotify_metadata.errors:
-            _safe_print(f"  lookup warning: {error}")
+            _safe_print(f"  {_color_text('lookup warning:', 'warning')} {error}")
+
     _print_change_group("added", result.added)
     _print_change_group("replaced", result.replaced)
     _print_change_group("skipped", result.skipped)
@@ -247,7 +298,8 @@ def _print_language_normalization_result(
         return
 
     status = "dry-run" if dry_run else "normalized"
-    _safe_print(f"[{status}] {ttml_path.name}")
+    status_colored = _color_text(f"[{status}]", status)
+    _safe_print(f"{status_colored} {ttml_path.name}")
     if result.language_changed:
         _safe_print("  language: zh-Hant -> zh-Hans")
     if result.body_text_changed:
@@ -261,6 +313,12 @@ def _print_language_normalization_result(
 
 
 def _print_change_group(label: str, changes: dict[str, list[str]]) -> None:
+    colors = {
+        "added": "updated",
+        "replaced": "skip",
+        "skipped": "unchanged",
+    }
+    color_key = colors.get(label, "reset")
     for key, values in changes.items():
         joined = ", ".join(values)
-        _safe_print(f"  {label}: {key} = {joined}")
+        _safe_print(f"  {_color_text(label, color_key)}: {key} = {joined}")

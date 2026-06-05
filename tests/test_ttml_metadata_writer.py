@@ -2622,7 +2622,9 @@ class SpotifyMetadataTests(unittest.TestCase):
                 _process_prepared_pair(pair, dry_run=True)
 
         output = stdout.getvalue()
-        self.assertIn("spotifyBest: US: Amazing Grace - G.E.M. - Amazing Grace [same-id], KR: 어메이징 그레이스 - G.E.M. - 어메이징 그레이스 [same-id]", output)
+        self.assertIn("spotifyBest:", output)
+        self.assertIn("    - US: Amazing Grace - G.E.M. - Amazing Grace [same-id]", output)
+        self.assertIn("    - KR: 어메이징 그레이스 - G.E.M. - 어메이징 그레이스 [same-id]", output)
         self.assertIn("spotifyId: same-id", output)
         self.assertNotIn("spotifyId: same-id, same-id", output)
 

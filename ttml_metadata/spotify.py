@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .console import _safe_print
+from .console import _safe_print, _color_text
 from .models import (
     DEFAULT_SPOTIFY_MARKETS,
     SPOTIFY_ARTIST_ALBUM_LIMIT,
@@ -436,14 +436,32 @@ def confirm_spotify_candidates(
     if dry_run or not available:
         return
 
+    use_color = (print_func is _safe_print) and (input_func is input)
+
     print_func("")
-    print_func("Spotify 最佳候选：")
+    header_text = "Spotify 最佳候选："
+    if use_color:
+        header_text = _color_text(header_text, "header")
+    print_func(header_text)
+
     for pair in available:
         best = _spotify_market_best_candidates(pair.spotify_metadata, pair.metadata)
-        print_func(f"  {pair.ttml_path.name}: {_format_spotify_candidate_list(best)}")
+        if not best:
+            cand_str = _color_text("-", "unchanged") if use_color else "-"
+            print_func(f"  {pair.ttml_path.name}: {cand_str}")
+        else:
+            print_func(f"  {pair.ttml_path.name}:")
+            for candidate in best:
+                cand_str = _format_spotify_candidate(candidate)
+                if use_color:
+                    cand_str = _color_text(cand_str, "highlight")
+                print_func(f"    - {cand_str}")
 
     while True:
-        answer = input_func("Accept all Spotify best candidates? Type Y to accept, N to choose alternatives: ").strip()
+        prompt_text = "Accept all Spotify best candidates? Type Y to accept, N to choose alternatives: "
+        if use_color:
+            prompt_text = _color_text(prompt_text, "prompt")
+        answer = input_func(prompt_text).strip()
         if answer.casefold() in {"y", "n"}:
             break
         print_func("Please type Y or N.")
@@ -454,7 +472,11 @@ def confirm_spotify_candidates(
     for pair in available:
         selected: list[SpotifyTrackCandidate] = []
         print_func("")
-        print_func(f"{pair.ttml_path.name} Spotify 候选：")
+        cand_title = f"{pair.ttml_path.name} Spotify 候选："
+        if use_color:
+            cand_title = _color_text(cand_title, "info")
+        print_func(cand_title)
+
         market_groups = pair.spotify_metadata.candidates_by_market or _spotify_candidates_grouped_by_market(
             pair.spotify_metadata.candidates
         )
@@ -462,11 +484,21 @@ def confirm_spotify_candidates(
             options = market_groups.get(market, [])[:5]
             if not options:
                 continue
-            print_func(f"  {market} Spotify 候选：")
+            market_title = f"  {market} Spotify 候选："
+            if use_color:
+                market_title = _color_text(market_title, "info")
+            print_func(market_title)
+
             for index, candidate in enumerate(options, start=1):
-                print_func(f"    {index}. {_format_spotify_candidate(candidate)}")
+                idx_str = f"    {index}."
+                if use_color:
+                    idx_str = _color_text(idx_str, "info")
+                print_func(f"{idx_str} {_format_spotify_candidate(candidate)}")
             while True:
-                answer = input_func(f"Select {market} 1-5, or press Enter to skip this market: ").strip()
+                sel_prompt = f"Select {market} 1-5, or press Enter to skip this market: "
+                if use_color:
+                    sel_prompt = _color_text(sel_prompt, "prompt")
+                answer = input_func(sel_prompt).strip()
                 if not answer:
                     break
                 if answer.isdigit() and 1 <= int(answer) <= len(options):

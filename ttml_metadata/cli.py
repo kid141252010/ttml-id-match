@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .apple_music import AppleMusicClient, confirm_apple_music_candidates
-from .console import _safe_print
+from .console import _safe_print, _color_text
 from .models import AUDIO_EXTENSIONS, PairMetadata, WorkItem
 from .ncm_music import NCMusicClient, confirm_ncm_music_candidates
 from .orchestration import _collect_ncm_music_metadata_for_pairs, _prepare_work_item, _print_language_normalization_result, _process_prepared_pair
@@ -101,7 +101,7 @@ def _prepare_work_items(
         if error is None:
             continue
         failures += 1
-        _safe_print(f"[error] {work_items[index].ttml_path.name}: {error}", file=sys.stderr)
+        _safe_print(f"{_color_text('[error]', 'error')} {work_items[index].ttml_path.name}: {error}", file=sys.stderr)
 
     return [pair for pair in prepared if pair is not None], failures
 
@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         work_items, warnings = find_directory_work_items(directory)
 
     for warning in warnings:
-        _safe_print(f"[skip] {warning}")
+        _safe_print(f"{_color_text('[skip]', 'skip')} {warning}")
 
     apple_music_client = AppleMusicClient()
     qq_music_client = QQMusicClient()
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_language_normalization_result(work_item.ttml_path, normalization, dry_run=args.dry_run)
         except Exception as exc:
             failures += 1
-            _safe_print(f"[error] {work_item.ttml_path.name}: {exc}", file=sys.stderr)
+            _safe_print(f"{_color_text('[error]', 'error')} {work_item.ttml_path.name}: {exc}", file=sys.stderr)
             continue
         searchable_work_items.append(work_item)
 
@@ -178,6 +178,6 @@ def main(argv: list[str] | None = None) -> int:
             _process_prepared_pair(pair, dry_run=args.dry_run, backup_paths=backup_paths)
         except Exception as exc:
             failures += 1
-            _safe_print(f"[error] {pair.ttml_path.name}: {exc}", file=sys.stderr)
+            _safe_print(f"{_color_text('[error]', 'error')} {pair.ttml_path.name}: {exc}", file=sys.stderr)
 
     return 1 if failures else 0

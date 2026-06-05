@@ -14,7 +14,7 @@ from .apple_music import (
 )
 from .audio import read_audio_metadata, _flatten_tags
 from .cli import find_directory_pairs, find_directory_work_items
-from .console import _safe_print
+from .console import _safe_print, _color_text
 from .models import (
     DEFAULT_STORES,
     DEFAULT_SPOTIFY_MARKETS,
@@ -121,6 +121,7 @@ __all__ = [
     "_parse_spotify_candidates",
     "_process_prepared_pair",
     "_safe_print",
+    "_color_text",
     "_spotify_candidate_score",
     "_spotify_search_queries",
     "_sync_apple_music_result_values",

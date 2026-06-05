@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import { DatabaseZap } from 'lucide-vue-next';
 import { darkTheme, NConfigProvider, NIcon, NMessageProvider } from 'naive-ui';
@@ -13,13 +13,23 @@ const store = useSessionStore();
 const route = useRoute();
 const router = useRouter();
 
-const dark = computed({
-  get: () => document.documentElement.classList.contains('dark'),
-  set: (value: boolean) => {
-    document.documentElement.classList.toggle('dark', value);
-    localStorage.setItem('ttml-id-match-theme', value ? 'dark' : 'light');
-  },
-});
+const themeMode = ref<'light' | 'dark' | 'auto'>('auto');
+const isDark = ref(false);
+
+const updateTheme = () => {
+  if (themeMode.value === 'auto') {
+    isDark.value = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  } else {
+    isDark.value = themeMode.value === 'dark';
+  }
+  document.documentElement.classList.toggle('dark', isDark.value);
+};
+
+const setThemeMode = (mode: 'light' | 'dark' | 'auto') => {
+  themeMode.value = mode;
+  localStorage.setItem('ttml-id-match-theme-mode', mode);
+  updateTheme();
+};
 
 const steps: Array<{ key: WorkflowStep; path: string; title: string; caption: string }> = [
   { key: 'upload', path: '/upload', title: '上传', caption: '文件识别与配对' },
@@ -34,8 +44,16 @@ const pageCopy = computed(() => {
 });
 
 onMounted(() => {
-  const saved = localStorage.getItem('ttml-id-match-theme');
-  document.documentElement.classList.toggle('dark', saved === 'dark');
+  const saved = localStorage.getItem('ttml-id-match-theme-mode') as 'light' | 'dark' | 'auto' | null;
+  themeMode.value = saved || 'auto';
+  updateTheme();
+
+  const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  mediaQuery.addEventListener('change', () => {
+    if (themeMode.value === 'auto') {
+      updateTheme();
+    }
+  });
 });
 
 watch(
@@ -54,7 +72,7 @@ function go(step: (typeof steps)[number]) {
 </script>
 
 <template>
-  <NConfigProvider :theme="dark ? darkTheme : null">
+  <NConfigProvider :theme="isDark ? darkTheme : null">
     <NMessageProvider>
       <div class="app-shell">
         <aside class="sidebar">
@@ -79,7 +97,7 @@ function go(step: (typeof steps)[number]) {
           </nav>
 
           <div class="sidebar-footer">
-            <ThemeToggle v-model:dark="dark" />
+            <ThemeToggle :theme-mode="themeMode" @update:theme-mode="setThemeMode" />
             <ProgressPanel :events="store.progressEvents" />
           </div>
         </aside>
