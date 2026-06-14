@@ -42,17 +42,25 @@ const counts = computed(() => ({
           @click="selectable && emit('select', pair.id)"
         >
           <div class="pair-main">
-            <div class="pair-name">{{ pair.ttml }}</div>
-            <NTag :type="pair.status === 'paired' ? 'success' : 'warning'" size="small" round>
+            <div class="pair-name" style="font-size: 15px; font-weight: 700; letter-spacing: -0.01em;">{{ pair.ttml }}</div>
+            <NTag :type="pair.status === 'paired' ? 'success' : 'warning'" size="small" round strong>
               <template #icon>
                 <NIcon :component="pair.status === 'paired' ? Link2 : Unlink" />
               </template>
-              {{ pair.status === 'paired' ? '音频已匹配' : '仅歌词' }}
+              {{ pair.status === 'paired' ? '已配对' : '仅歌词' }}
             </NTag>
           </div>
-          <div class="muted" style="display: grid; gap: 4px">
-            <span><NIcon :component="FileText" /> {{ pair.ttml || '-' }}</span>
-            <span><NIcon :component="FileAudio" /> {{ pair.audio || '未匹配同名音频' }}</span>
+          <div class="muted" style="display: flex; flex-direction: column; gap: 6px; font-size: 12px; margin-top: 4px;">
+            <div style="display: flex; align-items: center; gap: 8px; background: rgba(0, 0, 0, 0.02); padding: 4px 8px; border-radius: 6px; border: 1px solid var(--app-border);">
+              <NIcon :component="FileText" color="var(--app-accent)" />
+              <span style="font-family: 'JetBrains Mono', monospace; word-break: break-all;">{{ pair.ttml || '-' }}</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px; background: rgba(0, 0, 0, 0.02); padding: 4px 8px; border-radius: 6px; border: 1px solid var(--app-border);">
+              <NIcon :component="FileAudio" :color="pair.status === 'paired' ? '#6366f1' : 'var(--app-text-muted)'" />
+              <span :style="{ fontFamily: '\'JetBrains Mono\', monospace', wordBreak: 'break-all', color: pair.status === 'paired' ? 'var(--app-text)' : 'var(--app-text-muted)' }">
+                {{ pair.audio || '未匹配音频文件' }}
+              </span>
+            </div>
           </div>
         </div>
       </div>

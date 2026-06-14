@@ -18,11 +18,12 @@ from server.models.schemas import (
 from server.services.file_service import copy_uploads_to_outputs, pair_session_files
 from server.services.session_manager import SessionManager, SessionState
 from ttml_metadata.apple_music import AppleMusicClient, _apple_music_storefront_top_candidates, _sync_apple_music_result_values
-from ttml_metadata.ncm_music import NCMusicClient, collect_ncm_music_metadata
-from ttml_metadata.orchestration import _prepare_work_item, values_from_metadata
+from ttml_metadata.ncm_music import NCMusicClient
+from ttml_metadata.orchestration import values_from_metadata
 from ttml_metadata.qq_music import QQMusicClient
 from ttml_metadata.spotify import SpotifyClient, load_spotify_credentials
 from ttml_metadata.ttml import normalize_ttml_language, update_ttml_metadata
+from ttml_metadata.search_scheduler import BatchSearchCache, SearchClients, collect_ncm_for_pairs, prepare_work_items
 from ttml_metadata.models import (
     AppleMusicClientProtocol,
     AppleMusicTrackCandidate,
@@ -63,28 +64,38 @@ class MetadataService:
         state.prepared_pairs = {}
         state.previews = {}
         results: list[PreviewResult] = []
-        for pair_model in [FilePair(**pair) for pair in state.pairs]:
-            if not pair_model.ttml:
-                continue
-            work_item = WorkItem(
-                ttml_path=state.upload_dir / pair_model.ttml,
+        pair_models = [FilePair(**pair) for pair in state.pairs if pair.get("ttml")]
+        work_items = [
+            WorkItem(
+                ttml_path=state.upload_dir / (pair_model.ttml or ""),
                 audio_path=(state.upload_dir / pair_model.audio) if pair_model.audio else None,
             )
-            prepared = _prepare_work_item(
-                work_item,
-                self.apple_music_client,
-                self.qq_music_client,
-                self.ncm_music_client,
-                self.spotify_client,
-            )
+            for pair_model in pair_models
+        ]
+        cache = BatchSearchCache()
+        prepared_pairs, failures = prepare_work_items(
+            work_items,
+            SearchClients(
+                apple_music=self.apple_music_client,
+                qq_music=self.qq_music_client,
+                ncm_music=self.ncm_music_client,
+                spotify=self.spotify_client,
+            ),
+            max_workers=self.search_workers,
+            cache=cache,
+        )
+        if failures:
+            work_item, error = failures[0]
+            raise ValueError(f"{work_item.ttml_path.name}: {error}")
+        for prepared in prepared_pairs:
             _select_preview_defaults(prepared)
-            prepared.ncm_music_metadata = collect_ncm_music_metadata(
-                prepared.metadata,
-                self.ncm_music_client,
-                qq_music_candidate=prepared.qq_music_metadata.selected,
-            )
-            if prepared.ncm_music_metadata.candidates:
-                prepared.ncm_music_metadata.selected = prepared.ncm_music_metadata.candidates[0]
+        collect_ncm_for_pairs(
+            prepared_pairs,
+            self.ncm_music_client,
+            max_workers=self.search_workers,
+            cache=cache,
+        )
+        for pair_model, prepared in zip(pair_models, prepared_pairs):
             preview = pair_to_preview(pair_model, prepared)
             state.prepared_pairs[pair_model.id] = prepared
             state.previews[pair_model.id] = preview

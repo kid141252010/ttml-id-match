@@ -59,13 +59,20 @@ async function startPreview() {
             </div>
           </div>
 
-          <div v-if="store.files.length" class="file-list" style="margin-top: 14px">
+          <div v-if="store.files.length" class="file-list" style="margin-top: 20px">
             <div v-for="file in store.files" :key="file.name" class="file-row">
-              <div class="file-main">
-                <span class="file-name">{{ file.name }}</span>
-                <NTag size="small" round>{{ file.kind }}</NTag>
+              <div class="file-main" style="width: 100%;">
+                <div style="display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1;">
+                  <NIcon :component="file.kind === 'ttml' ? FileText : FileAudio" :color="file.kind === 'ttml' ? 'var(--app-accent)' : '#6366f1'" size="18" />
+                  <span class="file-name" style="word-break: break-all; font-family: 'JetBrains Mono', monospace; font-size: 13px;">{{ file.name }}</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 12px; margin-left: 12px; flex-shrink: 0;">
+                  <NTag :type="file.kind === 'ttml' ? 'success' : 'info'" size="small" round strong>{{ file.kind.toUpperCase() }}</NTag>
+                  <span class="muted" style="font-family: 'JetBrains Mono', monospace; font-size: 12px;">
+                    {{ file.size > 1024 * 1024 ? (file.size / (1024 * 1024)).toFixed(1) + ' MB' : file.size > 1024 ? Math.round(file.size / 1024) + ' KB' : file.size + ' B' }}
+                  </span>
+                </div>
               </div>
-              <span class="muted">{{ file.size }} bytes</span>
             </div>
           </div>
 

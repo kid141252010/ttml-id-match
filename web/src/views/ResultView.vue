@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router';
-import { Archive, FileDown, RotateCcw } from 'lucide-vue-next';
+import { Archive, FileDown, RotateCcw, FileText } from 'lucide-vue-next';
 import { NButton, NEmpty, NIcon, NResult, NTag } from 'naive-ui';
 
 import { downloadAllUrl, downloadFileUrl } from '@/api/client';
@@ -61,14 +61,32 @@ const router = useRouter();
         <div class="result-list">
           <div v-for="file in store.resultSummary.files" :key="file.pair_id" class="result-row">
             <div class="result-main">
-              <span class="result-name">{{ file.ttml }}</span>
-              <NTag :type="file.status === 'success' ? 'success' : 'error'" size="small" round>{{ file.status }}</NTag>
+              <div style="display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1;">
+                <NIcon :component="FileText" color="var(--app-accent)" size="18" />
+                <span class="result-name" style="word-break: break-all; font-family: 'JetBrains Mono', monospace; font-size: 13px;">{{ file.ttml }}</span>
+              </div>
+              <NTag :type="file.status === 'success' ? 'success' : 'error'" size="small" round strong>
+                {{ file.status === 'success' ? '成功' : '失败' }}
+              </NTag>
             </div>
-            <div class="muted">写入：{{ file.metadata_written.join(' / ') || file.error || '-' }}</div>
-            <NButton size="small" tag="a" :href="store.sessionId ? downloadFileUrl(store.sessionId, file.ttml) : undefined" :disabled="file.status !== 'success'">
-              <template #icon><NIcon :component="FileDown" /></template>
-              单文件下载
-            </NButton>
+            
+            <div style="display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 10px; align-items: center;">
+              <span class="muted" style="font-size: 12px; font-weight: 600;">写入元数据:</span>
+              <template v-if="file.status === 'success' && file.metadata_written.length">
+                <NTag v-for="meta in file.metadata_written" :key="meta" size="small" :bordered="false" style="background: rgba(13, 148, 136, 0.08); color: var(--app-accent); font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600;">
+                  {{ meta }}
+                </NTag>
+              </template>
+              <span v-else-if="file.error" style="color: var(--app-danger); font-size: 12px; font-weight: 500;">{{ file.error }}</span>
+              <span v-else class="muted" style="font-size: 12px;">-</span>
+            </div>
+
+            <div style="display: flex; justify-content: flex-end;">
+              <NButton size="small" tag="a" :href="store.sessionId ? downloadFileUrl(store.sessionId, file.ttml) : undefined" :disabled="file.status !== 'success'" secondary strong>
+                <template #icon><NIcon :component="FileDown" /></template>
+                单文件下载
+              </NButton>
+            </div>
           </div>
         </div>
       </div>

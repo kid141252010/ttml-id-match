@@ -3,11 +3,47 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import { DatabaseZap } from 'lucide-vue-next';
 import { darkTheme, NConfigProvider, NIcon, NMessageProvider } from 'naive-ui';
+import type { GlobalThemeOverrides } from 'naive-ui';
 
 import ProgressPanel from '@/components/ProgressPanel.vue';
 import ThemeToggle from '@/components/ThemeToggle.vue';
 import { useSessionStore } from '@/stores/session';
 import type { WorkflowStep } from '@/api/types';
+
+const themeOverrides: GlobalThemeOverrides = {
+  common: {
+    primaryColor: '#0d9488',
+    primaryColorHover: '#0f766e',
+    primaryColorPressed: '#115e59',
+    primaryColorSuppl: '#14b8a6',
+    successColor: '#16a34a',
+    successColorHover: '#15803d',
+    successColorPressed: '#166534',
+    successColorSuppl: '#22c55e',
+    warningColor: '#d97706',
+    warningColorHover: '#b45309',
+    warningColorPressed: '#92400e',
+    warningColorSuppl: '#f59e0b',
+    errorColor: '#dc2626',
+    errorColorHover: '#b91c1c',
+    errorColorPressed: '#991b1b',
+    errorColorSuppl: '#ef4444',
+    borderRadius: '12px',
+    borderRadiusSmall: '8px',
+  },
+  Button: {
+    borderRadiusMedium: '10px',
+    borderRadiusLarge: '12px',
+    borderRadiusSmall: '8px',
+    fontWeightStrong: '600',
+  },
+  Tag: {
+    borderRadius: '8px',
+  },
+  Progress: {
+    borderRadius: '4px',
+  }
+};
 
 const store = useSessionStore();
 const route = useRoute();
@@ -72,7 +108,7 @@ function go(step: (typeof steps)[number]) {
 </script>
 
 <template>
-  <NConfigProvider :theme="isDark ? darkTheme : null">
+  <NConfigProvider :theme="isDark ? darkTheme : null" :theme-overrides="themeOverrides">
     <NMessageProvider>
       <div class="app-shell">
         <aside class="sidebar">

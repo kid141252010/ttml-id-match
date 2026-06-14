@@ -27,7 +27,7 @@ from .models import (
     _SpotifyAlbumCandidate,
     _SpotifyArtistCandidate,
 )
-from .network import urlopen_with_retry
+from .network import proxy_url_for_source, urlopen_with_retry
 from .text_utils import (
     _add_unique_value,
     _duration_close,
@@ -69,9 +69,11 @@ class SpotifyClient:
         timeout: int = 20,
         markets: Iterable[str] | None = None,
         read_json: Callable[[str, str], dict[str, Any]] | None = None,
+        proxy_url: str | None = None,
     ):
         self.credentials = credentials
         self.timeout = timeout
+        self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("spotify")
         self.markets = list(markets or DEFAULT_SPOTIFY_MARKETS)
         self._read_json = read_json or self._read_json_from_url
         self._access_token: str | None = None
@@ -278,7 +280,7 @@ class SpotifyClient:
             if self._access_token:
                 return self._access_token
             request = self._build_token_request()
-            with urlopen_with_retry(request, timeout=self.timeout) as response:
+            with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
                 payload = json.loads(response.read().decode("utf-8", "ignore"))
             token = _stringify_tag_value(payload.get("access_token")) if isinstance(payload, dict) else None
             if not token:
@@ -361,7 +363,7 @@ class SpotifyClient:
                 "User-Agent": "Mozilla/5.0",
             },
         )
-        with urlopen_with_retry(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         if not isinstance(payload, dict):
             raise ValueError("Spotify API returned a non-object payload")

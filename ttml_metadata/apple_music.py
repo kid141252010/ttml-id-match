@@ -24,7 +24,7 @@ from .models import (
     _AppleMusicAlbumCandidate,
     _AppleMusicArtistCandidate,
 )
-from .network import urlopen_with_retry
+from .network import proxy_url_for_source, urlopen_with_retry
 from .text_utils import (
     _add_unique_list_value,
     _add_unique_value,
@@ -48,8 +48,9 @@ from .text_utils import (
 )
 
 class AppleMusicClient:
-    def __init__(self, timeout: int = 20):
+    def __init__(self, timeout: int = 20, proxy_url: str | None = None):
         self.timeout = timeout
+        self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("apple_music")
         self._token: str | None = None
         self._page_cache: dict[tuple[str, str], str] = {}
         self._track_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -276,7 +277,7 @@ class AppleMusicClient:
         if headers:
             request_headers.update(headers)
         request = urllib.request.Request(url, headers=request_headers)
-        with urlopen_with_retry(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             return response.read().decode("utf-8", "ignore")
 
     @staticmethod

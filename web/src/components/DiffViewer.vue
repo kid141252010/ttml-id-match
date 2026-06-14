@@ -30,9 +30,14 @@ function entries(data: Record<string, string[]>) {
             <NTag :type="group.type" size="small" round>{{ group.label }}</NTag>
           </h3>
           <NEmpty v-if="entries(group.data).length === 0" size="small" description="无" />
-          <div v-for="item in entries(group.data)" :key="`${group.key}-${item.key}-${item.value}`" class="change-item">
+          <div 
+            v-for="item in entries(group.data)" 
+            :key="`${group.key}-${item.key}-${item.value}`" 
+            class="change-item"
+            :style="{ borderLeft: `3px solid var(--app-${group.type === 'default' ? 'text-muted' : group.type})` }"
+          >
             <strong>{{ item.key }}</strong>
-            <div>{{ item.value }}</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; word-break: break-all; margin-top: 4px;">{{ item.value }}</div>
           </div>
         </div>
       </div>

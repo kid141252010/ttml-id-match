@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import { CheckCheck, Download, RotateCcw } from 'lucide-vue-next';
+import { CheckCheck, Download, RotateCcw, Music, Headphones, Disc, Radio } from 'lucide-vue-next';
 import { NButton, NEmpty, NIcon, NTag } from 'naive-ui';
 
 import CandidateCard from '@/components/CandidateCard.vue';
@@ -14,11 +14,11 @@ const store = useSessionStore();
 const router = useRouter();
 const activeSource = ref<keyof Omit<SelectionPayload, 'pair_id'>>('apple_music');
 
-const sourceOptions: Array<{ key: keyof Omit<SelectionPayload, 'pair_id'>; label: string }> = [
-  { key: 'apple_music', label: 'Apple Music' },
-  { key: 'qq_music', label: 'QQ 音乐' },
-  { key: 'ncm_music', label: '网易云' },
-  { key: 'spotify', label: 'Spotify' },
+const sourceOptions: Array<{ key: keyof Omit<SelectionPayload, 'pair_id'>; label: string; icon: any }> = [
+  { key: 'apple_music', label: 'Apple Music', icon: Music },
+  { key: 'qq_music', label: 'QQ 音乐', icon: Headphones },
+  { key: 'ncm_music', label: '网易云', icon: Disc },
+  { key: 'spotify', label: 'Spotify', icon: Radio },
 ];
 
 const preview = computed(() => store.selectedPreview);
@@ -63,7 +63,11 @@ async function apply() {
               :class="{ active: activeSource === source.key }"
               @click="activeSource = source.key"
             >
-              {{ source.label }} · {{ preview ? sourceCount(preview, source.key) : 0 }}
+              <NIcon :component="source.icon" size="15" />
+              <span>{{ source.label }}</span>
+              <span style="opacity: 0.75; font-size: 11px; font-family: 'JetBrains Mono', monospace; margin-left: 2px;">
+                {{ preview ? sourceCount(preview, source.key) : 0 }}
+              </span>
             </button>
           </div>
 

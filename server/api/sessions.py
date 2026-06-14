@@ -28,6 +28,7 @@ def build_router(session_manager: SessionManager, metadata_service: MetadataServ
         await save_uploads(state.upload_dir, files)
         pairs = pair_session_files(state.upload_dir)
         state.pairs = [pair.model_dump() for pair in pairs]
+        session_manager.sync(state)
         return UploadResponse(files=list_session_files(state.upload_dir), pairs=pairs)
 
     @router.get("/sessions/{session_id}/pairs")
@@ -46,7 +47,9 @@ def build_router(session_manager: SessionManager, metadata_service: MetadataServ
     @router.post("/sessions/{session_id}/apply", response_model=ApplySummary)
     def apply(request: ApplyRequest, state: SessionState = Depends(session)) -> ApplySummary:
         try:
-            return metadata_service.apply(state, request.selections)
+            summary = metadata_service.apply(state, request.selections)
+            session_manager.sync(state)
+            return summary
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

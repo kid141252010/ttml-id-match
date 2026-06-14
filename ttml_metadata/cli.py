@@ -13,6 +13,7 @@ from .orchestration import _collect_ncm_music_metadata_for_pairs, _prepare_work_
 from .qq_music import QQMusicClient, confirm_qq_music_candidates
 from .spotify import SpotifyClient, confirm_spotify_candidates, load_spotify_credentials
 from .ttml import normalize_ttml_language
+from .search_scheduler import BatchSearchCache, SearchClients, clients_with_cache
 
 def find_directory_work_items(directory: Path) -> tuple[list[WorkItem], list[str]]:
     ttml_files = sorted(directory.glob("*.ttml"))
@@ -72,19 +73,28 @@ def _prepare_work_items(
     if not work_items:
         return [], 0
 
+    cached_clients = clients_with_cache(
+        SearchClients(
+            apple_music=apple_music_client,
+            qq_music=qq_music_client,
+            ncm_music=ncm_music_client,
+            spotify=spotify_client,
+        ),
+        BatchSearchCache(),
+    )
     worker_count = min(max_workers, len(work_items))
     prepared: list[PairMetadata | None] = [None] * len(work_items)
-    errors: list[Exception | None] = [None] * len(work_items)
+    errors: list[tuple[WorkItem, Exception]] = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
             executor.submit(
                 _prepare_work_item,
                 work_item,
-                apple_music_client,
-                qq_music_client,
-                ncm_music_client,
-                spotify_client,
+                cached_clients.apple_music,
+                cached_clients.qq_music,
+                cached_clients.ncm_music,
+                cached_clients.spotify,
             ): index
             for index, work_item in enumerate(work_items)
         }
@@ -94,14 +104,12 @@ def _prepare_work_items(
             try:
                 prepared[index] = future.result()
             except Exception as exc:
-                errors[index] = exc
+                errors.append((work_items[index], exc))
 
     failures = 0
-    for index, error in enumerate(errors):
-        if error is None:
-            continue
+    for work_item, error in errors:
         failures += 1
-        _safe_print(f"{_color_text('[error]', 'error')} {work_items[index].ttml_path.name}: {error}", file=sys.stderr)
+        _safe_print(f"{_color_text('[error]', 'error')} {work_item.ttml_path.name}: {error}", file=sys.stderr)
 
     return [pair for pair in prepared if pair is not None], failures
 

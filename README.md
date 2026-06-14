@@ -31,6 +31,7 @@ python fill_ttml_metadata.py --help
 - 处理主语言为 `xml:lang="zh-Hant"` 的 TTML 时，会先自动改为 `zh-Hans`，并把歌词正文转换为简体。
 - 批量模式按同名文件配对音频和 TTML；同名 `.flac` 和 `.m4a` 同时存在时优先使用 `.flac`。没有同名音频时，会尝试从 TTML 已有 `musicName`、`artists`、`album`、`appleMusicId`、`isrc` 填充 Apple Music、QQ 音乐、网易云音乐和 Spotify ID。
 - 批量模式的网络搜索默认一次并行处理 3 个文件；如果遇到限流或需要复现旧式串行行为，可以用 `--search-workers 1` 降级。
+- 每个批量工作项内部会并行搜索 Apple Music、QQ 音乐和 Spotify；网易云音乐仍在 QQ 音乐候选确认后执行，但同一批内会复用重复搜索结果，减少同名歌曲重复请求。
 - Apple Music、QQ 音乐、网易云音乐和 Spotify 的网络请求默认会对临时网络错误、HTTP 408/429 和 5xx 响应重试最多 3 次；单个来源重试耗尽会显示 `lookup warning:`，不会阻止其它来源已确认或自动选中的元数据继续写入。
 - 多艺术家会拆成多个 `artists` 元数据节点。
 - `ITUNESCATALOGID` 若明显不是歌曲 ID，例如示例中的 `1`，不会直接写入。
@@ -61,6 +62,40 @@ SPOTIFY_CLIENT_SECRET=
 ```
 
 脚本会先读取当前目录的 `.env`，再用系统环境变量覆盖同名值。`.env` 已在 `.gitignore` 中屏蔽，仓库只提交 `.env.example`。如果缺少任一变量，运行时会输出 `缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索`，Apple Music、QQ 音乐和网易云音乐流程会继续执行。
+
+## 代理与后端配置
+
+所有上游搜索都支持代理配置。按来源配置优先于全局配置；未设置来源代理时会退回到 `TTML_PROXY_ALL`，再退回到标准 `HTTPS_PROXY` / `HTTP_PROXY`：
+
+```text
+TTML_PROXY_ALL=
+TTML_PROXY_APPLE_MUSIC=
+TTML_PROXY_QQ_MUSIC=
+TTML_PROXY_NCM_MUSIC=
+TTML_PROXY_SPOTIFY=
+```
+
+Web 后端默认使用本地临时目录保存会话：
+
+```text
+ID_MATCH_STORAGE_BACKEND=local
+```
+
+部署到 Vercel 时应切换到持久化后端，并配置 Vercel Blob 与 Redis/KV REST 环境变量：
+
+```text
+ID_MATCH_STORAGE_BACKEND=vercel
+BLOB_READ_WRITE_TOKEN=
+KV_REST_API_URL=
+KV_REST_API_TOKEN=
+```
+
+如果使用新的 Vercel Redis / Upstash 环境变量，也可以改用：
+
+```text
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+```
 
 ## 快速开始
 
@@ -501,3 +536,20 @@ cd web
 $env:VITE_USE_MOCK_API="1"
 npm run dev
 ```
+
+### Vercel 一键部署
+
+仓库根目录包含 `vercel.json` 和 `api/index.py`。Vercel 会构建 `web/` 静态前端，并把 `/api/*` 重写到 FastAPI Python Function。
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.)
+
+Vercel 部署时建议设置：
+
+```text
+ID_MATCH_STORAGE_BACKEND=vercel
+BLOB_READ_WRITE_TOKEN=...
+KV_REST_API_URL=...
+KV_REST_API_TOKEN=...
+```
+
+如果没有 Spotify 凭据，Spotify 搜索会跳过，不影响 Apple Music、QQ 音乐和网易云音乐。上传和结果文件会同步到 Vercel Blob，会话索引会同步到 Redis/KV，避免 Serverless 函数冷启动后丢失会话。

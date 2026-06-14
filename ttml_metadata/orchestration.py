@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 from pathlib import Path
 
 from .apple_music import (
@@ -32,6 +31,7 @@ from .qq_music import QQMusicClient, _format_qq_music_candidate, _merge_qq_music
 from .spotify import _format_spotify_candidate, _merge_spotify_metadata, _unique_spotify_ids, collect_spotify_metadata
 from .text_utils import _add_unique_value, split_artists
 from .ttml import read_ttml_metadata, update_ttml_metadata
+from .search_scheduler import BatchSearchCache, SearchClients, collect_ncm_for_pairs, prepare_one_work_item
 
 def values_from_metadata(
     metadata: AudioMetadata,
@@ -95,27 +95,14 @@ def _prepare_work_item(
     ncm_music_client: NCMusicClientProtocol | None = None,
     spotify_client: SpotifyClientProtocol | None = None,
 ) -> PairMetadata:
-    if work_item.audio_path:
-        return _prepare_pair(
-            work_item.audio_path,
-            work_item.ttml_path,
-            apple_music_client,
-            qq_music_client,
-            ncm_music_client,
-            spotify_client,
-        )
-
-    metadata = read_ttml_metadata(work_item.ttml_path)
-    if not metadata.title:
-        raise ValueError("TTML 中未读取到歌名，跳过 QQ 音乐搜索、网易云音乐搜索和 Spotify 搜索")
-    return PairMetadata(
-        None,
-        work_item.ttml_path,
-        metadata,
-        collect_apple_music_metadata(metadata, apple_music_client),
-        collect_qq_music_metadata(metadata, qq_music_client),
-        NCMusicSearchResult(),
-        collect_spotify_metadata(metadata, spotify_client),
+    return prepare_one_work_item(
+        work_item,
+        SearchClients(
+            apple_music=apple_music_client,
+            qq_music=qq_music_client,
+            ncm_music=ncm_music_client or NCMusicClient(),
+            spotify=spotify_client,
+        ),
     )
 
 
@@ -148,28 +135,12 @@ def _collect_ncm_music_metadata_for_pairs(
     ncm_music_client: NCMusicClientProtocol,
     max_workers: int = 1,
 ) -> None:
-    if max_workers <= 1 or len(pairs) <= 1:
-        for pair in pairs:
-            pair.ncm_music_metadata = collect_ncm_music_metadata(
-                pair.metadata,
-                ncm_music_client,
-                qq_music_candidate=pair.qq_music_metadata.selected,
-            )
-        return
-
-    worker_count = min(max_workers, len(pairs))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(
-                collect_ncm_music_metadata,
-                pair.metadata,
-                ncm_music_client,
-                qq_music_candidate=pair.qq_music_metadata.selected,
-            ): pair
-            for pair in pairs
-        }
-        for future in concurrent.futures.as_completed(futures):
-            futures[future].ncm_music_metadata = future.result()
+    collect_ncm_for_pairs(
+        pairs,
+        ncm_music_client,
+        max_workers=max_workers,
+        cache=BatchSearchCache(),
+    )
 
 
 def _process_prepared_pair(

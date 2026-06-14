@@ -1,0 +1,20 @@
+{
+  "installCommand": "python -m pip install -r requirements.txt && npm --prefix web install",
+  "buildCommand": "npm --prefix web run build",
+  "outputDirectory": "web/dist",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

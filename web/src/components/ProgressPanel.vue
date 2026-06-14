@@ -28,12 +28,12 @@ function label(level: ProgressEvent['level']) {
     <div class="panel-body">
       <NEmpty v-if="events.length === 0" size="small" description="等待操作" />
       <div v-else class="event-list">
-        <div v-for="event in events" :key="event.id" class="event-row">
+        <div v-for="event in events" :key="event.id" class="event-row" :class="event.level">
           <div class="event-main">
-            <NTag :type="tagType(event.level)" size="small" round>{{ label(event.level) }}</NTag>
-            <span class="muted">{{ event.at }}</span>
+            <NTag :type="tagType(event.level)" size="small" round strong>{{ label(event.level) }}</NTag>
+            <span class="muted" style="font-family: 'JetBrains Mono', monospace; font-size: 11px;">{{ event.at }}</span>
           </div>
-          <div>{{ event.message }}</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; word-break: break-all; margin-top: 4px; line-height: 1.5;">{{ event.message }}</div>
         </div>
       </div>
     </div>

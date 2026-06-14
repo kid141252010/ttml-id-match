@@ -22,7 +22,7 @@ from .models import (
     _NCMusicAlbumCandidate,
     _NCMusicArtistCandidate,
 )
-from .network import urlopen_with_retry
+from .network import proxy_url_for_source, urlopen_with_retry
 from .text_utils import (
     _add_text_with_simplified_variants,
     _add_unique_value,
@@ -40,8 +40,10 @@ class NCMusicClient:
         timeout: int = 20,
         api_bases: Iterable[str] | None = None,
         read_json: Callable[[str], dict[str, Any]] | None = None,
+        proxy_url: str | None = None,
     ):
         self.timeout = timeout
+        self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("ncm_music")
         self.api_bases = [base.rstrip("/") for base in (api_bases or DEFAULT_NCM_API_BASES) if base]
         self._read_json = read_json or self._read_json_from_url
 
@@ -183,7 +185,7 @@ class NCMusicClient:
                 "User-Agent": "Mozilla/5.0",
             },
         )
-        with urlopen_with_retry(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         if not isinstance(payload, dict):
             raise ValueError("NCM API returned a non-object payload")

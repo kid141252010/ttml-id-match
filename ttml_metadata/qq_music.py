@@ -7,16 +7,17 @@ from typing import Any, Callable
 
 from .console import _safe_print, _color_text
 from .models import AudioMetadata, PairMetadata, QQMusicCandidate, QQMusicClientProtocol, QQMusicSearchResult
-from .network import urlopen_with_retry
+from .network import proxy_url_for_source, urlopen_with_retry
 from .text_utils import _add_unique_value, _nested_get, _same_raw_text, _stringify_tag_value, _text_match_score, split_artists
 
 class QQMusicClient:
-    def __init__(self, timeout: int = 20):
+    def __init__(self, timeout: int = 20, proxy_url: str | None = None):
         self.timeout = timeout
+        self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("qq_music")
 
     def search_songs(self, query: str) -> list[QQMusicCandidate]:
         request = self._build_search_request(query)
-        with urlopen_with_retry(request, timeout=self.timeout) as response:
+        with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         return _parse_qq_music_candidates(payload)
 
