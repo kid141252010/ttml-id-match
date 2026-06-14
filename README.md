@@ -63,39 +63,9 @@ SPOTIFY_CLIENT_SECRET=
 
 脚本会先读取当前目录的 `.env`，再用系统环境变量覆盖同名值。`.env` 已在 `.gitignore` 中屏蔽，仓库只提交 `.env.example`。如果缺少任一变量，运行时会输出 `缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索`，Apple Music、QQ 音乐和网易云音乐流程会继续执行。
 
-## 代理与后端配置
+## 配置
 
-所有上游搜索都支持代理配置。按来源配置优先于全局配置；未设置来源代理时会退回到 `TTML_PROXY_ALL`，再退回到标准 `HTTPS_PROXY` / `HTTP_PROXY`：
-
-```text
-TTML_PROXY_ALL=
-TTML_PROXY_APPLE_MUSIC=
-TTML_PROXY_QQ_MUSIC=
-TTML_PROXY_NCM_MUSIC=
-TTML_PROXY_SPOTIFY=
-```
-
-Web 后端默认使用本地临时目录保存会话：
-
-```text
-ID_MATCH_STORAGE_BACKEND=local
-```
-
-部署到 Vercel 时应切换到持久化后端，并配置 Vercel Blob 与 Redis/KV REST 环境变量：
-
-```text
-ID_MATCH_STORAGE_BACKEND=vercel
-BLOB_READ_WRITE_TOKEN=
-KV_REST_API_URL=
-KV_REST_API_TOKEN=
-```
-
-如果使用新的 Vercel Redis / Upstash 环境变量，也可以改用：
-
-```text
-UPSTASH_REDIS_REST_URL=
-UPSTASH_REDIS_REST_TOKEN=
-```
+代理、批量并发、Web 存储后端、前端 API 地址等配置见 [docs/configuration.md](docs/configuration.md)。
 
 ## 快速开始
 
@@ -539,11 +509,11 @@ npm run dev
 
 ### Vercel 一键部署
 
-仓库根目录包含 `vercel.json` 和 `api/index.py`。Vercel 会构建 `web/` 静态前端，并把 `/api/*` 重写到 FastAPI Python Function。
+仓库根目录包含 `vercel.json` 和 `api/index.py`。Vercel 会构建 `web/` 静态前端，并把 `/api/*` 重写到 FastAPI Python Function。完整部署教程见 [docs/deployment/vercel.md](docs/deployment/vercel.md)。
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.)
 
-Vercel 部署时建议设置：
+Vercel 部署时至少设置：
 
 ```text
 ID_MATCH_STORAGE_BACKEND=vercel
@@ -552,4 +522,4 @@ KV_REST_API_URL=...
 KV_REST_API_TOKEN=...
 ```
 
-如果没有 Spotify 凭据，Spotify 搜索会跳过，不影响 Apple Music、QQ 音乐和网易云音乐。上传和结果文件会同步到 Vercel Blob，会话索引会同步到 Redis/KV，避免 Serverless 函数冷启动后丢失会话。
+如果没有 Spotify 凭据，Spotify 搜索会跳过，不影响 Apple Music、QQ 音乐和网易云音乐。
