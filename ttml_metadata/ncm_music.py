@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable
 
+from .config import load_positive_int_config
 from .console import _safe_print, _color_text
 from .models import (
     DEFAULT_NCM_API_BASES,
@@ -23,6 +24,7 @@ from .models import (
     _NCMusicArtistCandidate,
 )
 from .network import proxy_url_for_source, urlopen_with_retry
+from .parallel import run_ordered_parallel
 from .text_utils import (
     _add_text_with_simplified_variants,
     _add_unique_value,
@@ -82,26 +84,42 @@ class NCMusicClient:
     def _search_base(self, base: str, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
         candidates: list[NCMusicCandidate] = []
         errors: list[str] = []
-        for query in context.titles:
+        query_workers = load_positive_int_config("TTML_NCM_QUERY_WORKERS", default=2)
+
+        def search_title(query: str) -> tuple[list[NCMusicCandidate], str | None]:
             try:
                 payload = self._read_json(self._build_search_url(base, query))
             except Exception as exc:
-                errors.append(f"song:{query}: {exc}")
-                continue
-            candidates.extend(_parse_ncm_music_candidates(payload))
+                return [], f"song:{query}: {exc}"
+            return _parse_ncm_music_candidates(payload), None
 
-        candidates.extend(self._search_album_song_candidates(base, context))
+        for query_candidates, error in run_ordered_parallel(
+            context.titles,
+            search_title,
+            max_workers=query_workers,
+        ):
+            if error:
+                errors.append(error)
+            candidates.extend(query_candidates)
+
+        candidates.extend(self._search_album_song_candidates(base, context, query_workers))
         deduped = _dedupe_ncm_music_candidates(candidates)
         if not deduped and errors:
             raise LookupError("; ".join(errors))
         return deduped
 
-    def _search_album_song_candidates(self, base: str, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
+    def _search_album_song_candidates(
+        self,
+        base: str,
+        context: NCMusicSearchContext,
+        query_workers: int | None = None,
+    ) -> list[NCMusicCandidate]:
         if not context.titles or not context.artists or not context.albums:
             return []
 
-        artists = self._find_matching_artists(base, context)
-        candidates: list[NCMusicCandidate] = []
+        workers = query_workers or load_positive_int_config("TTML_NCM_QUERY_WORKERS", default=2)
+        artists = self._find_matching_artists(base, context, workers)
+        albums: list[_NCMusicAlbumCandidate] = []
         seen_album_ids: set[str] = set()
         for artist in artists:
             try:
@@ -112,26 +130,42 @@ class NCMusicClient:
                 if album.album_id in seen_album_ids or not _ncm_album_matches(context, album):
                     continue
                 seen_album_ids.add(album.album_id)
-                try:
-                    album_payload = self._read_json(self._build_album_url(base, album.album_id))
-                except Exception:
-                    continue
-                candidates.extend(
-                    candidate
-                    for candidate in _parse_ncm_album_song_candidates(album_payload)
-                    if _ncm_candidate_title_score(context, candidate) > 0
-                )
+                albums.append(album)
+
+        def search_album(album: _NCMusicAlbumCandidate) -> list[NCMusicCandidate]:
+            try:
+                album_payload = self._read_json(self._build_album_url(base, album.album_id))
+            except Exception:
+                return []
+            return [
+                candidate
+                for candidate in _parse_ncm_album_song_candidates(album_payload)
+                if _ncm_candidate_title_score(context, candidate) > 0
+            ]
+
+        candidates: list[NCMusicCandidate] = []
+        for album_candidates in run_ordered_parallel(albums, search_album, max_workers=workers):
+            candidates.extend(album_candidates)
         return candidates
 
-    def _find_matching_artists(self, base: str, context: NCMusicSearchContext) -> list[_NCMusicArtistCandidate]:
+    def _find_matching_artists(
+        self,
+        base: str,
+        context: NCMusicSearchContext,
+        query_workers: int,
+    ) -> list[_NCMusicArtistCandidate]:
         matches: list[_NCMusicArtistCandidate] = []
         seen_artist_ids: set[str] = set()
-        for query in context.artists:
+
+        def search_artist(query: str) -> list[_NCMusicArtistCandidate]:
             try:
                 payload = self._read_json(self._build_artist_search_url(base, query))
             except Exception:
-                continue
-            for artist in _parse_ncm_artist_candidates(payload):
+                return []
+            return _parse_ncm_artist_candidates(payload)
+
+        for artists in run_ordered_parallel(context.artists, search_artist, max_workers=query_workers):
+            for artist in artists:
                 if artist.artist_id in seen_artist_ids or not _ncm_artist_matches(context, artist):
                     continue
                 seen_artist_ids.add(artist.artist_id)

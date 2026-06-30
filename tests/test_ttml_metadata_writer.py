@@ -539,6 +539,64 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             ],
         )
 
+    def test_apple_music_searches_storefronts_in_parallel_and_merges_in_default_order(self) -> None:
+        class SlowSearchClient:
+            def fetch_album_tracks(self, store, album_id):
+                return []
+
+            def search_songs(self, store, metadata):
+                time.sleep(0.08)
+                return [
+                    AppleMusicTrackCandidate(
+                        track_id=f"apple-{store}",
+                        title=metadata.title,
+                        artists=["Artist"],
+                        album="Album",
+                        storefront=store,
+                        source_index=0,
+                    )
+                ]
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
+
+        with patch.dict(os.environ, {"TTML_APPLE_MUSIC_WORKERS": "3"}, clear=False):
+            start = time.perf_counter()
+            result = collect_apple_music_metadata(
+                AudioMetadata(title="Song", artists=["Artist"], album="Album"),
+                SlowSearchClient(),
+            )
+            elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(list(result.candidates_by_storefront), DEFAULT_STORES)
+        self.assertEqual([candidate.storefront for candidate in result.selected], DEFAULT_STORES)
+
+    def test_apple_music_worker_count_one_keeps_storefront_calls_serial(self) -> None:
+        calls: list[str] = []
+
+        class RecordingSearchClient:
+            def fetch_album_tracks(self, store, album_id):
+                return []
+
+            def search_songs(self, store, metadata):
+                calls.append(store)
+                return []
+
+            def search_artists(self, store, query):
+                return []
+
+            def fetch_artist_albums(self, store, artist_id):
+                return [], []
+
+        with patch.dict(os.environ, {"TTML_APPLE_MUSIC_WORKERS": "1"}, clear=False):
+            collect_apple_music_metadata(AudioMetadata(title="Song"), RecordingSearchClient())
+
+        self.assertEqual(calls, DEFAULT_STORES)
+
     def test_existing_apple_music_id_still_searches_all_storefronts_and_appends_localized_metadata(self) -> None:
         class SearchClient:
             def __init__(self):
@@ -1363,6 +1421,25 @@ class NCMusicMetadataTests(unittest.TestCase):
 
         self.assertEqual([candidate.song_id for candidate in candidates], ["2"])
 
+    def test_ncm_title_queries_run_in_parallel_and_keep_candidate_order(self) -> None:
+        def read_json(url: str):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["keywords"][0]
+            time.sleep(0.07)
+            return {"result": {"songs": [{"id": query, "name": query}]}}
+
+        client = NCMusicClient(
+            api_bases=["https://music163.example"],
+            read_json=read_json,
+        )
+
+        with patch.dict(os.environ, {"TTML_NCM_QUERY_WORKERS": "2"}, clear=False):
+            start = time.perf_counter()
+            candidates = client.search_songs(NCMusicSearchContext(titles=["First", "Second"]))
+            elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 0.12)
+        self.assertEqual([candidate.song_id for candidate in candidates], ["First", "Second"])
+
     def test_ncm_search_retries_transient_urlopen_error(self) -> None:
         attempts = 0
         payload = {"result": {"songs": [{"id": 224116257, "name": "玫瑰少年"}]}}
@@ -1982,6 +2059,44 @@ class SpotifyMetadataTests(unittest.TestCase):
         self.assertEqual(
             [candidate.track_id for candidate in candidates],
             ["5cofkYnlrYaXesdVpP6xeP", "loose-0", "loose-1", "loose-2", "loose-3", "loose-4"],
+        )
+
+    def test_spotify_searches_markets_in_parallel_and_keeps_market_order(self) -> None:
+        def read_json(url: str, access_token: str) -> dict:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            market = params["market"][0]
+            time.sleep(0.07)
+            return {
+                "tracks": {
+                    "items": [
+                        {
+                            "id": f"{market}-{index}",
+                            "name": "Song",
+                            "artists": [{"name": "Artist"}],
+                            "album": {"name": "Album"},
+                        }
+                        for index in range(5)
+                    ]
+                }
+            }
+
+        client = SpotifyClient(
+            SpotifyCredentials("client-id", "client-secret"),
+            markets=["US", "KR", "JP", "TW"],
+            read_json=read_json,
+        )
+        client._access_token = "token"
+
+        with patch.dict(os.environ, {"TTML_SPOTIFY_MARKET_WORKERS": "2"}, clear=False):
+            start = time.perf_counter()
+            candidates = client.search_tracks(AudioMetadata(title="Song", artists=["Artist"], album="Album"))
+            elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 0.20)
+        self.assertEqual(
+            [candidate.track_id for candidate in candidates[::5]],
+            ["US-0", "KR-0", "JP-0", "TW-0"],
         )
 
     def test_spotify_search_falls_back_to_title_and_strict_queries_when_loose_query_has_too_few_results(self) -> None:

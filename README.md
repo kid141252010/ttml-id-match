@@ -51,6 +51,10 @@ python fill_ttml_metadata.py example --dry-run
 python fill_ttml_metadata.py example
 ```
 
+### 并发和限流
+
+批量搜索默认会并行处理多个文件，并在 Apple Music 区域、Spotify 市场和网易云查询内部做受控并行。遇到上游限流或网络不稳定时，可先在 `.env` 中把对应的 `TTML_APPLE_MUSIC_WORKERS`、`TTML_SPOTIFY_MARKET_WORKERS` 或 `TTML_NCM_QUERY_WORKERS` 降为 `1`；仍不稳定时再使用 `--search-workers 1` 降低外层批量并发。完整说明见 [配置指南](docs/configuration.md)。
+
 ---
 
 ## 文档指南

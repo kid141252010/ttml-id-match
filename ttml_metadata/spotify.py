@@ -6,10 +6,11 @@ import os
 import threading
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .config import load_config_value
+from .config import load_config_value, load_positive_int_config
 from .console import _safe_print, _color_text
 from .models import (
     DEFAULT_SPOTIFY_MARKETS,
@@ -29,6 +30,7 @@ from .models import (
     _SpotifyArtistCandidate,
 )
 from .network import proxy_url_for_source, urlopen_with_retry
+from .parallel import run_ordered_parallel
 from .text_utils import (
     _add_unique_value,
     _duration_close,
@@ -83,20 +85,35 @@ class SpotifyClient:
         if not metadata.title:
             return []
         access_token = self._get_access_token()
-        candidates: list[SpotifyTrackCandidate] = []
         errors: list[str] = []
-        for market in self.markets:
-            market_candidates = self._search_market_tracks(metadata, access_token, market, len(candidates), errors)
+
+        def search_market(market: str) -> tuple[list[SpotifyTrackCandidate], list[str]]:
+            market_errors: list[str] = []
+            market_candidates = self._search_market_tracks(metadata, access_token, market, 0, market_errors)
             if self._should_search_artist_albums(metadata, market_candidates):
                 market_candidates.extend(
                     self._search_artist_album_tracks(
                         metadata,
                         access_token,
                         market,
-                        len(candidates) + len(market_candidates),
+                        len(market_candidates),
                     )
                 )
-            candidates.extend(_dedupe_spotify_candidates(market_candidates))
+            return _dedupe_spotify_candidates(market_candidates), market_errors
+
+        market_results = run_ordered_parallel(
+            self.markets,
+            search_market,
+            max_workers=load_positive_int_config("TTML_SPOTIFY_MARKET_WORKERS", default=2),
+        )
+
+        candidates: list[SpotifyTrackCandidate] = []
+        for market_candidates, market_errors in market_results:
+            errors.extend(market_errors)
+            candidates.extend(
+                replace(candidate, source_index=len(candidates) + index)
+                for index, candidate in enumerate(market_candidates)
+            )
         if errors and not candidates:
             raise LookupError("; ".join(errors))
         return candidates

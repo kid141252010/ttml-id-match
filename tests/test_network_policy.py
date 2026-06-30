@@ -37,6 +37,13 @@ class NetworkPolicyTests(unittest.TestCase):
         with patch.dict(os.environ, {"TTML_PROXY_SPOTIFY": "http://spotify-proxy:8080"}, clear=True):
             self.assertEqual(proxy_url_for_source("spotify"), "http://spotify-proxy:8080")
 
+    def test_positive_integer_config_rejects_invalid_environment_value(self):
+        from ttml_metadata.config import load_positive_int_config
+
+        with patch.dict(os.environ, {"TTML_APPLE_MUSIC_WORKERS": "fast"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "TTML_APPLE_MUSIC_WORKERS"):
+                load_positive_int_config("TTML_APPLE_MUSIC_WORKERS", default=3)
+
 
 if __name__ == "__main__":
     unittest.main()

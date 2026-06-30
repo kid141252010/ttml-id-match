@@ -19,6 +19,27 @@ def load_config_value(
     return values.get(name)
 
 
+def load_positive_int_config(
+    name: str,
+    *,
+    default: int,
+    env_path: Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> int:
+    value = load_config_value(name, env_path=env_path, environ=environ)
+    if value is None:
+        if default < 1:
+            raise ValueError(f"{name} default must be at least 1")
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be at least 1")
+    return parsed
+
+
 def read_dotenv_values(path: Path, *, allowed_keys: Iterable[str] | None = None) -> dict[str, str]:
     if not path.exists():
         return {}

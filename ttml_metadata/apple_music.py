@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable
 
-from .config import clean_env_value, load_config_value
+from .config import clean_env_value, load_config_value, load_positive_int_config
 from .console import _safe_print, _color_text
 from .models import (
     APPLE_MUSIC_ARTIST_ALBUM_LIMIT,
@@ -26,6 +26,7 @@ from .models import (
     _AppleMusicArtistCandidate,
 )
 from .network import proxy_url_for_source, urlopen_with_retry
+from .parallel import run_ordered_parallel
 from .text_utils import (
     _add_unique_list_value,
     _add_unique_value,
@@ -321,62 +322,18 @@ def collect_apple_music_metadata(
             result.errors.append("音频中未读取到 Apple Music 歌曲 ID 或专辑 ID")
         return result
 
+    storefront_results = run_ordered_parallel(
+        store_order,
+        lambda store: _collect_apple_music_storefront(metadata, client, store),
+        max_workers=load_positive_int_config("TTML_APPLE_MUSIC_WORKERS", default=3),
+    )
+
     all_candidates: list[AppleMusicTrackCandidate] = []
-    for store in store_order:
-        store_candidates: list[AppleMusicTrackCandidate] = []
-        album_errors: list[str] = []
-
-        if metadata.playlist_id:
-            match = _match_album_store(metadata, client, store, metadata.playlist_id, album_errors)
-            if match.track:
-                candidate = _apple_music_candidate_from_flat_track(
-                    match.track,
-                    store,
-                    len(store_candidates),
-                    match.source,
-                )
-                if candidate:
-                    store_candidates.append(candidate)
-
-        if metadata.title:
-            try:
-                store_candidates.extend(
-                    _normalize_apple_music_candidates(
-                        client.search_songs(store, metadata),
-                        store,
-                        len(store_candidates),
-                        "search",
-                    )
-                )
-            except Exception as exc:
-                result.errors.append(f"{store}: Apple Music 搜索失败: {exc}")
-
-        if _apple_music_should_search_artist_albums(metadata, store_candidates):
-            store_candidates.extend(
-                _search_apple_music_artist_album_candidates(
-                    metadata,
-                    client,
-                    store,
-                    len(store_candidates),
-                    result.errors,
-                )
-            )
-
-        sorted_store_candidates = _dedupe_apple_music_candidates(
-            sorted(
-                store_candidates,
-                key=lambda candidate: (
-                    -_apple_music_candidate_score(metadata, candidate),
-                    _apple_music_source_priority(candidate.match_source),
-                    candidate.source_index,
-                ),
-            )
-        )
+    for store, sorted_store_candidates, errors in storefront_results:
+        result.errors.extend(errors)
         if sorted_store_candidates:
             result.candidates_by_storefront[store] = sorted_store_candidates
             all_candidates.extend(sorted_store_candidates)
-        else:
-            result.errors.extend(album_errors)
 
     result.candidates = sorted(
         all_candidates,
@@ -393,6 +350,66 @@ def collect_apple_music_metadata(
         result.sources.append("not-found")
         result.errors.append("Apple Music 未找到带歌曲 ID 的候选")
     return result
+
+
+def _collect_apple_music_storefront(
+    metadata: AudioMetadata,
+    client: AppleMusicClientProtocol,
+    store: str,
+) -> tuple[str, list[AppleMusicTrackCandidate], list[str]]:
+    store_candidates: list[AppleMusicTrackCandidate] = []
+    errors: list[str] = []
+    album_errors: list[str] = []
+
+    if metadata.playlist_id:
+        match = _match_album_store(metadata, client, store, metadata.playlist_id, album_errors)
+        if match.track:
+            candidate = _apple_music_candidate_from_flat_track(
+                match.track,
+                store,
+                len(store_candidates),
+                match.source,
+            )
+            if candidate:
+                store_candidates.append(candidate)
+
+    if metadata.title:
+        try:
+            store_candidates.extend(
+                _normalize_apple_music_candidates(
+                    client.search_songs(store, metadata),
+                    store,
+                    len(store_candidates),
+                    "search",
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{store}: Apple Music 搜索失败: {exc}")
+
+    if _apple_music_should_search_artist_albums(metadata, store_candidates):
+        store_candidates.extend(
+            _search_apple_music_artist_album_candidates(
+                metadata,
+                client,
+                store,
+                len(store_candidates),
+                errors,
+            )
+        )
+
+    sorted_store_candidates = _dedupe_apple_music_candidates(
+        sorted(
+            store_candidates,
+            key=lambda candidate: (
+                -_apple_music_candidate_score(metadata, candidate),
+                _apple_music_source_priority(candidate.match_source),
+                candidate.source_index,
+            ),
+        )
+    )
+    if not sorted_store_candidates:
+        errors.extend(album_errors)
+    return store, sorted_store_candidates, errors
 
 
 def confirm_apple_music_candidates(

@@ -60,6 +60,20 @@ python fill_ttml_metadata.py example --dry-run --search-workers 1
 
 Web 后端默认沿用相同并发值。单个工作项内部会并行搜索 Apple Music、QQ 音乐和 Spotify；网易云音乐会在 QQ 音乐候选确认后执行。
 
+除外层批量 worker 外，部分来源还有内部请求并发，用于并行互不依赖的区域、市场或查询：
+
+```text
+TTML_APPLE_MUSIC_WORKERS=3
+TTML_SPOTIFY_MARKET_WORKERS=2
+TTML_NCM_QUERY_WORKERS=2
+```
+
+- `TTML_APPLE_MUSIC_WORKERS` 控制 Apple Music storefront 并行数，默认 3。
+- `TTML_SPOTIFY_MARKET_WORKERS` 控制 Spotify market 并行数，默认 2。
+- `TTML_NCM_QUERY_WORKERS` 控制网易云单个 API base 内的歌名、歌手和专辑详情查询并行数，默认 2。
+
+总请求压力约等于外层 `--search-workers` 乘以各来源内部 worker。遇到 429、超时或上游不稳定时，先把对应来源变量降到 `1`；如果仍然限流，再把 CLI 的 `--search-workers` 或 Web 后端的 `search_workers` 降到 `1`。
+
 ## Web 存储后端
 
 本地开发默认使用磁盘临时目录：
