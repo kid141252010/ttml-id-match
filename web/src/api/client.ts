@@ -2,6 +2,7 @@ import type {
   ApplySummary,
   CandidateBase,
   FilePair,
+  PreviewJobResponse,
   PreviewResult,
   SelectionPayload,
   SessionFile,
@@ -19,6 +20,8 @@ export interface IdMatchClient {
   createSession(): Promise<{ session_id: string }>;
   uploadFiles(sessionId: string, files: File[]): Promise<UploadResponse>;
   preview(sessionId: string, pairs: FilePair[]): Promise<{ results: PreviewResult[] }>;
+  createPreviewJob(sessionId: string, pairs: FilePair[]): Promise<PreviewJobResponse>;
+  stepPreviewJob(sessionId: string, jobId: string): Promise<PreviewJobResponse>;
   apply(sessionId: string, selections: SelectionPayload[], previews: PreviewResult[]): Promise<ApplySummary>;
 }
 
@@ -47,6 +50,14 @@ export class HttpIdMatchClient implements IdMatchClient {
     return request(`/sessions/${encodeURIComponent(sessionId)}/preview`, { method: 'POST' });
   }
 
+  async createPreviewJob(sessionId: string): Promise<PreviewJobResponse> {
+    return request(`/sessions/${encodeURIComponent(sessionId)}/preview-jobs`, { method: 'POST' });
+  }
+
+  async stepPreviewJob(sessionId: string, jobId: string): Promise<PreviewJobResponse> {
+    return request(`/sessions/${encodeURIComponent(sessionId)}/preview-jobs/${encodeURIComponent(jobId)}/step`, { method: 'POST' });
+  }
+
   async apply(sessionId: string, selections: SelectionPayload[]): Promise<ApplySummary> {
     return request(`/sessions/${encodeURIComponent(sessionId)}/apply`, {
       method: 'POST',
@@ -57,6 +68,8 @@ export class HttpIdMatchClient implements IdMatchClient {
 }
 
 export class MockIdMatchClient implements IdMatchClient {
+  private previewJobs = new Map<string, { pairs: FilePair[]; nextIndex: number; results: PreviewResult[] }>();
+
   async createSession(): Promise<{ session_id: string }> {
     await delay(40);
     return { session_id: `mock-${Date.now().toString(36)}` };
@@ -71,6 +84,39 @@ export class MockIdMatchClient implements IdMatchClient {
   async preview(_sessionId: string, pairs: FilePair[]): Promise<{ results: PreviewResult[] }> {
     await delay(260);
     return { results: pairs.filter((pair) => pair.ttml).map((pair, index) => makePreview(pair, index)) };
+  }
+
+  async createPreviewJob(_sessionId: string, pairs: FilePair[]): Promise<PreviewJobResponse> {
+    await delay(80);
+    const jobId = `mock-job-${Date.now().toString(36)}`;
+    const previewPairs = pairs.filter((pair) => pair.ttml);
+    this.previewJobs.set(jobId, { pairs: previewPairs, nextIndex: 0, results: [] });
+    return {
+      job_id: jobId,
+      status: previewPairs.length === 0 ? 'complete' : 'pending',
+      total: previewPairs.length,
+      completed: 0,
+      results: [],
+    };
+  }
+
+  async stepPreviewJob(_sessionId: string, jobId: string): Promise<PreviewJobResponse> {
+    await delay(160);
+    const job = this.previewJobs.get(jobId);
+    if (!job) {
+      return { job_id: jobId, status: 'failed', total: 0, completed: 0, results: [], error: 'preview job not found' };
+    }
+    if (job.nextIndex < job.pairs.length) {
+      job.results.push(makePreview(job.pairs[job.nextIndex], job.nextIndex));
+      job.nextIndex += 1;
+    }
+    return {
+      job_id: jobId,
+      status: job.nextIndex >= job.pairs.length ? 'complete' : 'running',
+      total: job.pairs.length,
+      completed: job.results.length,
+      results: job.results,
+    };
   }
 
   async apply(_sessionId: string, _selections: SelectionPayload[], previews: PreviewResult[]): Promise<ApplySummary> {

@@ -28,12 +28,12 @@ const themeOverrides: GlobalThemeOverrides = {
     errorColorHover: '#b91c1c',
     errorColorPressed: '#991b1b',
     errorColorSuppl: '#ef4444',
-    borderRadius: '12px',
+    borderRadius: '8px',
     borderRadiusSmall: '8px',
   },
   Button: {
-    borderRadiusMedium: '10px',
-    borderRadiusLarge: '12px',
+    borderRadiusMedium: '8px',
+    borderRadiusLarge: '8px',
     borderRadiusSmall: '8px',
     fontWeightStrong: '600',
   },
@@ -74,9 +74,9 @@ const steps: Array<{ key: WorkflowStep; path: string; title: string; caption: st
 ];
 
 const pageCopy = computed(() => {
-  if (route.name === 'preview') return { title: '预览与候选选择', subtitle: '按来源检查最佳候选，必要时取消某个市场或区域的写入。' };
-  if (route.name === 'result') return { title: '结果与下载', subtitle: '这里先展示前端结果汇总，下载链接等待后端 ZIP 和单文件 API 接入。' };
-  return { title: '上传与配对', subtitle: '上传 TTML 和音频，前端先用同名规则模拟后端配对结果。' };
+  if (route.name === 'preview') return { title: '候选工作台', subtitle: '逐组核对来源候选、写入预览和批量动作。' };
+  if (route.name === 'result') return { title: '写入复查', subtitle: '检查成功、失败和跳过项，并下载处理后的 TTML。' };
+  return { title: '上传与配对', subtitle: '添加 TTML 与音频文件，先确认识别和配对质量。' };
 });
 
 onMounted(() => {
@@ -118,7 +118,7 @@ function go(step: (typeof steps)[number]) {
             </div>
             <div>
               <h1 class="brand-title">TTML ID Match</h1>
-              <p class="brand-subtitle">AMLL metadata workflow</p>
+              <p class="brand-subtitle">Batch metadata workbench</p>
             </div>
           </div>
 

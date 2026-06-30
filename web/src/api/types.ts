@@ -53,6 +53,17 @@ export interface PreviewResult {
   changes: ChangeSet;
 }
 
+export type PreviewJobStatus = 'pending' | 'running' | 'complete' | 'failed';
+
+export interface PreviewJobResponse {
+  job_id: string;
+  status: PreviewJobStatus;
+  total: number;
+  completed: number;
+  results: PreviewResult[];
+  error?: string | null;
+}
+
 export interface SelectionPayload {
   pair_id: string;
   apple_music: string[];

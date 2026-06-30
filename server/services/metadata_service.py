@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Iterable
@@ -10,6 +12,7 @@ from server.models.schemas import (
     Candidate,
     ChangeSet,
     FilePair,
+    PreviewJobResponse,
     PreviewResponse,
     PreviewResult,
     SelectionPayload,
@@ -58,13 +61,17 @@ class MetadataService:
             credentials = load_spotify_credentials()
             self.spotify_client = SpotifyClient(credentials) if credentials.enabled else None
         self.search_workers = max(1, search_workers)
+        self.search_cache = BatchSearchCache()
 
     def preview(self, state: SessionState) -> PreviewResponse:
-        state.pairs = [pair.model_dump() for pair in pair_session_files(state.upload_dir)]
+        pair_models, fingerprint = refresh_preview_pairs(state)
+        cached = cached_preview_response(state, pair_models, fingerprint)
+        if cached is not None:
+            return cached
+
         state.prepared_pairs = {}
         state.previews = {}
         results: list[PreviewResult] = []
-        pair_models = [FilePair(**pair) for pair in state.pairs if pair.get("ttml")]
         work_items = [
             WorkItem(
                 ttml_path=state.upload_dir / (pair_model.ttml or ""),
@@ -72,7 +79,6 @@ class MetadataService:
             )
             for pair_model in pair_models
         ]
-        cache = BatchSearchCache()
         prepared_pairs, failures = prepare_work_items(
             work_items,
             SearchClients(
@@ -82,7 +88,7 @@ class MetadataService:
                 spotify=self.spotify_client,
             ),
             max_workers=self.search_workers,
-            cache=cache,
+            cache=self.search_cache,
         )
         if failures:
             work_item, error = failures[0]
@@ -93,17 +99,128 @@ class MetadataService:
             prepared_pairs,
             self.ncm_music_client,
             max_workers=self.search_workers,
-            cache=cache,
+            cache=self.search_cache,
         )
         for pair_model, prepared in zip(pair_models, prepared_pairs):
             preview = pair_to_preview(pair_model, prepared)
             state.prepared_pairs[pair_model.id] = prepared
             state.previews[pair_model.id] = preview
             results.append(preview)
+        state.preview_fingerprint = fingerprint
         return PreviewResponse(results=results)
 
+    def create_preview_job(self, state: SessionState) -> PreviewJobResponse:
+        pair_models, fingerprint = refresh_preview_pairs(state)
+        job_id = uuid.uuid4().hex
+        cached = cached_preview_response(state, pair_models, fingerprint)
+        if cached is not None:
+            job = {
+                "job_id": job_id,
+                "status": "complete",
+                "fingerprint": fingerprint,
+                "pair_keys": preview_job_pair_keys(pair_models),
+                "pair_ids": [pair.id for pair in pair_models],
+                "next_index": len(pair_models),
+                "total": len(pair_models),
+                "results": [result.model_dump() for result in cached.results],
+                "error": None,
+            }
+        else:
+            job = {
+                "job_id": job_id,
+                "status": "complete" if not pair_models else "pending",
+                "fingerprint": fingerprint,
+                "pair_keys": preview_job_pair_keys(pair_models),
+                "pair_ids": [pair.id for pair in pair_models],
+                "next_index": 0,
+                "total": len(pair_models),
+                "results": [],
+                "error": None,
+            }
+        state.preview_jobs[job_id] = job
+        return preview_job_response(job)
+
+    def step_preview_job(self, state: SessionState, job_id: str, batch_size: int = 1) -> PreviewJobResponse:
+        try:
+            job = state.preview_jobs[job_id]
+        except KeyError as exc:
+            raise KeyError(f"preview job not found: {job_id}") from exc
+
+        if job.get("status") in {"complete", "failed"}:
+            return preview_job_response(job)
+
+        pair_models, fingerprint = refresh_preview_pairs(state)
+        if job.get("pair_keys") != preview_job_pair_keys(pair_models):
+            job["status"] = "failed"
+            job["error"] = "uploaded files changed; create a new preview job"
+            return preview_job_response(job)
+
+        state.preview_fingerprint = fingerprint
+        pair_by_id = {pair.id: pair for pair in pair_models}
+        pair_ids = [str(pair_id) for pair_id in job.get("pair_ids", [])]
+        next_index = int(job.get("next_index", 0))
+        results = list(job.get("results", []))
+        job["status"] = "running"
+
+        for _ in range(max(1, batch_size)):
+            if next_index >= len(pair_ids):
+                break
+            pair_id = pair_ids[next_index]
+            pair_model = pair_by_id.get(pair_id)
+            if pair_model is None:
+                job["status"] = "failed"
+                job["error"] = f"pair not found: {pair_id}"
+                break
+            try:
+                preview = self.preview_one_pair(state, pair_model)
+            except Exception as exc:
+                job["status"] = "failed"
+                job["error"] = f"{pair_model.ttml}: {exc}"
+                break
+            results.append(preview.model_dump())
+            next_index += 1
+
+        job["results"] = results
+        job["next_index"] = next_index
+        if job.get("status") != "failed":
+            job["status"] = "complete" if next_index >= len(pair_ids) else "running"
+        return preview_job_response(job)
+
+    def preview_one_pair(self, state: SessionState, pair_model: FilePair) -> PreviewResult:
+        work_item = WorkItem(
+            ttml_path=state.upload_dir / (pair_model.ttml or ""),
+            audio_path=(state.upload_dir / pair_model.audio) if pair_model.audio else None,
+        )
+        prepared_pairs, failures = prepare_work_items(
+            [work_item],
+            SearchClients(
+                apple_music=self.apple_music_client,
+                qq_music=self.qq_music_client,
+                ncm_music=self.ncm_music_client,
+                spotify=self.spotify_client,
+            ),
+            max_workers=1,
+            cache=self.search_cache,
+        )
+        if failures:
+            _work_item, error = failures[0]
+            raise ValueError(error)
+        prepared = prepared_pairs[0]
+        _select_preview_defaults(prepared)
+        collect_ncm_for_pairs(
+            [prepared],
+            self.ncm_music_client,
+            max_workers=1,
+            cache=self.search_cache,
+        )
+        preview = pair_to_preview(pair_model, prepared)
+        state.prepared_pairs[pair_model.id] = prepared
+        state.previews[pair_model.id] = preview
+        return preview
+
     def apply(self, state: SessionState, selections: list[SelectionPayload]) -> ApplySummary:
-        if not state.prepared_pairs:
+        pair_models, fingerprint = refresh_preview_pairs(state)
+        if cached_preview_response(state, pair_models, fingerprint) is None:
             self.preview(state)
         selection_by_pair = {selection.pair_id: selection for selection in selections}
         copy_uploads_to_outputs(state.upload_dir, state.output_dir)
@@ -164,6 +281,76 @@ class MetadataService:
             for path in sorted(state.output_dir.glob("*.ttml"), key=lambda item: item.name.lower()):
                 archive.write(path, arcname=path.name)
         return zip_path
+
+
+def refresh_preview_pairs(state: SessionState) -> tuple[list[FilePair], str]:
+    pairs = pair_session_files(state.upload_dir)
+    state.pairs = [pair.model_dump() for pair in pairs]
+    pair_models = [pair for pair in pairs if pair.ttml]
+    return pair_models, preview_fingerprint(state.upload_dir, pair_models)
+
+
+def cached_preview_response(
+    state: SessionState,
+    pair_models: list[FilePair],
+    fingerprint: str,
+) -> PreviewResponse | None:
+    if state.preview_fingerprint != fingerprint:
+        return None
+    results: list[PreviewResult] = []
+    for pair in pair_models:
+        if pair.id not in state.prepared_pairs or pair.id not in state.previews:
+            return None
+        results.append(preview_result_from_value(state.previews[pair.id]))
+    return PreviewResponse(results=results)
+
+
+def preview_fingerprint(upload_dir: Path, pair_models: list[FilePair]) -> str:
+    digest = hashlib.sha256()
+    for pair in pair_models:
+        _fingerprint_part(digest, pair.id)
+        _fingerprint_part(digest, pair.ttml or "")
+        _fingerprint_file(digest, upload_dir / pair.ttml) if pair.ttml else _fingerprint_part(digest, "")
+        _fingerprint_part(digest, pair.audio or "")
+        _fingerprint_file(digest, upload_dir / pair.audio) if pair.audio else _fingerprint_part(digest, "")
+    return digest.hexdigest()
+
+
+def preview_job_pair_keys(pair_models: list[FilePair]) -> list[str]:
+    return [f"{pair.id}\0{pair.ttml or ''}\0{pair.audio or ''}" for pair in pair_models]
+
+
+def preview_job_response(job: dict[str, object]) -> PreviewJobResponse:
+    results = [preview_result_from_value(result) for result in job.get("results", []) if isinstance(result, (dict, PreviewResult))]
+    return PreviewJobResponse(
+        job_id=str(job["job_id"]),
+        status=str(job["status"]),
+        total=int(job.get("total", len(results))),
+        completed=len(results),
+        results=results,
+        error=str(job["error"]) if job.get("error") is not None else None,
+    )
+
+
+def preview_result_from_value(value: PreviewResult | dict[str, object]) -> PreviewResult:
+    if isinstance(value, PreviewResult):
+        return value
+    return PreviewResult.model_validate(value)
+
+
+def _fingerprint_part(digest, value: str) -> None:
+    digest.update(value.encode("utf-8", errors="surrogatepass"))
+    digest.update(b"\0")
+
+
+def _fingerprint_file(digest, path: Path) -> None:
+    try:
+        stat = path.stat()
+    except OSError:
+        _fingerprint_part(digest, "missing")
+        return
+    _fingerprint_part(digest, str(stat.st_size))
+    _fingerprint_part(digest, str(stat.st_mtime_ns))
 
 
 def pair_to_preview(pair: FilePair, prepared: PairMetadata) -> PreviewResult:

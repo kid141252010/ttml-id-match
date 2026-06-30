@@ -42,9 +42,11 @@ function onDrop(event: DragEvent) {
       <div class="upload-icon">
         <NIcon :component="UploadCloud" size="30" />
       </div>
-      <h2 class="upload-title">{{ dragging ? '释放鼠标以上传' : '拖入音频与 TTML 文件' }}</h2>
-      <p class="upload-text">{{ dragging ? '系统将立即解析文件并建立配对关系' : '前端会按同名规则模拟配对，支持 TTML-only 预览路径' }}</p>
-      <NButton type="primary" strong secondary style="margin-top: 16px" @click.stop="openPicker">
+      <div class="upload-copy">
+        <h2 class="upload-title">{{ dragging ? '释放鼠标以上传' : '添加 TTML 与音频文件' }}</h2>
+        <p class="upload-text">{{ dragging ? '系统将立即解析文件并建立配对关系' : '同名文件会自动配对，缺音频的 TTML 仍可进入预览。' }}</p>
+      </div>
+      <NButton type="primary" strong secondary @click.stop="openPicker">
         <template #icon>
           <NIcon :component="FolderUp" />
         </template>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import tempfile
@@ -19,6 +20,7 @@ class BlobArtifactRecord:
     pathname: str
     url: str
     download_url: str
+    sha256: str | None = None
 
 
 @dataclass
@@ -30,6 +32,8 @@ class StoredSession:
     pairs: list[dict[str, str | None]] = field(default_factory=list)
     prepared_pairs: dict[str, PairMetadata] = field(default_factory=dict)
     previews: dict[str, PreviewResult] = field(default_factory=dict)
+    preview_fingerprint: str | None = None
+    preview_jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class ArtifactStore(Protocol):
@@ -225,11 +229,21 @@ class VercelArtifactStore(LocalArtifactStore):
         self.blob_store.delete_prefix(self._blob_prefix(session_id))
 
     def _persist_session(self, session: StoredSession) -> dict[str, Any]:
-        upload_records = self._sync_directory(session.upload_dir, "uploads")
-        output_records = self._sync_directory(session.output_dir, "outputs")
+        previous = self.key_value_store.get_json(self._session_key(session.session_id)) or {}
+        upload_records = self._sync_directory(
+            session.upload_dir,
+            "uploads",
+            previous_records=_records_by_pathname(previous.get("upload_records", [])),
+        )
+        output_records = self._sync_directory(
+            session.output_dir,
+            "outputs",
+            previous_records=_records_by_pathname(previous.get("output_records", [])),
+        )
         return {
             "session_id": session.session_id,
             "pairs": session.pairs,
+            "preview_jobs": session.preview_jobs,
             "upload_records": [asdict(record) for record in upload_records],
             "output_records": [asdict(record) for record in output_records],
         }
@@ -238,20 +252,40 @@ class VercelArtifactStore(LocalArtifactStore):
         session_id = str(record["session_id"])
         session = self._create_session_dirs(session_id)
         session.pairs = list(record.get("pairs", []))
+        session.preview_jobs = dict(record.get("preview_jobs", {}))
         for artifact in record.get("upload_records", []):
             self.blob_store.get_to_file(artifact["pathname"], session.upload_dir / Path(artifact["pathname"]).name)
         for artifact in record.get("output_records", []):
             self.blob_store.get_to_file(artifact["pathname"], session.output_dir / Path(artifact["pathname"]).name)
         return session
 
-    def _sync_directory(self, directory: Path, kind: str) -> list[BlobArtifactRecord]:
+    def _sync_directory(
+        self,
+        directory: Path,
+        kind: str,
+        *,
+        previous_records: dict[str, BlobArtifactRecord] | None = None,
+    ) -> list[BlobArtifactRecord]:
         records: list[BlobArtifactRecord] = []
+        previous_records = previous_records or {}
         for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
             if not path.is_file():
                 continue
             blob_path = f"{self._blob_prefix(path.parent.parent.name)}/{kind}/{path.name}"
-            record = self.blob_store.put_file(path, blob_path)
-            records.append(record)
+            digest = _file_sha256(path)
+            previous = previous_records.get(blob_path)
+            if previous is not None and previous.sha256 == digest:
+                records.append(previous)
+                continue
+            uploaded = self.blob_store.put_file(path, blob_path)
+            records.append(
+                BlobArtifactRecord(
+                    pathname=uploaded.pathname,
+                    url=uploaded.url,
+                    download_url=uploaded.download_url,
+                    sha256=digest,
+                )
+            )
         return records
 
     @staticmethod
@@ -274,3 +308,30 @@ def build_session_store(root: Path | None = None) -> ArtifactStore:
 
 def _encode_key(value: str) -> str:
     return parse.quote(value, safe="")
+
+
+def _records_by_pathname(values: object) -> dict[str, BlobArtifactRecord]:
+    if not isinstance(values, list):
+        return {}
+    records: dict[str, BlobArtifactRecord] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        pathname = value.get("pathname")
+        if not isinstance(pathname, str):
+            continue
+        records[pathname] = BlobArtifactRecord(
+            pathname=pathname,
+            url=str(value.get("url") or ""),
+            download_url=str(value.get("download_url") or ""),
+            sha256=value.get("sha256") if isinstance(value.get("sha256"), str) else None,
+        )
+    return records
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

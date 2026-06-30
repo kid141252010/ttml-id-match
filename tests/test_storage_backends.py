@@ -71,12 +71,43 @@ class StorageBackendTests(unittest.TestCase):
             self.assertEqual((loaded.output_dir / "Song.ttml").read_text(encoding="utf-8"), '<tt done="1" />')
             self.assertEqual(loaded.pairs[0]["id"], "pair-1")
 
+    def test_vercel_artifact_store_reuses_unchanged_blob_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blob = FakeBlobStore()
+            kv = FakeKeyValueStore()
+            store = VercelArtifactStore(
+                root,
+                blob_token="blob-token",
+                kv_rest_api_url="https://kv.example",
+                kv_rest_api_token="kv-token",
+                blob_store=blob,
+                key_value_store=kv,
+            )
+            session = store.create_session()
+            (session.upload_dir / "Song.ttml").write_text("<tt />", encoding="utf-8")
+            (session.output_dir / "Song.ttml").write_text("<tt done=\"1\" />", encoding="utf-8")
+
+            store.sync_session(session)
+            first_uploads = list(blob.put_calls)
+            store.sync_session(session)
+
+            self.assertEqual(blob.put_calls, first_uploads)
+
+            (session.output_dir / "Song.ttml").write_text("<tt done=\"2\" />", encoding="utf-8")
+            store.sync_session(session)
+
+            self.assertEqual(len(blob.put_calls), len(first_uploads) + 1)
+            self.assertEqual(blob.put_calls[-1], f"id-match/{session.session_id}/outputs/Song.ttml")
+
 
 class FakeBlobStore:
     def __init__(self):
         self.objects: dict[str, bytes] = {}
+        self.put_calls: list[str] = []
 
     def put_file(self, local_path: Path, blob_path: str) -> BlobArtifactRecord:
+        self.put_calls.append(blob_path)
         self.objects[blob_path] = Path(local_path).read_bytes()
         return BlobArtifactRecord(pathname=blob_path, url=f"blob://{blob_path}", download_url=f"blob://{blob_path}")
 

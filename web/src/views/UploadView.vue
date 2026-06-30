@@ -13,6 +13,8 @@ const router = useRouter();
 
 const ttmlCount = computed(() => store.files.filter((file) => file.kind === 'ttml').length);
 const audioCount = computed(() => store.files.filter((file) => file.kind === 'audio').length);
+const pairedCount = computed(() => store.pairs.filter((pair) => pair.status === 'paired').length);
+const ttmlOnlyCount = computed(() => store.pairs.filter((pair) => pair.status === 'ttml_only').length);
 
 async function onFiles(files: File[]) {
   await store.uploadFiles(files);
@@ -25,14 +27,17 @@ async function startPreview() {
 </script>
 
 <template>
-  <div class="view-grid">
-    <div class="stack">
+  <div class="workbench-grid upload-workbench">
+    <div class="workbench-primary stack">
       <FileUploader @files="onFiles" />
 
       <section class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">上传文件</h2>
-          <div style="display: flex; gap: 8px; flex-wrap: wrap">
+          <div>
+            <h2 class="panel-title">文件识别</h2>
+            <p class="panel-kicker">检查文件类型、大小和配对状态，再进入候选预览。</p>
+          </div>
+          <div class="status-tags">
             <NTag type="success" size="small" round>
               <template #icon><NIcon :component="FileText" /></template>
               {{ ttmlCount }} TTML
@@ -44,7 +49,7 @@ async function startPreview() {
           </div>
         </div>
         <div class="panel-body">
-          <div class="metric-row">
+          <div class="metric-row" data-testid="upload-workbench-summary">
             <div class="metric">
               <span class="metric-value">{{ store.files.length }}</span>
               <span class="metric-label">文件</span>
@@ -54,21 +59,25 @@ async function startPreview() {
               <span class="metric-label">TTML 组</span>
             </div>
             <div class="metric">
-              <span class="metric-value">{{ store.pairs.filter((pair) => pair.status === 'paired').length }}</span>
+              <span class="metric-value">{{ pairedCount }}</span>
               <span class="metric-label">音频配对</span>
+            </div>
+            <div class="metric warning-metric">
+              <span class="metric-value">{{ ttmlOnlyCount }}</span>
+              <span class="metric-label">仅歌词</span>
             </div>
           </div>
 
-          <div v-if="store.files.length" class="file-list" style="margin-top: 20px">
+          <div v-if="store.files.length" class="file-list compact-list" data-testid="upload-file-review">
             <div v-for="file in store.files" :key="file.name" class="file-row">
-              <div class="file-main" style="width: 100%;">
-                <div style="display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1;">
-                  <NIcon :component="file.kind === 'ttml' ? FileText : FileAudio" :color="file.kind === 'ttml' ? 'var(--app-accent)' : '#6366f1'" size="18" />
-                  <span class="file-name" style="word-break: break-all; font-family: 'JetBrains Mono', monospace; font-size: 13px;">{{ file.name }}</span>
+              <div class="file-main">
+                <div class="file-identity">
+                  <NIcon :component="file.kind === 'ttml' ? FileText : FileAudio" :color="file.kind === 'ttml' ? 'var(--app-accent)' : 'var(--app-info)'" size="18" />
+                  <span class="file-name mono-text">{{ file.name }}</span>
                 </div>
-                <div style="display: flex; align-items: center; gap: 12px; margin-left: 12px; flex-shrink: 0;">
+                <div class="row-meta">
                   <NTag :type="file.kind === 'ttml' ? 'success' : 'info'" size="small" round strong>{{ file.kind.toUpperCase() }}</NTag>
-                  <span class="muted" style="font-family: 'JetBrains Mono', monospace; font-size: 12px;">
+                  <span class="muted mono-text">
                     {{ file.size > 1024 * 1024 ? (file.size / (1024 * 1024)).toFixed(1) + ' MB' : file.size > 1024 ? Math.round(file.size / 1024) + ' KB' : file.size + ' B' }}
                   </span>
                 </div>
@@ -86,6 +95,8 @@ async function startPreview() {
       </section>
     </div>
 
-    <PairList :pairs="store.pairs" :selected-id="store.selectedPairId" @select="store.selectPair" />
+    <div class="workbench-context" data-testid="upload-pairing-context">
+      <PairList :pairs="store.pairs" :selected-id="store.selectedPairId" @select="store.selectPair" />
+    </div>
   </div>
 </template>

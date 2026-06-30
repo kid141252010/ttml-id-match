@@ -67,6 +67,15 @@ class PreviewResponse(BaseModel):
     results: list[PreviewResult]
 
 
+class PreviewJobResponse(BaseModel):
+    job_id: str
+    status: str
+    total: int
+    completed: int
+    results: list[PreviewResult] = Field(default_factory=list)
+    error: str | None = None
+
+
 class SelectionPayload(BaseModel):
     pair_id: str
     apple_music: list[str] = Field(default_factory=list)

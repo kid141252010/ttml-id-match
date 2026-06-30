@@ -17,12 +17,70 @@ const router = useRouter();
     </template>
   </NEmpty>
 
-  <div v-else class="view-grid">
-    <section class="panel">
+  <div v-else class="workbench-grid result-workbench">
+    <section class="panel workbench-primary">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">写入复查</h2>
+          <p class="panel-kicker">优先检查失败和跳过项，再下载全部或单个 TTML。</p>
+        </div>
+        <NTag size="small" type="success" round>{{ store.resultSummary.files.length }} 文件</NTag>
+      </div>
+      <div class="panel-body">
+        <div class="metric-row" data-testid="result-workbench-summary">
+          <div class="metric">
+            <span class="metric-value">{{ store.resultSummary.succeeded }}</span>
+            <span class="metric-label">成功</span>
+          </div>
+          <div class="metric danger-metric">
+            <span class="metric-value">{{ store.resultSummary.failed }}</span>
+            <span class="metric-label">失败</span>
+          </div>
+          <div class="metric warning-metric">
+            <span class="metric-value">{{ store.resultSummary.skipped }}</span>
+            <span class="metric-label">跳过</span>
+          </div>
+        </div>
+
+        <div class="result-list compact-list" data-testid="result-file-review">
+          <div v-for="file in store.resultSummary.files" :key="file.pair_id" class="result-row" :class="`status-${file.status}`">
+            <div class="result-main">
+              <div class="file-identity">
+                <NIcon :component="FileText" color="var(--app-accent)" size="18" />
+                <span class="result-name mono-text">{{ file.ttml }}</span>
+              </div>
+              <NTag :type="file.status === 'success' ? 'success' : file.status === 'skipped' ? 'warning' : 'error'" size="small" round strong>
+                {{ file.status === 'success' ? '成功' : file.status === 'skipped' ? '跳过' : '失败' }}
+              </NTag>
+            </div>
+
+            <div class="metadata-summary">
+              <span class="muted summary-label">写入元数据</span>
+              <template v-if="file.status === 'success' && file.metadata_written.length">
+                <NTag v-for="meta in file.metadata_written" :key="meta" size="small" :bordered="false" class="metadata-chip mono-text">
+                  {{ meta }}
+                </NTag>
+              </template>
+              <span v-else-if="file.error" class="error-text">{{ file.error }}</span>
+              <span v-else class="muted">-</span>
+            </div>
+
+            <div class="row-actions">
+              <NButton size="small" tag="a" :href="store.sessionId ? downloadFileUrl(store.sessionId, file.ttml) : undefined" :disabled="file.status !== 'success'" secondary strong>
+                <template #icon><NIcon :component="FileDown" /></template>
+                单文件下载
+              </NButton>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel workbench-context">
       <div class="panel-body">
         <NResult status="success" title="写入流程已完成" description="可下载单个 TTML，也可以打包下载全部结果。">
           <template #footer>
-            <div class="action-row" style="justify-content: center">
+            <div class="action-row context-actions">
               <NButton type="primary" tag="a" :href="store.sessionId ? downloadAllUrl(store.sessionId) : undefined">
                 <template #icon><NIcon :component="Archive" /></template>
                 打包下载 ZIP
@@ -34,61 +92,6 @@ const router = useRouter();
             </div>
           </template>
         </NResult>
-
-        <div class="metric-row" style="margin-top: 10px">
-          <div class="metric">
-            <span class="metric-value">{{ store.resultSummary.succeeded }}</span>
-            <span class="metric-label">成功</span>
-          </div>
-          <div class="metric">
-            <span class="metric-value">{{ store.resultSummary.failed }}</span>
-            <span class="metric-label">失败</span>
-          </div>
-          <div class="metric">
-            <span class="metric-value">{{ store.resultSummary.skipped }}</span>
-            <span class="metric-label">跳过</span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-header">
-        <h2 class="panel-title">逐文件结果</h2>
-        <NTag size="small" type="success" round>{{ store.resultSummary.files.length }} 文件</NTag>
-      </div>
-      <div class="panel-body">
-        <div class="result-list">
-          <div v-for="file in store.resultSummary.files" :key="file.pair_id" class="result-row">
-            <div class="result-main">
-              <div style="display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1;">
-                <NIcon :component="FileText" color="var(--app-accent)" size="18" />
-                <span class="result-name" style="word-break: break-all; font-family: 'JetBrains Mono', monospace; font-size: 13px;">{{ file.ttml }}</span>
-              </div>
-              <NTag :type="file.status === 'success' ? 'success' : 'error'" size="small" round strong>
-                {{ file.status === 'success' ? '成功' : '失败' }}
-              </NTag>
-            </div>
-            
-            <div style="display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 10px; align-items: center;">
-              <span class="muted" style="font-size: 12px; font-weight: 600;">写入元数据:</span>
-              <template v-if="file.status === 'success' && file.metadata_written.length">
-                <NTag v-for="meta in file.metadata_written" :key="meta" size="small" :bordered="false" style="background: rgba(13, 148, 136, 0.08); color: var(--app-accent); font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600;">
-                  {{ meta }}
-                </NTag>
-              </template>
-              <span v-else-if="file.error" style="color: var(--app-danger); font-size: 12px; font-weight: 500;">{{ file.error }}</span>
-              <span v-else class="muted" style="font-size: 12px;">-</span>
-            </div>
-
-            <div style="display: flex; justify-content: flex-end;">
-              <NButton size="small" tag="a" :href="store.sessionId ? downloadFileUrl(store.sessionId, file.ttml) : undefined" :disabled="file.status !== 'success'" secondary strong>
-                <template #icon><NIcon :component="FileDown" /></template>
-                单文件下载
-              </NButton>
-            </div>
-          </div>
-        </div>
       </div>
     </section>
   </div>

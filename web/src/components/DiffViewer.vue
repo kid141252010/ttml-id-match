@@ -20,7 +20,10 @@ function entries(data: Record<string, string[]>) {
 <template>
   <section class="panel">
     <div class="panel-header">
-      <h2 class="panel-title">写入预览</h2>
+      <div>
+        <h2 class="panel-title">写入预览</h2>
+        <p class="panel-kicker">当前选择将写入的元数据变化。</p>
+      </div>
       <NTag size="small" round>dry-run</NTag>
     </div>
     <div class="panel-body">
@@ -34,10 +37,10 @@ function entries(data: Record<string, string[]>) {
             v-for="item in entries(group.data)" 
             :key="`${group.key}-${item.key}-${item.value}`" 
             class="change-item"
-            :style="{ borderLeft: `3px solid var(--app-${group.type === 'default' ? 'text-muted' : group.type})` }"
+            :class="`change-${group.key}`"
           >
             <strong>{{ item.key }}</strong>
-            <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; word-break: break-all; margin-top: 4px;">{{ item.value }}</div>
+            <div class="mono-text">{{ item.value }}</div>
           </div>
         </div>
       </div>

@@ -1,7 +1,10 @@
 import { defineStore } from 'pinia';
 
 import { client } from '@/api/client';
-import type { ApplySummary, FilePair, PreviewResult, ProgressEvent, SelectionPayload, SessionFile, WorkflowStep } from '@/api/types';
+import type { IdMatchClient } from '@/api/client';
+import type { ApplySummary, FilePair, PreviewJobResponse, PreviewResult, ProgressEvent, SelectionPayload, SessionFile, WorkflowStep } from '@/api/types';
+
+let activeClient: IdMatchClient = client;
 
 interface SessionState {
   sessionId: string | null;
@@ -56,9 +59,13 @@ export const useSessionStore = defineStore('session', {
   },
 
   actions: {
+    setClient(nextClient: IdMatchClient) {
+      activeClient = nextClient;
+    },
+
     async ensureSession() {
       if (this.sessionId) return;
-      const response = await client.createSession();
+      const response = await activeClient.createSession();
       this.sessionId = response.session_id;
       this.addProgress('info', `会话已创建 ${response.session_id}`);
     },
@@ -67,7 +74,7 @@ export const useSessionStore = defineStore('session', {
       await this.ensureSession();
       this.loading = true;
       try {
-        const response = await client.uploadFiles(this.sessionId!, files);
+        const response = await activeClient.uploadFiles(this.sessionId!, files);
         this.files = response.files;
         this.pairs = response.pairs;
         this.selectedPairId = response.pairs[0]?.id ?? null;
@@ -89,8 +96,16 @@ export const useSessionStore = defineStore('session', {
       this.loading = true;
       try {
         this.addProgress('info', '开始 dry-run 预览');
-        const response = await client.preview(this.sessionId!, this.pairs);
+        const response = await runPreviewJob(this.sessionId!, this.pairs, (job) => {
+          this.previewResults = job.results;
+          if (job.completed > 0 && job.status !== 'complete') {
+            this.addProgress('info', `预览进度 ${job.completed}/${job.total}`);
+          }
+        });
         this.previewResults = response.results;
+        if (response.status === 'failed') {
+          throw new Error(response.error ?? '预览失败');
+        }
         this.selections = Object.fromEntries(response.results.map((result) => [result.pair_id, defaultSelection(result)]));
         this.selectedPairId = response.results[0]?.pair_id ?? null;
         this.currentStep = 'preview';
@@ -125,7 +140,7 @@ export const useSessionStore = defineStore('session', {
       try {
         const payload = Object.values(this.selections);
         this.addProgress('info', `写入 ${payload.length} 组选择`);
-        this.resultSummary = await client.apply(this.sessionId!, payload, this.previewResults);
+        this.resultSummary = await activeClient.apply(this.sessionId!, payload, this.previewResults);
         this.currentStep = 'result';
         this.addProgress('success', '写入流程已完成');
       } catch (error) {
@@ -150,6 +165,16 @@ export const useSessionStore = defineStore('session', {
     },
   },
 });
+
+async function runPreviewJob(sessionId: string, pairs: FilePair[], onProgress: (job: PreviewJobResponse) => void): Promise<PreviewJobResponse> {
+  let job = await activeClient.createPreviewJob(sessionId, pairs);
+  onProgress(job);
+  while (job.status === 'pending' || job.status === 'running') {
+    job = await activeClient.stepPreviewJob(sessionId, job.job_id);
+    onProgress(job);
+  }
+  return job;
+}
 
 function defaultSelection(result: PreviewResult): SelectionPayload {
   return {

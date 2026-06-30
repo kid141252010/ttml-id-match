@@ -45,17 +45,22 @@ async function apply() {
     </template>
   </NEmpty>
 
-  <div v-else class="preview-grid">
-    <PairList :pairs="store.pairs" :selected-id="store.selectedPairId" selectable @select="store.selectPair" />
+  <div v-else class="workbench-grid preview-workbench">
+    <div class="workbench-queue">
+      <PairList :pairs="store.pairs" :selected-id="store.selectedPairId" selectable @select="store.selectPair" />
+    </div>
 
-    <div class="stack">
+    <div class="workbench-primary stack">
       <section class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">候选来源</h2>
+          <div>
+            <h2 class="panel-title">候选核对</h2>
+            <p class="panel-kicker">按来源快速比较候选，确认后再写入 TTML。</p>
+          </div>
           <NTag size="small" round>已选 {{ store.selectionCount }}</NTag>
         </div>
         <div class="panel-body">
-          <div class="source-tabs">
+          <div class="source-tabs" data-testid="source-switcher">
             <button
               v-for="source in sourceOptions"
               :key="source.key"
@@ -65,7 +70,7 @@ async function apply() {
             >
               <NIcon :component="source.icon" size="15" />
               <span>{{ source.label }}</span>
-              <span style="opacity: 0.75; font-size: 11px; font-family: 'JetBrains Mono', monospace; margin-left: 2px;">
+              <span class="source-count mono-text">
                 {{ preview ? sourceCount(preview, source.key) : 0 }}
               </span>
             </button>
@@ -99,7 +104,9 @@ async function apply() {
         </div>
       </section>
 
-      <DiffViewer v-if="preview" :changes="preview.changes" />
+      <div v-if="preview" class="workbench-context" data-testid="write-preview-context">
+        <DiffViewer :changes="preview.changes" />
+      </div>
     </div>
   </div>
 </template>

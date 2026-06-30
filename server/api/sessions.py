@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from server.models.schemas import ApplyRequest, ApplySummary, PreviewResponse, SessionResponse, UploadResponse
+from server.models.schemas import ApplyRequest, ApplySummary, PreviewJobResponse, PreviewResponse, SessionResponse, UploadResponse
 from server.services.file_service import list_session_files, pair_session_files, save_uploads
 from server.services.metadata_service import MetadataService
 from server.services.session_manager import SessionManager, SessionState
@@ -28,6 +28,10 @@ def build_router(session_manager: SessionManager, metadata_service: MetadataServ
         await save_uploads(state.upload_dir, files)
         pairs = pair_session_files(state.upload_dir)
         state.pairs = [pair.model_dump() for pair in pairs]
+        state.prepared_pairs = {}
+        state.previews = {}
+        state.preview_fingerprint = None
+        state.preview_jobs = {}
         session_manager.sync(state)
         return UploadResponse(files=list_session_files(state.upload_dir), pairs=pairs)
 
@@ -41,6 +45,26 @@ def build_router(session_manager: SessionManager, metadata_service: MetadataServ
     def preview(state: SessionState = Depends(session)) -> PreviewResponse:
         try:
             return metadata_service.preview(state)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/sessions/{session_id}/preview-jobs", response_model=PreviewJobResponse)
+    def create_preview_job(state: SessionState = Depends(session)) -> PreviewJobResponse:
+        try:
+            response = metadata_service.create_preview_job(state)
+            session_manager.sync(state)
+            return response
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/sessions/{session_id}/preview-jobs/{job_id}/step", response_model=PreviewJobResponse)
+    def step_preview_job(job_id: str, state: SessionState = Depends(session)) -> PreviewJobResponse:
+        try:
+            response = metadata_service.step_preview_job(state, job_id)
+            session_manager.sync(state)
+            return response
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
