@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable
 
+from .config import clean_env_value, load_config_value
 from .console import _safe_print, _color_text
 from .models import (
     APPLE_MUSIC_ARTIST_ALBUM_LIMIT,
@@ -48,10 +49,12 @@ from .text_utils import (
 )
 
 class AppleMusicClient:
-    def __init__(self, timeout: int = 20, proxy_url: str | None = None):
+    def __init__(self, timeout: int = 20, proxy_url: str | None = None, bearer_token: str | None = None):
         self.timeout = timeout
         self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("apple_music")
-        self._token: str | None = None
+        self._token: str | None = _normalize_bearer_token(
+            bearer_token if bearer_token is not None else load_config_value("APPLE_MUSIC_BEARER_TOKEN")
+        )
         self._page_cache: dict[tuple[str, str], str] = {}
         self._track_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._json_cache: dict[str, dict[str, Any]] = {}
@@ -962,6 +965,16 @@ def is_valid_apple_music_song_id(value: str | None) -> bool:
         return False
     value = str(value).strip()
     return value.isdigit() and int(value) >= 100000
+
+
+def _normalize_bearer_token(value: str | None) -> str | None:
+    token = clean_env_value(value)
+    if not token:
+        return None
+    scheme, _, rest = token.partition(" ")
+    if scheme.casefold() == "bearer":
+        return rest.strip() or None
+    return token
 
 
 def _track_id(track: dict[str, Any]) -> str | None:

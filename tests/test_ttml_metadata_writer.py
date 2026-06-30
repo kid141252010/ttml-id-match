@@ -407,6 +407,71 @@ class TtmlMetadataWriterTests(unittest.TestCase):
         self.assertEqual(text, "apple page")
         self.assertEqual(attempts, 2)
 
+    def test_apple_music_catalog_request_uses_configured_bearer_token_without_scraping_page(self) -> None:
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return FakeHttpResponse(b'{"results": {}}')
+
+        with (
+            patch.dict(os.environ, {"APPLE_MUSIC_BEARER_TOKEN": "Bearer token-from-env"}, clear=True),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            payload = AppleMusicClient(timeout=1)._read_catalog_json(
+                "cn",
+                "https://amp-api.music.apple.com/v1/catalog/cn/search?term=Song&types=songs&limit=25",
+            )
+
+        self.assertEqual(payload, {"results": {}})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].full_url, "https://amp-api.music.apple.com/v1/catalog/cn/search?term=Song&types=songs&limit=25")
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer token-from-env")
+
+    def test_apple_music_bearer_token_accepts_bare_token(self) -> None:
+        with patch.dict(os.environ, {"APPLE_MUSIC_BEARER_TOKEN": "token-from-env"}, clear=True):
+            client = AppleMusicClient(timeout=1)
+            with patch.object(client, "_get_search_page", side_effect=AssertionError("should not scrape Apple page")):
+                self.assertEqual(client._get_bearer_token("cn"), "token-from-env")
+
+    def test_apple_music_bearer_token_reads_dotenv_and_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text('APPLE_MUSIC_BEARER_TOKEN="Bearer token-from-file"\n', encoding="utf-8")
+            cwd = os.getcwd()
+
+            try:
+                os.chdir(tmp)
+                with patch.dict(os.environ, {}, clear=True):
+                    file_client = AppleMusicClient(timeout=1)
+                    with patch.object(file_client, "_get_search_page", side_effect=AssertionError("should not scrape Apple page")):
+                        file_token = file_client._get_bearer_token("cn")
+
+                with patch.dict(os.environ, {"APPLE_MUSIC_BEARER_TOKEN": "Bearer token-from-env"}, clear=True):
+                    env_client = AppleMusicClient(timeout=1)
+                    with patch.object(env_client, "_get_search_page", side_effect=AssertionError("should not scrape Apple page")):
+                        env_token = env_client._get_bearer_token("cn")
+            finally:
+                os.chdir(cwd)
+
+        self.assertEqual(file_token, "token-from-file")
+        self.assertEqual(env_token, "token-from-env")
+
+    def test_apple_music_bearer_token_falls_back_to_page_scraping_when_unconfigured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with patch.dict(os.environ, {}, clear=True):
+                    client = AppleMusicClient(timeout=1)
+                    with (
+                        patch.object(client, "_get_search_page", return_value='<script type="module" src="/assets/app.js"></script>'),
+                        patch.object(client, "_read_text", return_value='const token = "eyJhbGciOiJFUzI1NiJ9";'),
+                    ):
+                        self.assertEqual(client._get_bearer_token("cn"), "eyJhbGciOiJFUzI1NiJ9")
+            finally:
+                os.chdir(cwd)
+
     def test_collects_metadata_from_all_default_storefronts_without_stopping_at_first_match(self) -> None:
         class RecordingClient:
             def __init__(self):

@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .config import load_config_value
 from .console import _safe_print, _color_text
 from .models import (
     DEFAULT_SPOTIFY_MARKETS,
@@ -49,10 +50,9 @@ def load_spotify_credentials(
 ) -> SpotifyCredentials:
     env_path = env_path or Path(".env")
     environment = environ if environ is not None else os.environ
-    values = _read_dotenv_values(env_path)
 
-    client_id = _clean_env_value(environment.get("SPOTIFY_CLIENT_ID")) or values.get("SPOTIFY_CLIENT_ID")
-    client_secret = _clean_env_value(environment.get("SPOTIFY_CLIENT_SECRET")) or values.get("SPOTIFY_CLIENT_SECRET")
+    client_id = load_config_value("SPOTIFY_CLIENT_ID", env_path=env_path, environ=environment)
+    client_secret = load_config_value("SPOTIFY_CLIENT_SECRET", env_path=env_path, environ=environment)
     return SpotifyCredentials(client_id=client_id, client_secret=client_secret)
 
 
@@ -893,33 +893,3 @@ def _format_spotify_candidate(candidate: SpotifyTrackCandidate) -> str:
 
 def _format_spotify_candidate_list(candidates: Iterable[SpotifyTrackCandidate]) -> str:
     return ", ".join(_format_spotify_candidate(candidate) for candidate in candidates)
-
-
-def _read_dotenv_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key not in {"SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"}:
-            continue
-        cleaned = _clean_env_value(value)
-        if cleaned:
-            values[key] = cleaned
-    return values
-
-
-def _clean_env_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
-        text = text[1:-1].strip()
-    return text or None

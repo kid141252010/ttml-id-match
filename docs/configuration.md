@@ -1,6 +1,16 @@
 # 配置说明
 
-本文档说明 CLI 与 Web 后端共用的运行配置。CLI 本地使用时可以只配置 Spotify；Web 部署到 Vercel 时还需要配置持久化存储。
+本文档说明 CLI 与 Web 后端共用的运行配置。CLI 本地使用时可以只配置音乐服务凭据；Web 部署到 Vercel 时还需要配置持久化存储。
+
+## Apple Music
+
+Apple Music catalog API 需要 Web bearer token。程序会优先读取 `APPLE_MUSIC_BEARER_TOKEN`，没有配置时再尝试从 Apple Music 页面脚本里提取临时 token。
+
+```text
+APPLE_MUSIC_BEARER_TOKEN=
+```
+
+该变量可以包含 `Bearer ` 前缀，也可以只填 token 本体；程序发送请求时会统一生成 `Authorization: Bearer <token>`。不要把真实 token 提交到仓库。
 
 ## Spotify
 

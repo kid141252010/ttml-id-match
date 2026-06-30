@@ -52,16 +52,17 @@ python fill_ttml_metadata.py --help
 python -m pip install -r requirements.txt
 ```
 
-## Spotify 凭据
+## 音乐服务凭据
 
-Spotify 搜索默认启用，但需要本地凭据。复制 `.env.example` 为 `.env`，填入 Spotify Developer 后台创建应用得到的 Client ID 和 Client Secret：
+复制 `.env.example` 为 `.env` 后按需填写凭据。Apple Music 可配置 Web bearer token；Spotify 搜索需要 Spotify Developer 后台创建应用得到的 Client ID 和 Client Secret：
 
 ```text
+APPLE_MUSIC_BEARER_TOKEN=
 SPOTIFY_CLIENT_ID=
 SPOTIFY_CLIENT_SECRET=
 ```
 
-脚本会先读取当前目录的 `.env`，再用系统环境变量覆盖同名值。`.env` 已在 `.gitignore` 中屏蔽，仓库只提交 `.env.example`。如果缺少任一变量，运行时会输出 `缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索`，Apple Music、QQ 音乐和网易云音乐流程会继续执行。
+`APPLE_MUSIC_BEARER_TOKEN` 可以填写 `Bearer ey...`，也可以只填 `ey...`。脚本会先读取当前目录的 `.env`，再用系统环境变量覆盖同名值。`.env` 已在 `.gitignore` 中屏蔽，仓库只提交 `.env.example`。如果缺少 Spotify 任一变量，运行时会输出 `缺少 SPOTIFY_CLIENT_ID 或 SPOTIFY_CLIENT_SECRET，跳过 Spotify 搜索`，Apple Music、QQ 音乐和网易云音乐流程会继续执行。不要把真实 bearer token 或 secret 提交到仓库。
 
 ## 配置
 
@@ -215,7 +216,7 @@ A, B, C & D
 https://music.apple.com/{store}/album/{ITUNESPLAYLISTID}
 ```
 
-脚本参考 `Ame (Apple Music).user.js` 的做法，从 Apple Music 页面提取 Bearer token，不需要 Apple Developer Token。专辑曲目读取请求：
+脚本会优先使用 `APPLE_MUSIC_BEARER_TOKEN` 配置的 Web bearer token；未配置时参考 `Ame (Apple Music).user.js` 的做法，从 Apple Music 页面提取临时 Bearer token，不需要 Apple Developer Token。专辑曲目读取请求：
 
 ```text
 https://amp-api.music.apple.com/v1/catalog/{store}/albums/{albumId}
@@ -408,6 +409,7 @@ song-lyrics.ttml
 - 固定查询的 `cn`、`us`、`kr`、`jp`、`tw` 区域都没有该专辑或歌曲。
 - 专辑页存在，但曲名、曲目号、发行日期、歌手或时长和音频标签不一致。
 - 最佳候选是伴奏版，但源歌名不含伴奏标记。
+- `APPLE_MUSIC_BEARER_TOKEN` 未配置且 Apple Music 页面不再暴露可提取的 Web token，或已配置的 token 已过期。
 - 当前网络无法访问 Apple Music。
 
 ### 找不到 QQ 音乐 ID
@@ -511,7 +513,7 @@ npm run dev
 
 仓库根目录包含 `vercel.json` 和 `api/index.py`。Vercel 会构建 `web/` 静态前端，并把 `/api/*` 重写到 FastAPI Python Function。完整部署教程见 [docs/deployment/vercel.md](docs/deployment/vercel.md)。
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,APPLE_MUSIC_BEARER_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.%20Apple%20Music%20and%20Spotify%20credentials%20are%20optional.)
 
 Vercel 部署时至少设置：
 

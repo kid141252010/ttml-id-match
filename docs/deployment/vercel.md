@@ -42,6 +42,7 @@ UPSTASH_REDIS_REST_TOKEN=...
 可选变量：
 
 ```text
+APPLE_MUSIC_BEARER_TOKEN=...
 SPOTIFY_CLIENT_ID=...
 SPOTIFY_CLIENT_SECRET=...
 TTML_PROXY_APPLE_MUSIC=
@@ -50,7 +51,7 @@ TTML_PROXY_NCM_MUSIC=
 TTML_PROXY_SPOTIFY=
 ```
 
-不要把 `BLOB_READ_WRITE_TOKEN`、Redis/KV token、Spotify secret 写进仓库。
+不要把 `BLOB_READ_WRITE_TOKEN`、Redis/KV token、Apple Music bearer token、Spotify secret 写进仓库。
 
 ### 环境变量用途与获取过程
 
@@ -121,6 +122,18 @@ UPSTASH_REDIS_REST_TOKEN=...
 ```
 
 二选一即可：如果已经有 `KV_REST_API_URL` / `KV_REST_API_TOKEN`，不需要再填 `UPSTASH_REDIS_REST_*`。代码会先读 `KV_REST_API_*`，没有时再读 `UPSTASH_REDIS_REST_*`。
+
+#### `APPLE_MUSIC_BEARER_TOKEN`
+
+用途：启用 Apple Music catalog API 搜索，用于补充 `appleMusicId`、本地化歌名、歌手、专辑和 ISRC。程序未配置该变量时，会尝试从 Apple Music 页面脚本里提取临时 Web token；如果上游页面不再暴露可提取 token，预览可能出现 `failed to find Apple Music bearer token`。
+
+获取方式：从可信的 Apple Music Web 请求中提取 `Authorization` 头里的 bearer token。变量值可以包含 `Bearer ` 前缀，也可以只填 token 本体：
+
+```text
+APPLE_MUSIC_BEARER_TOKEN=Bearer ey...
+```
+
+该 token 可能会过期。过期后重新获取并更新 Vercel 环境变量，然后重新部署。不要把真实 token 提交到仓库。
 
 #### `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET`
 
@@ -205,7 +218,7 @@ KV_REST_API_TOKEN=...
 
 README 中的按钮会打开 Vercel Project creation flow，并要求填写必要环境变量：
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,APPLE_MUSIC_BEARER_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.%20Apple%20Music%20and%20Spotify%20credentials%20are%20optional.)
 
 如果你从 fork 部署，把按钮里的 `repository-url` 换成自己的仓库地址，或者直接在 Vercel Dashboard 里导入 Git 仓库。
 
