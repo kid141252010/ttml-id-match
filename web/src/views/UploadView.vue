@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { ArrowRight, FileAudio, FileText } from 'lucide-vue-next';
-import { NButton, NIcon, NTag } from 'naive-ui';
+import { NAlert, NButton, NIcon, NTag } from 'naive-ui';
 
 import FileUploader from '@/components/FileUploader.vue';
 import PairList from '@/components/PairList.vue';
@@ -23,6 +23,11 @@ async function onFiles(files: File[]) {
 async function startPreview() {
   await store.previewAll();
   await router.push('/preview');
+}
+
+function issueMessage(code: string, ttmlPath: string) {
+  if (code === 'duplicate_ttml_key') return `${ttmlPath} 与另一 TTML 规范化后重名`;
+  return `${ttmlPath} 的音频配对存在歧义`;
 }
 </script>
 
@@ -49,6 +54,13 @@ async function startPreview() {
           </div>
         </div>
         <div class="panel-body">
+          <NAlert
+            v-for="issue in store.pairingIssues"
+            :key="`${issue.code}-${issue.pair_id}`"
+            type="error"
+            :title="issueMessage(issue.code, issue.ttml_path)"
+            class="pairing-issue"
+          />
           <div class="metric-row" data-testid="upload-workbench-summary">
             <div class="metric">
               <span class="metric-value">{{ store.files.length }}</span>

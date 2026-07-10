@@ -1,99 +1,71 @@
-# Web GUI 运行与部署指南
+# Web GUI 运行指南
 
-本文档介绍如何本地运行 Web 图形化界面（GUI）以及将其一键部署到 Vercel 平台的具体步骤。
-
-## 项目架构
-
-项目包含一个前后端分离的 Web 服务骨架：
-- **后端**：基于 FastAPI，入口为 `server.main:app`。
-- **前端**：基于 Vue 3 + Vite + Naive UI，代码位于 `web/` 目录。
-- **联调代理**：前端开发阶段默认通过 Vite 代理将 `/api` 请求转发到后端的 `http://127.0.0.1:8000`。
+本文档介绍如何本地运行和开发 Web 图形化界面（GUI），并说明其核心工作流和上传规则。
 
 ---
 
-## 本地开发与运行
+## 1. 项目架构
 
-### 1. 安装依赖
+Web 服务采用前后端分离的架构：
+- **后端**：基于 FastAPI，程序入口为 `server.main:app`。
+- **前端**：基于 Vue 3 + Vite + Naive UI，代码位于 `web/` 目录。
+- **代理联调**：Vite 开发服务器会自动将以 `/api/v2` 开头的请求转发至后端的 `http://127.0.0.1:8000`。
+- **接口契约**：使用 OpenAPI 进行接口定义。通过 `openapi/v2.json` 生成前端的接口文件 `web/src/api/generated.ts`，再通过网关适配器（Gateway Adapter）转换为前端领域模型。
 
-在仓库根目录下安装 Python 后端依赖，并进入 `web` 目录安装前端 Node.js 依赖：
+---
+
+## 2. 本地开发与运行
+
+### 安装依赖
+
+首先，在仓库根目录下安装 Python 后端依赖；然后进入 `web` 目录安装 Node.js 前端依赖：
 
 ```powershell
-# 安装后端依赖
+# 安装 Python 后端依赖
 python -m pip install -r requirements.txt
 
-# 安装前端依赖
+# 安装前端 Node 依赖
 cd web
 npm install
 ```
 
-### 2. 启动后端
+### 启动服务
 
-使用 `uvicorn` 启动 FastAPI 后端服务（默认监听 8000 端口，开启热重载）：
+本地运行需要同时启动后端与前端开发服务器：
 
-```powershell
-uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
-```
+1. **启动后端服务**：
+   ```powershell
+   uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
+   ```
 
-### 3. 启动前端
+2. **启动前端服务**（在另一个终端中运行）：
+   ```powershell
+   cd web
+   npm run dev
+   ```
 
-在另一个终端中，进入 `web` 目录启动 Vite 开发服务器：
-
-```powershell
-cd web
-npm run dev
-```
-
-启动后在浏览器打开 `http://127.0.0.1:5173` 即可使用。
-
-### 4. 上传限制说明
-
-- 上传 **TTML-only** 文件时，该 TTML 文件中需要已经包含 `musicName` 元数据，否则后端会沿用 CLI 规则拒绝搜索；
-- 上传同名音频和 TTML 时，会走音频标签读取路径。
-
-### 5. 纯前端 Mock 模式
-
-如果只需要预览或调试前端 UI 界面，而不想运行 Python 后端，可以开启 Mock API 模式：
-
-```powershell
-cd web
-# Windows PowerShell
-$env:VITE_USE_MOCK_API="1"
-npm run dev
-
-# Windows CMD
-set VITE_USE_MOCK_API=1
-npm run dev
-
-# Linux / macOS
-VITE_USE_MOCK_API=1 npm run dev
-```
+启动后，在浏览器中打开 `http://127.0.0.1:5173` 即可开始使用。
 
 ---
 
-## Vercel 部署
+## 3. 上传与文件配对规则
 
-仓库根目录包含了用于 Vercel 平台的配置文件 `vercel.json` 以及构建无服务器函数（Serverless Function）的入口文件 `api/index.py`。
+- **纯 TTML 模式 (TTML-only)**：若只上传 TTML 文件，则该 TTML 文件必须已经包含 `musicName` 元数据，否则后端会拒绝搜索。
+- **音频+TTML 模式**：若同时上传同名音频与 TTML 文件，后端将优先从音频文件中读取 ID3/FLAC 等元数据标签作为检索基准。
 
-Vercel 会自动构建 `web/` 中的静态前端，并将所有的 `/api/*` 请求重写到 FastAPI Python Function。
+---
 
-### 一键部署按钮
+## 4. 工作流约束
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,APPLE_MUSIC_BEARER_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.%20Apple%20Music%20and%20Spotify%20credentials%20are%20optional.)
+- **修改预览**：修改候选选择会触发防抖（Debounce）请求，获取当前选择的变更方案（ChangePlan）；界面同时展示元数据/语言摘要和最终将写入的完整 TTML，并自动忽略较旧的过时响应。
+- **提交限制**：只有在最新变更方案（ChangePlan）成功计算出来后，“应用 (Apply)”按钮才会启用。
+- **会话销毁**：点击“新会话”时，程序会首先删除远端存储（如 Vercel Blob）中的 Session 数据，然后清空前端本地状态。
 
-### 环境变量配置
+---
 
-在 Vercel 部署时，**必须**将存储后端配置为持久化存储（Vercel KV 和 Vercel Blob），否则由于 Serverless 的无状态特性，会话和文件将会丢失。
+## 5. 生产部署
 
-请在 Vercel 控制面板中为项目添加以下环境变量：
+生产环境下建议部署至 Vercel 平台，配合使用 Vercel Blob 和 Vercel KV 存储。
 
-```text
-ID_MATCH_STORAGE_BACKEND=vercel
-BLOB_READ_WRITE_TOKEN=your_vercel_blob_token
-KV_REST_API_URL=your_vercel_kv_rest_url
-KV_REST_API_TOKEN=your_vercel_kv_rest_token
-```
-
-> [!NOTE]
-> 如果您没有 Spotify 凭据，Spotify 搜索会自动跳过，不影响 Apple Music、QQ 音乐和网易云音乐的使用。
-
-有关 Vercel 部署更详尽的系统配置及集成步骤，请参阅已有的 [docs/deployment/vercel.md](deployment/vercel.md)。
+有关 Vercel 的一键部署、手动部署以及环境变量的详细配置步骤，请参阅专用文档：
+- **[Vercel 部署教程](deployment/vercel.md)**

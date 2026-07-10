@@ -1,84 +1,129 @@
-# TTML 元数据快速填充脚本
+# TTML ID Match v2
 
-这个仓库提供一个 Python CLI 脚本和 Web 服务，用于使用音频文件中的标签或 TTML 歌词文件中已有的基础信息，快速检索并填充 TTML 文件中的 AMLL 元数据。
+TTML ID Match 是一个用于快速填充 TTML 歌词元数据（Metadata）的工具。它能够读取音频标签或已有的 TTML 元数据，自动检索并匹配音乐平台的歌曲 ID，支持生成并应用确定的写入方案。
 
-目前脚本支持从各大音乐平台（Apple Music、QQ 音乐、网易云音乐、Spotify）检索并写入以下 AMLL 元数据：
+项目提供命令行（CLI）工具和 Web API 服务，两者共享底层的匹配引擎（`MatchingEngine`）、配对方案（`PairingPlan`）和 TTML 写入规划器（`TtmlPlanner`）。
 
-```xml
-<amll:meta key="musicName" value="..."/>
-<amll:meta key="artists" value="..."/>
-<amll:meta key="album" value="..."/>
-<amll:meta key="qqMusicId" value="..."/>
-<amll:meta key="ncmMusicId" value="..."/>
-<amll:meta key="spotifyId" value="..."/>
-<amll:meta key="isrc" value="..."/>
-<amll:meta key="appleMusicId" value="..."/>
-```
+目前已内置支持以下音乐平台：
+- Apple Music
+- QQ 音乐
+- 网易云音乐
+- Spotify
 
 ---
 
-## 快速开始
+## 核心特性
 
-### 1. 环境准备
+- **确定性写入**：预览、选择变更方案（ChangePlan）与最终应用写入，使用完全一致的文件内容与 SHA-256 哈希校验。
+- **无状态设计**：应用写入阶段仅读取不可变的快照，不调用任何音乐平台 API，确保执行速度与稳定性。
+- **容错与鲁棒性**：单个音频或平台接口失败仅作为警告输出，不影响其他文件和平台的处理。
+- **智能配对**：支持 Unicode NFKC 规范化、去前后空格、大小写折叠；支持同名 Stem 下的唯一 FLAC 优先匹配规则。
+- **弹性存储**：会话任务支持版本化状态和租约机制，可通过 Redis (KV) + Vercel Blob 在 Serverless 架构（如 Vercel）中稳定运行。
+- **全新 API 契约**：仅开放 `/api/v2` 接口，支持松耦合的源映射架构，方便后续扩展更多平台而无需修改核心数据表结构。
 
-- Python 3.10 或更新版本。
-- 确保您的网络能够访问 Apple Music、QQ 音乐、网易云音乐的公开 API 以及 Spotify API（如需检索 Spotify 元数据）。
+---
 
-安装 Python 依赖库：
+## 安装与配置
+
+### 1. 安装依赖
+
 ```powershell
 python -m pip install -r requirements.txt
+npm --prefix web ci
 ```
 
-### 2. 音乐服务凭据配置
+### 2. 配置平台凭据（可选）
 
-复制 `.env.example` 为 `.env` 并按需填写凭据：
+在环境变量或 `.env` 文件中配置以下内容以启用对应平台的高级搜索：
+
 ```text
-APPLE_MUSIC_BEARER_TOKEN=your_apple_music_token_here
-SPOTIFY_CLIENT_ID=your_spotify_client_id_here
-SPOTIFY_CLIENT_SECRET=your_spotify_client_secret_here
-```
-*(注：如果缺少凭据，对应平台在检索时会被自动跳过)*
-
-### 3. 一键运行
-
-对 `example` 目录下的音频和 TTML 文件进行匹配 dry-run（仅预览，不写入文件）：
-```powershell
-python fill_ttml_metadata.py example --dry-run
-```
-
-确认预览输出的匹配结果无误后，执行真实写入（写入前脚本会自动生成 `.bak` 备份文件）：
-```powershell
-python fill_ttml_metadata.py example
-```
-
-### 并发和限流
-
-批量搜索默认会并行处理多个文件，并在 Apple Music 区域、Spotify 市场和网易云查询内部做受控并行。遇到上游限流或网络不稳定时，可先在 `.env` 中把对应的 `TTML_APPLE_MUSIC_WORKERS`、`TTML_SPOTIFY_MARKET_WORKERS` 或 `TTML_NCM_QUERY_WORKERS` 降为 `1`；仍不稳定时再使用 `--search-workers 1` 降低外层批量并发。完整说明见 [配置指南](docs/configuration.md)。
-
----
-
-## 文档指南
-
-为保持主文档清爽，我们将更详尽的内容整理到了以下文档中：
-
-- ⚙️ **[配置指南 (docs/configuration.md)](docs/configuration.md)**：包含代理配置、并发数控制、存储后端及前端 API 的详细配置参数。
-- 💻 **[CLI 进阶使用 (docs/cli_usage.md)](docs/cli_usage.md)**：包含单首音频/TTML 歌曲的处理、Windows 交互脚本（批处理/PowerShell）的使用说明。
-- 🧠 **[匹配规则与写入结构 (docs/matching_rules.md)](docs/matching_rules.md)**：包含详细的音频标签读取逻辑、多艺术家拆分标准、各平台的匹配与排序权重、XML 结构变更及 dry-run 典型输出说明。
-- 🌐 **[Web GUI 运行与部署 (docs/web_gui.md)](docs/web_gui.md)**：本地运行 Vue 3 + FastAPI Web 界面的步骤及 Mock API 调试模式。
-- 🚀 **[Vercel 部署教程 (docs/deployment/vercel.md)](docs/deployment/vercel.md)**：将 Web GUI 前后端一键部署并在 Vercel 上使用 KV 和 Blob 持久化的完整教程。
-- ❓ **[常见问题与故障排查 (docs/faq.md)](docs/faq.md)**：汇总了匹配项跳过、各平台 ID 无法找回的常见原因及排查方案。
-
----
-
-## 测试
-
-运行项目的单元测试：
-```powershell
-python -B -m unittest discover -s tests
+APPLE_MUSIC_BEARER_TOKEN=
+SPOTIFY_CLIENT_ID=
+SPOTIFY_CLIENT_SECRET=
 ```
 
 ---
 
-## 许可协议
+## 命令行使用 (CLI)
 
-此仓库使用 **GNU Affero General Public License v3.0 (AGPLv3)** 授权。详情见 [LICENSE](LICENSE) 文件。
+`python -m ttml_metadata` 是标准的命令行入口。
+
+- **仅预览（不修改文件）**：
+  ```powershell
+  python -m ttml_metadata example --dry-run
+  ```
+
+- **应用匹配并写入文件**（自动生成 `.bak` 备份并执行原子写入）：
+  ```powershell
+  python -m ttml_metadata example
+  ```
+
+- **生成机器可读的预览（JSON 格式）**：
+  ```powershell
+  python -m ttml_metadata example --dry-run --json
+  ```
+
+- **使用指定的选择文件应用修改**：
+  ```powershell
+  python -m ttml_metadata example --selection-file selections.json
+  ```
+
+> [!NOTE]
+> `fill_ttml_metadata.py` 仍可作为可执行脚本直接运行，但推荐使用 `python -m ttml_metadata`。
+
+---
+
+## 网页端开发 (Web Development)
+
+1. **启动后端服务**：
+   ```powershell
+   uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
+   ```
+
+2. **启动前端服务**：
+   ```powershell
+   npm --prefix web run dev
+   ```
+
+启动后可在浏览器中访问 `http://127.0.0.1:5173`。前端通过 `/api/v2` 接口与后端通信，数据传输对象（DTO）由 `openapi/v2.json` 自动生成。
+
+---
+
+## 验证与测试
+
+```powershell
+# 运行后端单元测试
+python -m unittest discover -s tests
+
+# 检查 OpenAPI 规范的一致性
+npm --prefix web run openapi:check
+
+# 运行前端测试
+npm --prefix web test
+
+# 构建前端静态文件
+npm --prefix web run build
+
+# 运行端到端 (E2E) 测试
+npm --prefix web run test:e2e
+```
+
+端到端测试会模拟完整的用户流程：上传测试文件 -> 预览匹配候选 -> 修改选择并验证实时变更方案 -> 应用写入 -> 下载并校验生成的 TTML 文件。
+
+---
+
+## 相关文档
+
+- [配置说明](docs/configuration.md)
+- [CLI 使用指南](docs/cli_usage.md)
+- [Web GUI 指南](docs/web_gui.md)
+- [Vercel 部署教程](docs/deployment/vercel.md)
+- [架构决策记录 (ADR)](docs/adr/0001-v2-deterministic-snapshot-workflow.md)
+- [领域词汇表](docs/domain-glossary.md)
+- [匹配与写入规则](docs/matching_rules.md)
+
+---
+
+## 开源协议
+
+本项目采用 [AGPLv3](LICENSE) 协议开源。

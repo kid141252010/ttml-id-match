@@ -1,0 +1,1258 @@
+{
+  "components": {
+    "schemas": {
+      "ApplyFileResult": {
+        "additionalProperties": false,
+        "properties": {
+          "backup": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backup"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Sha256"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "applied",
+              "unchanged",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "ttml": {
+            "title": "Ttml",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pair_id",
+          "ttml",
+          "status"
+        ],
+        "title": "ApplyFileResult",
+        "type": "object"
+      },
+      "ApplyRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "selections": {
+            "items": {
+              "$ref": "#/components/schemas/Selection"
+            },
+            "title": "Selections",
+            "type": "array"
+          },
+          "snapshot_id": {
+            "title": "Snapshot Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "snapshot_id"
+        ],
+        "title": "ApplyRequest",
+        "type": "object"
+      },
+      "ApplyResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "failed": {
+            "minimum": 0.0,
+            "title": "Failed",
+            "type": "integer"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/ApplyFileResult"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "skipped": {
+            "minimum": 0.0,
+            "title": "Skipped",
+            "type": "integer"
+          },
+          "snapshot_id": {
+            "title": "Snapshot Id",
+            "type": "string"
+          },
+          "succeeded": {
+            "minimum": 0.0,
+            "title": "Succeeded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "snapshot_id",
+          "succeeded",
+          "failed",
+          "skipped"
+        ],
+        "title": "ApplyResponse",
+        "type": "object"
+      },
+      "Body_upload_files_api_v2_sessions__session_id__files_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "contentMediaType": "application/octet-stream",
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "title": "Body_upload_files_api_v2_sessions__session_id__files_post",
+        "type": "object"
+      },
+      "Candidate": {
+        "additionalProperties": false,
+        "properties": {
+          "album": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Album"
+          },
+          "aliases": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Aliases",
+            "type": "array"
+          },
+          "artists": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Artists",
+            "type": "array"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/Evidence"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "identifiers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Identifiers",
+            "type": "object"
+          },
+          "rank": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Rank",
+            "type": "integer"
+          },
+          "recommended": {
+            "default": false,
+            "title": "Recommended",
+            "type": "boolean"
+          },
+          "release_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Date"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "id",
+          "source"
+        ],
+        "title": "Candidate",
+        "type": "object"
+      },
+      "ChangePlanRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "selection": {
+            "$ref": "#/components/schemas/Selection"
+          },
+          "snapshot_id": {
+            "title": "Snapshot Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "snapshot_id",
+          "selection"
+        ],
+        "title": "ChangePlanRequest",
+        "type": "object"
+      },
+      "ChangePlanResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "final_text": {
+            "title": "Final Text",
+            "type": "string"
+          },
+          "input_sha256": {
+            "title": "Input Sha256",
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/MetadataChangeSummary"
+          },
+          "normalization": {
+            "$ref": "#/components/schemas/NormalizationSummary"
+          },
+          "output_sha256": {
+            "title": "Output Sha256",
+            "type": "string"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "snapshot_id": {
+            "title": "Snapshot Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "input_sha256",
+          "output_sha256",
+          "final_text",
+          "changed",
+          "metadata",
+          "normalization",
+          "snapshot_id",
+          "pair_id"
+        ],
+        "title": "ChangePlanResponse",
+        "type": "object"
+      },
+      "ChangePlanSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "final_text": {
+            "title": "Final Text",
+            "type": "string"
+          },
+          "input_sha256": {
+            "title": "Input Sha256",
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/MetadataChangeSummary"
+          },
+          "normalization": {
+            "$ref": "#/components/schemas/NormalizationSummary"
+          },
+          "output_sha256": {
+            "title": "Output Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "input_sha256",
+          "output_sha256",
+          "final_text",
+          "changed",
+          "metadata",
+          "normalization"
+        ],
+        "title": "ChangePlanSummary",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "Evidence": {
+        "additionalProperties": false,
+        "properties": {
+          "actual": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual"
+          },
+          "expected": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected"
+          },
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "relation": {
+            "title": "Relation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "relation"
+        ],
+        "title": "Evidence",
+        "type": "object"
+      },
+      "MetadataChangeSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "added": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Added",
+            "type": "object"
+          },
+          "changed": {
+            "default": false,
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "replaced": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Replaced",
+            "type": "object"
+          },
+          "skipped": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Skipped",
+            "type": "object"
+          }
+        },
+        "title": "MetadataChangeSummary",
+        "type": "object"
+      },
+      "NormalizationSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "body_text_changed": {
+            "default": false,
+            "title": "Body Text Changed",
+            "type": "boolean"
+          },
+          "changed": {
+            "default": false,
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "language_changed": {
+            "default": false,
+            "title": "Language Changed",
+            "type": "boolean"
+          },
+          "removed_translations": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Removed Translations",
+            "type": "integer"
+          },
+          "removed_transliterations": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Removed Transliterations",
+            "type": "integer"
+          }
+        },
+        "title": "NormalizationSummary",
+        "type": "object"
+      },
+      "PairFile": {
+        "additionalProperties": false,
+        "properties": {
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "filename",
+          "sha256"
+        ],
+        "title": "PairFile",
+        "type": "object"
+      },
+      "PairFiles": {
+        "additionalProperties": false,
+        "properties": {
+          "audio": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairFile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ttml": {
+            "$ref": "#/components/schemas/PairFile"
+          }
+        },
+        "required": [
+          "ttml"
+        ],
+        "title": "PairFiles",
+        "type": "object"
+      },
+      "PairPreview": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline_change_plan": {
+            "$ref": "#/components/schemas/ChangePlanSummary"
+          },
+          "default_selection": {
+            "$ref": "#/components/schemas/Selection"
+          },
+          "files": {
+            "$ref": "#/components/schemas/PairFiles"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "sources": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SourceResult"
+            },
+            "title": "Sources",
+            "type": "object"
+          }
+        },
+        "required": [
+          "pair_id",
+          "files",
+          "default_selection",
+          "baseline_change_plan"
+        ],
+        "title": "PairPreview",
+        "type": "object"
+      },
+      "PairingIssue": {
+        "additionalProperties": false,
+        "properties": {
+          "audio_candidates": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Audio Candidates",
+            "type": "array"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "ttml_path": {
+            "title": "Ttml Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "pair_id",
+          "ttml_path"
+        ],
+        "title": "PairingIssue",
+        "type": "object"
+      },
+      "PairingPair": {
+        "additionalProperties": false,
+        "properties": {
+          "audio_candidates": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Audio Candidates",
+            "type": "array"
+          },
+          "audio_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Path"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "paired",
+              "ttml_only",
+              "ambiguous"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "ttml_path": {
+            "title": "Ttml Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pair_id",
+          "status",
+          "ttml_path"
+        ],
+        "title": "PairingPair",
+        "type": "object"
+      },
+      "PairingPlanResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/PairingIssue"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "pairs": {
+            "items": {
+              "$ref": "#/components/schemas/PairingPair"
+            },
+            "title": "Pairs",
+            "type": "array"
+          }
+        },
+        "title": "PairingPlanResponse",
+        "type": "object"
+      },
+      "PreviewJob": {
+        "additionalProperties": false,
+        "properties": {
+          "completed": {
+            "minimum": 0.0,
+            "title": "Completed",
+            "type": "integer"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "title": "Errors",
+            "type": "array"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/PairPreview"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "completed",
+              "completed_with_errors",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "total",
+          "completed"
+        ],
+        "title": "PreviewJob",
+        "type": "object"
+      },
+      "Selection": {
+        "additionalProperties": false,
+        "properties": {
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "sources": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Sources",
+            "type": "object"
+          }
+        },
+        "required": [
+          "pair_id"
+        ],
+        "title": "Selection",
+        "type": "object"
+      },
+      "SessionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionResponse",
+        "type": "object"
+      },
+      "SourceResult": {
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/Candidate"
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "groups": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Groups",
+            "type": "object"
+          },
+          "recommended_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Recommended Ids",
+            "type": "array"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "SourceResult",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "TTML ID Match API",
+    "version": "2.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v2/sessions": {
+      "post": {
+        "operationId": "create_session_api_v2_sessions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Create Session"
+      }
+    },
+    "/api/v2/sessions/{session_id}": {
+      "delete": {
+        "operationId": "delete_session_api_v2_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Delete Session"
+      }
+    },
+    "/api/v2/sessions/{session_id}/apply": {
+      "post": {
+        "operationId": "apply_api_v2_sessions__session_id__apply_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Apply"
+      }
+    },
+    "/api/v2/sessions/{session_id}/change-plans": {
+      "post": {
+        "operationId": "change_plan_api_v2_sessions__session_id__change_plans_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangePlanResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Change Plan"
+      }
+    },
+    "/api/v2/sessions/{session_id}/files": {
+      "post": {
+        "operationId": "upload_files_api_v2_sessions__session_id__files_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_files_api_v2_sessions__session_id__files_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairingPlanResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Upload Files"
+      }
+    },
+    "/api/v2/sessions/{session_id}/outputs.zip": {
+      "get": {
+        "operationId": "download_outputs_zip_api_v2_sessions__session_id__outputs_zip_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Download Outputs Zip"
+      }
+    },
+    "/api/v2/sessions/{session_id}/outputs/{filename}": {
+      "get": {
+        "operationId": "download_output_api_v2_sessions__session_id__outputs__filename__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "filename",
+            "required": true,
+            "schema": {
+              "title": "Filename",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Download Output"
+      }
+    },
+    "/api/v2/sessions/{session_id}/preview-jobs": {
+      "post": {
+        "operationId": "create_preview_job_api_v2_sessions__session_id__preview_jobs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewJob"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Create Preview Job"
+      }
+    },
+    "/api/v2/sessions/{session_id}/preview-jobs/{job_id}": {
+      "get": {
+        "operationId": "get_preview_job_api_v2_sessions__session_id__preview_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewJob"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Get Preview Job"
+      }
+    },
+    "/api/v2/sessions/{session_id}/preview-jobs/{job_id}/steps": {
+      "post": {
+        "operationId": "step_preview_job_api_v2_sessions__session_id__preview_jobs__job_id__steps_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewJob"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Step Preview Job"
+      }
+    }
+  }
+}

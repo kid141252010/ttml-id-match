@@ -3,30 +3,28 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from server.api.sessions import build_router
-from server.services.metadata_service import MetadataService
-from server.services.session_manager import SessionManager
+from server.v2.api import build_v2_router, install_v2_exception_handlers
+from server.v2.composition import RuntimeSettings, build_v2_workflow
+from server.v2.workflow import SessionWorkflow
 
 
 def create_app(
-    session_manager: SessionManager | None = None,
-    metadata_service: MetadataService | None = None,
+    v2_workflow: SessionWorkflow | None = None,
+    *,
+    cors_origins: tuple[str, ...] | None = None,
 ) -> FastAPI:
-    manager = session_manager or SessionManager()
-    service = metadata_service or MetadataService(manager)
-    app = FastAPI(title="TTML ID Match API")
+    settings = RuntimeSettings.from_env()
+    workflow = v2_workflow or build_v2_workflow(settings)
+    app = FastAPI(title="TTML ID Match API", version="2.0.0")
+    install_v2_exception_handlers(app)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=list(cors_origins or settings.cors_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.include_router(build_router(manager, service))
-
-    @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    app.include_router(build_v2_router(workflow))
 
     return app
 

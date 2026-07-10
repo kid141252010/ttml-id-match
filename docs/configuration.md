@@ -1,33 +1,29 @@
-# 配置说明
+# v2 配置指南
 
-本文档说明 CLI 与 Web 后端共用的运行配置。CLI 本地使用时可以只配置音乐服务凭据；Web 部署到 Vercel 时还需要配置持久化存储。
+本文档介绍项目支持的环境变量和配置项，适用于本地开发和生产环境部署。
 
-## Apple Music
+---
 
-Apple Music catalog API 需要 Web bearer token。程序会优先读取 `APPLE_MUSIC_BEARER_TOKEN`，没有配置时再尝试从 Apple Music 页面脚本里提取临时 token。
+## 1. 音乐平台凭据 (Provider Credentials)
 
 ```text
 APPLE_MUSIC_BEARER_TOKEN=
-```
-
-该变量可以包含 `Bearer ` 前缀，也可以只填 token 本体；程序发送请求时会统一生成 `Authorization: Bearer <token>`。不要把真实 token 提交到仓库。
-
-## Spotify
-
-Spotify 搜索使用官方 Web API 的 Client Credentials Flow。缺少任一变量时，程序会跳过 Spotify，不影响 Apple Music、QQ 音乐和网易云音乐。
-
-```text
 SPOTIFY_CLIENT_ID=
 SPOTIFY_CLIENT_SECRET=
 ```
 
-本地开发可以复制 `.env.example` 为 `.env`。程序会先读取当前目录的 `.env`，再用系统环境变量覆盖同名值。
+- **Spotify**：如果缺少 `SPOTIFY_CLIENT_ID` 或 `SPOTIFY_CLIENT_SECRET`，程序会自动跳过 Spotify 的检索并产生警告。
+- **Apple Music**：如果未配置 Token，程序会尝试在网页端自动寻找并提取临时 Web Token。
 
-## 代理
+---
 
-所有上游搜索都支持代理。来源级代理优先于全局代理；未设置来源级代理时，程序会依次退回到 `TTML_PROXY_ALL`、`HTTPS_PROXY`、`HTTP_PROXY`。
+## 2. 网络与代理设置 (HTTP Transport & Proxy)
+
+后端所有平台的客户端共享 `httpx.Client` 连接池。超时、重试以及代理设置可以通过以下变量进行集中管理：
 
 ```text
+TTML_HTTP_TIMEOUT_SECONDS=20
+TTML_HTTP_ATTEMPTS=3
 TTML_PROXY_ALL=
 TTML_PROXY_APPLE_MUSIC=
 TTML_PROXY_QQ_MUSIC=
@@ -35,54 +31,48 @@ TTML_PROXY_NCM_MUSIC=
 TTML_PROXY_SPOTIFY=
 ```
 
-常见用法：
+- **`TTML_HTTP_TIMEOUT_SECONDS`**：请求超时时间（秒，默认 20 秒）。
+- **`TTML_HTTP_ATTEMPTS`**：网络请求最大重试次数（默认 3 次）。
+- **代理优先级**：各平台专属代理（如 `TTML_PROXY_SPOTIFY`）优先级最高，其次是全局代理 `TTML_PROXY_ALL`，最后是标准环境变量 `HTTPS_PROXY` / `HTTP_PROXY`。
+
+---
+
+## 3. 并发控制 (Concurrency Settings)
+
+可通过限制线程/协程并发数来保护平台接口不被限流。
 
 ```text
-TTML_PROXY_APPLE_MUSIC=http://127.0.0.1:7890
-TTML_PROXY_SPOTIFY=http://127.0.0.1:7890
+TTML_SEARCH_WORKERS=3
+TTML_SOURCE_APPLE_MUSIC_WORKERS=1
+TTML_SOURCE_QQ_MUSIC_WORKERS=2
+TTML_SOURCE_SPOTIFY_WORKERS=1
+TTML_SOURCE_NCM_MUSIC_WORKERS=1
 ```
 
-代理值为空、`none`、`off`、`false`、`0` 时会被视为未配置。
+- **`TTML_SEARCH_WORKERS`**（或命令行中的 `--search-workers`）：全局查询的总并发数限制。
+- **平台专属 Workers**：为各平台设置的最大并发资源锁（Semaphore），防止单个平台耗尽全局并发预算。
+- **并发调度机制**：在 v2 中，为确保稳定性，去除了多层级并发池。依赖项会串行执行（例如 QQ 音乐检索完成后，才会启动依赖它的网易云音乐适配器进行关联检索）。
 
-## 批量并发
+---
 
-CLI 批量搜索默认使用 3 个外层 worker：
+## 4. 存储后端 (Storage Backend)
 
-```powershell
-python fill_ttml_metadata.py example --dry-run --search-workers 3
-```
+根据运行环境选择本地文件存储或云端存储：
 
-如果上游服务限流，降低到 1：
-
-```powershell
-python fill_ttml_metadata.py example --dry-run --search-workers 1
-```
-
-Web 后端默认沿用相同并发值。单个工作项内部会并行搜索 Apple Music、QQ 音乐和 Spotify；网易云音乐会在 QQ 音乐候选确认后执行。
-
-除外层批量 worker 外，部分来源还有内部请求并发，用于并行互不依赖的区域、市场或查询：
-
-```text
-TTML_APPLE_MUSIC_WORKERS=3
-TTML_SPOTIFY_MARKET_WORKERS=2
-TTML_NCM_QUERY_WORKERS=2
-```
-
-- `TTML_APPLE_MUSIC_WORKERS` 控制 Apple Music storefront 并行数，默认 3。
-- `TTML_SPOTIFY_MARKET_WORKERS` 控制 Spotify market 并行数，默认 2。
-- `TTML_NCM_QUERY_WORKERS` 控制网易云单个 API base 内的歌名、歌手和专辑详情查询并行数，默认 2。
-
-总请求压力约等于外层 `--search-workers` 乘以各来源内部 worker。遇到 429、超时或上游不稳定时，先把对应来源变量降到 `1`；如果仍然限流，再把 CLI 的 `--search-workers` 或 Web 后端的 `search_workers` 降到 `1`。
-
-## Web 存储后端
-
-本地开发默认使用磁盘临时目录：
+### 本地开发 (Local Storage)
 
 ```text
 ID_MATCH_STORAGE_BACKEND=local
+ID_MATCH_V2_ROOT=.codex-tmp/id-match-v2
+ID_MATCH_WORK_ROOT=
 ```
 
-Vercel 部署必须改成持久化后端：
+- **`ID_MATCH_STORAGE_BACKEND`**：设为 `local` 以使用本地文件系统。
+- **`ID_MATCH_V2_ROOT`**：用于保存本地会话快照、上传内容和输出结果的临时根目录。
+
+### Vercel Serverless 部署 (Vercel Blob & Redis)
+
+当环境变量中存在 `VERCEL` 时，程序默认切换到 `vercel` 后端，但建议显式配置以下参数：
 
 ```text
 ID_MATCH_STORAGE_BACKEND=vercel
@@ -91,32 +81,21 @@ KV_REST_API_URL=
 KV_REST_API_TOKEN=
 ```
 
-如果使用 Vercel Redis / Upstash 的新变量名，也可以配置：
+- **`BLOB_READ_WRITE_TOKEN`**：Vercel Blob 的读写凭据，用于存取上传的音频、TTML 和处理生成的结果。
+- **`KV_REST_API_URL` & `KV_REST_API_TOKEN`**（或 Upstash Redis 的 `UPSTASH_REDIS_REST_URL` & `UPSTASH_REDIS_REST_TOKEN`）：用于高速存取会话索引。由于 Serverless 是无状态的，必须使用此数据库来保存会话映射状态。
+
+---
+
+## 5. 前端接口配置 (Frontend Configuration)
+
+前端网络交互基准路径默认为 `/api/v2`。如需使用独立的后端 API 部署：
 
 ```text
-UPSTASH_REDIS_REST_URL=
-UPSTASH_REDIS_REST_TOKEN=
+VITE_API_BASE=https://api.example.com/api/v2
 ```
 
-`vercel` 后端会把上传文件和结果文件写入 Vercel Blob，把会话索引写入 Redis/KV REST。不要在 Vercel 上使用 `local`，否则 Serverless 函数冷启动或换实例后会丢会话。
-
-## 前端 API 地址
-
-前端默认请求同源 `/api`。本地开发时由 Vite 代理到后端：
-
-```text
-http://127.0.0.1:5173 -> /api -> http://127.0.0.1:8000
-```
-
-如果前后端分开部署，设置：
-
-```text
-VITE_API_BASE=https://your-api.example.com/api
-```
-
-只看界面时可启用 mock：
+如果在后端修改了 API 数据契约，请在前端重新生成 DTO 类型定义文件：
 
 ```powershell
-$env:VITE_USE_MOCK_API="1"
-npm --prefix web run dev
+npm --prefix web run openapi:generate
 ```

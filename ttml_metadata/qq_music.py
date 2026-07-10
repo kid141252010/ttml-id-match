@@ -6,25 +6,43 @@ import urllib.request
 from typing import Any, Callable
 
 from .console import _safe_print, _color_text
-from .models import AudioMetadata, PairMetadata, QQMusicCandidate, QQMusicClientProtocol, QQMusicSearchResult
+from .models import AudioMetadata, QQMusicCandidate, QQMusicClientProtocol, QQMusicSearchResult
 from .network import proxy_url_for_source, urlopen_with_retry
+from .v2.transport import HttpTransport
 from .text_utils import _add_unique_value, _nested_get, _same_raw_text, _stringify_tag_value, _text_match_score, split_artists
 
 class QQMusicClient:
-    def __init__(self, timeout: int = 20, proxy_url: str | None = None):
+    SEARCH_URL = "http://u.y.qq.com/cgi-bin/musicu.fcg"
+
+    def __init__(
+        self,
+        timeout: int = 20,
+        proxy_url: str | None = None,
+        transport: HttpTransport | None = None,
+    ):
         self.timeout = timeout
         self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("qq_music")
+        self._transport = transport
 
     def search_songs(self, query: str) -> list[QQMusicCandidate]:
         request = self._build_search_request(query)
-        with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
-            payload = json.loads(response.read().decode("utf-8", "ignore"))
+        if self._transport is not None:
+            payload = self._transport.request(
+                "qq_music",
+                "POST",
+                request.full_url,
+                headers=dict(request.header_items()),
+                content=request.data,
+            ).json()
+        else:
+            with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
+                payload = json.loads(response.read().decode("utf-8", "ignore"))
         return _parse_qq_music_candidates(payload)
 
     def _build_search_request(self, query: str) -> urllib.request.Request:
         data = json.dumps(_qq_music_search_payload(query), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return urllib.request.Request(
-            "http://u.y.qq.com/cgi-bin/musicu.fcg",
+            self.SEARCH_URL,
             data=data,
             headers={
                 "Accept-Language": "zh-CN",
@@ -60,75 +78,6 @@ def collect_qq_music_metadata(
     return result
 
 
-def confirm_qq_music_candidates(
-    pairs: list[PairMetadata],
-    dry_run: bool,
-    input_func: Callable[[str], str] = input,
-    print_func: Callable[..., None] | None = None,
-) -> None:
-    if print_func is None:
-        print_func = _safe_print
-
-    available = [pair for pair in pairs if pair.qq_music_metadata.candidates]
-    for pair in available:
-        pair.qq_music_metadata.selected = pair.qq_music_metadata.candidates[0]
-
-    if dry_run or not available:
-        return
-
-    use_color = (print_func is _safe_print) and (input_func is input)
-
-    print_func("")
-    header_text = "QQ 音乐最佳候选："
-    if use_color:
-        header_text = _color_text(header_text, "header")
-    print_func(header_text)
-
-    for pair in available:
-        best = pair.qq_music_metadata.candidates[0]
-        cand_str = _format_qq_music_candidate(best)
-        if use_color:
-            cand_str = _color_text(cand_str, "highlight")
-        print_func(f"  {pair.ttml_path.name}:")
-        print_func(f"    - {cand_str}")
-
-    while True:
-        prompt_text = "Accept all QQ Music best candidates? Type Y to accept, N to choose alternatives: "
-        if use_color:
-            prompt_text = _color_text(prompt_text, "prompt")
-        answer = input_func(prompt_text).strip()
-        if answer.casefold() in {"y", "n"}:
-            break
-        print_func("Please type Y or N.")
-
-    if answer.casefold() == "y":
-        return
-
-    for pair in available:
-        options = pair.qq_music_metadata.candidates[:5]
-        print_func("")
-        cand_title = f"{pair.ttml_path.name} QQ 音乐候选："
-        if use_color:
-            cand_title = _color_text(cand_title, "info")
-        print_func(cand_title)
-
-        for index, candidate in enumerate(options, start=1):
-            idx_str = f"  {index}."
-            if use_color:
-                idx_str = _color_text(idx_str, "info")
-            print_func(f"{idx_str} {_format_qq_music_candidate(candidate)}")
-        while True:
-            sel_prompt = "Select 1-5, or press Enter to skip this song: "
-            if use_color:
-                sel_prompt = _color_text(sel_prompt, "prompt")
-            answer = input_func(sel_prompt).strip()
-            if not answer:
-                pair.qq_music_metadata.selected = None
-                break
-            if answer.isdigit() and 1 <= int(answer) <= len(options):
-                pair.qq_music_metadata.selected = options[int(answer) - 1]
-                break
-            print_func("Invalid selection.")
 
 
 def _merge_qq_music_metadata(

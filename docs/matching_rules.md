@@ -1,115 +1,117 @@
 # 匹配机制与写入结构说明
 
-本文档详细介绍了脚本在处理音频标签、进行多平台（Apple Music、QQ音乐、网易云音乐、Spotify）元数据检索时的匹配算法、排序规则以及写入 XML 的具体结构。
-
-## Apple Music 查询区域
-
-默认区域查找顺序如下，脚本固定查询这五个区域以获取本地化信息：
-1. `cn`
-2. `us`
-3. `kr`
-4. `jp`
-5. `tw`
-
-脚本不再提供单区域、兜底区域或交互输入区域参数。已有 Apple Music 歌曲 ID 不会让查询提前结束，仍会按以上顺序搜索以补充本地化歌名、歌手、专辑和 ISRC。
+本文档详细介绍内置适配器（Adapter）的匹配检索算法以及 TTML 文件的 XML 写入逻辑。在 v2 中，接口候选仅向前端/HTTP 暴露排名、推荐状态与解释证据（Evidence），内部使用的数值评分不进入公共契约。
 
 ---
 
-## 匹配规则
+## 1. Apple Music 区域检索规则
+
+程序会固定按以下顺序依次查询 5 个区域，以获取最完整的多语言/本地化元数据：
+1. **`cn`** (中国大陆)
+2. **`us`** (美国)
+3. **`kr`** (韩国)
+4. **`jp`** (日本)
+5. **`tw`** (中国台湾)
+
+检索为全局扫视，即使用户在音频标签中提供了已有的 Apple Music 歌曲 ID，也会按上述区域顺序查满，以确保能够补充不同区域的本地化歌名、歌手、专辑及 ISRC 信息。
+
+---
+
+## 2. 元数据匹配机制
 
 ### 音频标签读取
 
-脚本会大小写不敏感读取以下音频标签：
+从音频文件（如 `.flac`、`.m4a`）中大小写不敏感地读取以下标签：
 - **歌名**：`title`
-- **艺术家**：`artist`、`artists`
+- **歌手**：`artist`、`artists`
 - **专辑**：`album`
 - **ISRC**：`ISRC`
-- **Apple Music 歌曲 ID 候选**：`ITUNESCATALOGID`
+- **Apple Music 歌曲 ID**：`ITUNESCATALOGID`
 - **Apple Music 专辑 ID**：`ITUNESPLAYLISTID`
 - **曲目号**：`track`、`tracknumber`
 - **碟号**：`disc`、`discnumber`
 
 ### 多艺术家拆分
 
-脚本支持 Apple Music 常见艺术家格式（如 `A, B, C & D`），会将其写成多个独立的 `artists` 节点。
+支持主流的多艺术家格式（如 `A, B, C & D`）。只要检测到分隔符（包括 `,`、`;`·`、`·`&`·`＆`），就会将其拆分为独立的 `artists` 元数据节点。
 
-`,`、`;`、`、`、`&`、`＆` 都按多艺术家分隔符处理。例如 `Sān-Z & HOYO-MiX` 会写成 `Sān-Z` 和 `HOYO-MiX` 两个 `artists` 节点。
-
+例如，`Sān-Z & HOYO-MiX` 写入 TTML 时会生成：
 ```xml
 <amll:meta key="artists" value="Sān-Z"/>
 <amll:meta key="artists" value="HOYO-MiX"/>
 ```
 
-### Apple Music 元数据查找
+### Apple Music 检索流程
 
-- **ID 校验**：音频标签中的 `ITUNESCATALOGID` 只有在看起来像有效歌曲 ID 时才直接写入。TTML-only 模式下也会读取已有 `amll:meta key="appleMusicId"` 和 `isrc`。
-- **专辑匹配**：当音频存在 `ITUNESPLAYLISTID` 时，脚本会将其作为专辑 ID 查询曲目：
-  `https://music.apple.com/{store}/album/{ITUNESPLAYLISTID}`
-  程序会优先使用 `APPLE_MUSIC_BEARER_TOKEN`，未配置时从网页端自动提取临时 Token。在 5 个区域读取专辑曲目时，优先使用碟号和曲目号匹配；缺少曲目号时，使用规范化曲名和时长辅助匹配。
-- **普通搜索**：只要有歌名，脚本就会请求 Apple Music 搜索接口。普通搜索候选按 ISRC、歌名、歌手、专辑、发行日期和时长排序。
-- **艺人专辑降级检索 (Artist-Album Fallback)**：普通搜索标题匹配明显较弱且音频里包含歌手、发行日期和时长时，脚本会搜索对应艺人，分页读取该艺人的 album/single 列表（最多 10 页、每页 50 张）进行发行日期匹配、歌手匹配且时长误差不超过 1 秒的保守匹配。
-- **伴奏过滤**：源歌名不含伴奏标记时，带 `Instrumental`、`伴奏`、`インスト`、`반주` 等标记的候选会大幅降权且不会自动选中。
+1. **ID 直接匹配**：若音频标签中存在有效的 `ITUNESCATALOGID`，验证为合法 ID 后将直接采信。在纯 TTML 模式（无音频）下，也会读取已有的 `appleMusicId` 和 `isrc`。
+2. **专辑回查**：若标签包含 `ITUNESPLAYLISTID`（专辑 ID），程序会通过 `https://music.apple.com/{store}/album/{ID}` 遍历 5 个区域读取专辑的曲目列表。
+   - 优先通过**碟号+曲目号**匹配。
+   - 缺失曲目号时，通过规范化曲名和时长进行辅助匹配。
+   - 请求优先采用配置的 `APPLE_MUSIC_BEARER_TOKEN`，如无则自动从网页端抓取临时 Token。
+3. **普通搜索**：若以上方式均未匹配，则通过歌名在 Apple Music 进行关键词检索。候选结果按 ISRC、歌名、歌手、专辑、发行日期及时间长度进行综合排序。
+4. **艺人专辑降级检索 (Artist-Album Fallback)**：如果普通搜索效果不佳，且音频包含完整的歌手、发行日期及时间信息，程序会转而搜索该歌手，分页读取其名下专辑/单曲列表（最多 10 页，每页 50 张），寻找发行日期吻合、歌手匹配且时间误差在 1 秒以内的曲目。
+5. **伴奏过滤**：若原始歌名不含伴奏标记，则检索到的带 `Instrumental`、`伴奏`、`インスト`、`반주` 等标记的候选会被降权且不会被自动推荐。
 
-### QQ 音乐元数据查找
+### QQ 音乐检索流程
 
-- **检索关键词**：仅使用歌名作为检索词（音频标签中的 `title` 或 TTML 中已有的 `musicName`）。
-- **接口**：请求 QQ 音乐移动端搜索接口，读取 `item_song` 候选，要求同时具备 `songid` 和 `mid`。
-- **匹配权重**：综合歌名、歌手和专辑匹配度，其中歌名权重最高，歌手其次，专辑再次。精确匹配优先于包含匹配（如可处理包含关系）。多歌手会逐个比较。
+1. **关键词**：仅使用歌名（音频的 `title` 标签或 TTML 已有的 `musicName`）。
+2. **接口**：请求 QQ 音乐移动端搜索接口，筛选出同时包含 `songid` 和 `mid` 的 `item_song` 候选。
+3. **权重排序**：匹配优先级为：歌名匹配度（最高） > 歌手匹配度 > 专辑匹配度。精确匹配优于包含匹配，多歌手会逐一进行相似度比对。
 
-### 网易云音乐元数据查找
+### 网易云音乐检索流程
 
-- **检索顺序**：在 QQ 音乐候选确认后执行。
-- **繁简归一**：匹配前会将繁体和简体文本统一转换为简体进行比较，但最终写入时仍保留 API 返回的原始文本。
-- **并发检索接口**：使用歌名并发请求以下 3 个公开 API 接口竞速，固定读取单曲搜索第一页的前 100 条候选：
-  - `https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1`
-  - `https://neteasecloudmusicapi-main-api.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1`
-  - `https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1`
-- **歌手专辑回查**：如果确认后的 QQ 候选提供了歌手和专辑，脚本会额外请求网易云的歌手、歌手专辑和专辑详情接口获取候选并去重。
-- **匹配权重**：与 QQ 音乐一致（歌名 > 歌手 > 专辑）。
+1. **执行时机**：在 QQ 音乐候选匹配完成后执行（可作为依赖输入）。
+2. **繁简归一**：匹配比对时会将繁简体文本统一转换为简体进行判定，写入 TTML 时仍保留 API 返回 of 原始字符。
+3. **检索接口**：在全局并发预算内，轮询以下三个公开 API（只获取单曲类别的第 1 页前 100 条候选）：
+   - `https://music163.xuanmou.com.cn/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1`
+   - `https://neteasecloudmusicapi-main-api.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1`
+   - `https://api-enhanced-six-beta.vercel.app/cloudsearch?keywords={歌名}&limit=100&offset=0&type=1`
+4. **关联回查**：如果已匹配的 QQ 音乐候选提供了歌手和专辑信息，程序会回查网易云的歌手专辑和专辑详情接口，合并检索结果并去重。
+5. **权重排序**：与 QQ 音乐匹配逻辑相同（歌名 > 歌手 > 专辑）。
 
-### Spotify 元数据查找
+### Spotify 检索流程
 
-- **凭据要求**：必须在 `.env` 或系统环境变量中配置 `SPOTIFY_CLIENT_ID` 和 `SPOTIFY_CLIENT_SECRET`，通过 Client Credentials Flow 获取 Token。
-- **检索逻辑**：
-  1. 优先使用 `isrc:{ISRC}` 搜索；
-  2. 使用宽松关键词 `{歌名} {歌手} {专辑}` 和 `{歌名}` 搜索；
-  3. 若候选不足，fallback 到三要素限定搜索：`track:{歌名} artist:{歌手} album:{专辑}`。
-- **市场范围**：固定搜索 `US`、`KR`、`JP`、`TW` 四个市场。
-- **艺人专辑降级检索 (Artist-Album Fallback)**：普通检索候选不足且音频包含完整元数据时，会搜索艺人并读取其最近 30 张专辑/单曲，匹配发行日期一致、艺人匹配且时长在 2 秒内接近的曲目。同样会过滤伴奏候选。
+1. **前置条件**：需提供 `SPOTIFY_CLIENT_ID` 和 `SPOTIFY_CLIENT_SECRET`。
+2. **检索步骤**：
+   - 第一阶段：优先根据 `isrc:{ISRC}` 精准搜索。
+   - 第二阶段：使用宽泛关键词 `{歌名} {歌手} {专辑}` 及 `{歌名}` 搜索。
+   - 第三阶段（Fallback）：使用三要素字段限制搜索：`track:{歌名} artist:{歌手} album:{专辑}`。
+3. **检索市场**：固定在 `US`、`KR`、`JP`、`TW` 四个区域市场进行检索。
+4. **艺人专辑降级检索 (Artist-Album Fallback)**：普通检索候选不足且音频元数据完整时，检索该艺人最近 30 张专辑，匹配发行日期一致、歌手吻合且时长误差在 2 秒内的曲目。同样过滤伴奏结果。
 
 ---
 
-## XML 写入结构
+## 3. XML 写入规范
 
-为了避免命名空间前缀和属性顺序产生无关变化，脚本**不会**使用 XML 序列化器重写整份 TTML。
+为了防止因 XML 序列化器重构产生无谓的格式变动，程序**不**使用标准 XML 树序列化重写整个文件，而是采用文本标记精确定位与修改。
 
-1. **语言规范化**：如果根 `<tt>` 是 `xml:lang="zh-Hant"`，脚本会先将其改为 `zh-Hans`，将 `<body>` 内的主歌词文本节点转为简体，并删除 `zh-Hans` replacement 翻译层和 `zh-Latn-pinyin` 音译层。`<head>/<metadata>` 里的文字和属性不会被转换。
-2. **命名空间声明**：若根节点缺少 AMLL 命名空间声明，脚本会在根 `<tt>` 上补充 `xmlns:amll="http://www.example.com/ns/amll"`。
-3. **结构要求**：脚本只修改已有 `<metadata>` 内部的 `amll:meta` 节点。若文件缺少 `<metadata>`，脚本会报错并跳过。
-4. **插入位置**：新增的 `amll:meta` 会插入到已有 `<metadata>` 内；有 `<iTunesMetadata>` 时插到它之前，否则插到 `</metadata>` 之前：
+1. **语言规范化**：如果根节点声明为繁体中文（`xml:lang="zh-Hant"`），程序会将其更改为简体 `zh-Hans`，并将 `<body>` 内部的歌词文本转换为简体，同时自动剥离冗余的 `zh-Hans` 翻译层与 `zh-Latn-pinyin` 拼音音译层（注：`<head>/<metadata>` 内的数据和属性不进行简繁转换）。
+2. **命名空间**：如果根节点缺失 AMLL 命名空间，会自动在根 `<tt>` 上补充：`xmlns:amll="http://www.example.com/ns/amll"`。
+3. **节点插入**：程序仅修改已有的 `<metadata>`。若缺失该节点将直接报错。写入时，新增的 `amll:meta` 标签会按如下结构优先插入到已有的 `<iTunesMetadata>` 之前，如无则插在 `</metadata>` 之前。
+4. **去重新增**：保留用户人工编辑过的真实值，对于新检索出的未出现值，则作为同一个 key 的新节点追加（如支持多歌手或多语言歌名）。
+
+### 写入示例
 
 ```xml
 <metadata>
   <ttm:agent type="person" xml:id="v1"/>
-  <amll:meta key="musicName" value="..."/>
-  <amll:meta key="artists" value="..."/>
-  <amll:meta key="album" value="..."/>
-  <amll:meta key="qqMusicId" value="..."/>
-  <amll:meta key="ncmMusicId" value="..."/>
-  <amll:meta key="spotifyId" value="..."/>
-  <amll:meta key="appleMusicId" value="..."/>
-  <amll:meta key="isrc" value="..."/>
+  <amll:meta key="musicName" value="Disease"/>
+  <amll:meta key="artists" value="Lady Gaga"/>
+  <amll:meta key="album" value="Disease - Single"/>
+  <amll:meta key="qqMusicId" value="123456"/>
+  <amll:meta key="ncmMusicId" value="456789"/>
+  <amll:meta key="spotifyId" value="33e05cb33dd34eddb7d1d3b809dd44e1"/>
+  <amll:meta key="appleMusicId" value="6768201779"/>
+  <amll:meta key="isrc" value="USUM72603828"/>
   <iTunesMetadata>...</iTunesMetadata>
 </metadata>
 ```
 
-5. **去重规则**：已有人工整理的真实值默认保留，新查到的未出现值会追加到同一个 key 下（例如多语言歌名或歌手别名）。
-
 ---
 
-## 输出说明
+## 4. 命令行输出日志规范
 
-### 典型 dry-run 输出
+### 典型 预览 (dry-run) 日志
 
 ```text
 [dry-run] 2. Disease (Apple Music Live).ttml
@@ -133,9 +135,9 @@
   added: isrc = USUM72603828
 ```
 
-### 已填充文件的 unchanged 输出
+### 已填充文件未发生变化的日志
 
-如果文件已经填过所有真实值，再运行会显示 `unchanged` 和 `skipped`：
+如果文件中的各平台 ID 及元数据已是最新且完全一致，运行将显示 `unchanged` 并展示跳过写入的项目：
 
 ```text
 [unchanged] 2. Disease (Apple Music Live).ttml

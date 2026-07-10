@@ -1,36 +1,37 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { CheckCheck, Download, RotateCcw, Music, Headphones, Disc, Radio } from 'lucide-vue-next';
-import { NButton, NEmpty, NIcon, NTag } from 'naive-ui';
+import { CheckCheck, Download, RotateCcw } from 'lucide-vue-next';
+import { NAlert, NButton, NEmpty, NIcon, NTag } from 'naive-ui';
 
 import CandidateCard from '@/components/CandidateCard.vue';
 import DiffViewer from '@/components/DiffViewer.vue';
 import PairList from '@/components/PairList.vue';
+import { orderedSourceDescriptors } from '@/domain/sourceCatalog';
 import { useSessionStore } from '@/stores/session';
-import type { PreviewResult, SelectionPayload } from '@/api/types';
+import type { SourceKey } from '@/api/types';
 
 const store = useSessionStore();
 const router = useRouter();
-const activeSource = ref<keyof Omit<SelectionPayload, 'pair_id'>>('apple_music');
-
-const sourceOptions: Array<{ key: keyof Omit<SelectionPayload, 'pair_id'>; label: string; icon: any }> = [
-  { key: 'apple_music', label: 'Apple Music', icon: Music },
-  { key: 'qq_music', label: 'QQ 音乐', icon: Headphones },
-  { key: 'ncm_music', label: '网易云', icon: Disc },
-  { key: 'spotify', label: 'Spotify', icon: Radio },
-];
+const activeSource = ref<SourceKey | null>(null);
 
 const preview = computed(() => store.selectedPreview);
-const sourcePreview = computed(() => preview.value?.[activeSource.value] ?? null);
+const sourceOptions = computed(() => orderedSourceDescriptors(
+  Object.keys(preview.value?.sources ?? {}),
+));
+const sourcePreview = computed(() => (
+  preview.value && activeSource.value ? preview.value.sources[activeSource.value] ?? null : null
+));
 const selectedIds = computed(() => {
-  if (!preview.value) return [];
-  return store.selections[preview.value.pair_id]?.[activeSource.value] ?? [];
+  if (!preview.value || !activeSource.value) return [];
+  return store.selections[preview.value.pair_id]?.sources[activeSource.value] ?? [];
 });
 
-function sourceCount(result: PreviewResult, key: keyof Omit<SelectionPayload, 'pair_id'>) {
-  return result[key].candidates.length;
-}
+watch(sourceOptions, (options) => {
+  if (!options.some((source) => source.key === activeSource.value)) {
+    activeSource.value = options[0]?.key ?? null;
+  }
+}, { immediate: true });
 
 async function apply() {
   await store.applySelections();
@@ -55,7 +56,7 @@ async function apply() {
         <div class="panel-header">
           <div>
             <h2 class="panel-title">候选核对</h2>
-            <p class="panel-kicker">按来源快速比较候选，确认后再写入 TTML。</p>
+            <p class="panel-kicker">来源由服务端动态提供；每次选择都会重新计算写入计划。</p>
           </div>
           <NTag size="small" round>已选 {{ store.selectionCount }}</NTag>
         </div>
@@ -71,28 +72,36 @@ async function apply() {
               <NIcon :component="source.icon" size="15" />
               <span>{{ source.label }}</span>
               <span class="source-count mono-text">
-                {{ preview ? sourceCount(preview, source.key) : 0 }}
+                {{ preview?.sources[source.key]?.candidates.length ?? 0 }}
               </span>
             </button>
           </div>
 
-          <div v-if="sourcePreview" class="candidate-grid">
+          <NAlert
+            v-for="warning in sourcePreview?.warnings ?? []"
+            :key="warning"
+            type="warning"
+            :title="warning"
+            class="source-warning"
+          />
+
+          <div v-if="sourcePreview?.candidates.length" class="candidate-grid">
             <CandidateCard
               v-for="candidate in sourcePreview.candidates"
               :key="candidate.id"
               :candidate="candidate"
               :selected="selectedIds.includes(candidate.id)"
-              @toggle="preview && store.toggleCandidate(preview.pair_id, activeSource, $event)"
+              @toggle="preview && activeSource && store.toggleCandidate(preview.pair_id, activeSource, $event)"
             />
           </div>
-          <NEmpty v-else description="无候选" />
+          <NEmpty v-else description="当前来源无候选" />
 
           <div class="action-row">
             <NButton secondary @click="store.acceptBestForAll">
               <template #icon><NIcon :component="CheckCheck" /></template>
-              全部接受最佳
+              全部接受推荐
             </NButton>
-            <NButton secondary @click="store.previewAll">
+            <NButton secondary :disabled="store.loading" @click="store.previewAll">
               <template #icon><NIcon :component="RotateCcw" /></template>
               重新预览
             </NButton>
@@ -105,7 +114,7 @@ async function apply() {
       </section>
 
       <div v-if="preview" class="workbench-context" data-testid="write-preview-context">
-        <DiffViewer :changes="preview.changes" />
+        <DiffViewer :plan="store.selectedChangePlan" />
       </div>
     </div>
   </div>

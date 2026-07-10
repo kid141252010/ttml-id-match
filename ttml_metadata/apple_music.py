@@ -10,23 +10,10 @@ from typing import Any, Callable, Iterable
 
 from .config import clean_env_value, load_config_value, load_positive_int_config
 from .console import _safe_print, _color_text
-from .models import (
-    APPLE_MUSIC_ARTIST_ALBUM_LIMIT,
-    APPLE_MUSIC_ARTIST_ALBUM_PAGE_LIMIT,
-    APPLE_MUSIC_ARTIST_SEARCH_LIMIT,
-    APPLE_MUSIC_SEARCH_LIMIT,
-    DEFAULT_STORES,
-    AppleMusicClientProtocol,
-    AppleMusicMetadataResult,
-    AppleMusicTrackCandidate,
-    AppleMusicTrackMatch,
-    AudioMetadata,
-    PairMetadata,
-    _AppleMusicAlbumCandidate,
-    _AppleMusicArtistCandidate,
-)
+from .models import APPLE_MUSIC_ARTIST_ALBUM_LIMIT, APPLE_MUSIC_ARTIST_ALBUM_PAGE_LIMIT, APPLE_MUSIC_ARTIST_SEARCH_LIMIT, APPLE_MUSIC_SEARCH_LIMIT, DEFAULT_STORES, AppleMusicClientProtocol, AppleMusicMetadataResult, AppleMusicTrackCandidate, AppleMusicTrackMatch, AudioMetadata, _AppleMusicAlbumCandidate, _AppleMusicArtistCandidate
 from .network import proxy_url_for_source, urlopen_with_retry
 from .parallel import run_ordered_parallel
+from .v2.transport import HttpTransport
 from .text_utils import (
     _add_unique_list_value,
     _add_unique_value,
@@ -50,9 +37,16 @@ from .text_utils import (
 )
 
 class AppleMusicClient:
-    def __init__(self, timeout: int = 20, proxy_url: str | None = None, bearer_token: str | None = None):
+    def __init__(
+        self,
+        timeout: int = 20,
+        proxy_url: str | None = None,
+        bearer_token: str | None = None,
+        transport: HttpTransport | None = None,
+    ):
         self.timeout = timeout
         self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("apple_music")
+        self._transport = transport
         self._token: str | None = _normalize_bearer_token(
             bearer_token if bearer_token is not None else load_config_value("APPLE_MUSIC_BEARER_TOKEN")
         )
@@ -280,6 +274,13 @@ class AppleMusicClient:
         }
         if headers:
             request_headers.update(headers)
+        if self._transport is not None:
+            return self._transport.request(
+                "apple_music",
+                "GET",
+                url,
+                headers=request_headers,
+            ).text
         request = urllib.request.Request(url, headers=request_headers)
         with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             return response.read().decode("utf-8", "ignore")
@@ -311,6 +312,8 @@ def collect_apple_music_metadata(
     metadata: AudioMetadata,
     client: AppleMusicClientProtocol,
     stores: list[str] | None = None,
+    *,
+    max_workers: int | None = None,
 ) -> AppleMusicMetadataResult:
     result = AppleMusicMetadataResult()
     store_order = _apple_music_store_order(stores)
@@ -325,7 +328,11 @@ def collect_apple_music_metadata(
     storefront_results = run_ordered_parallel(
         store_order,
         lambda store: _collect_apple_music_storefront(metadata, client, store),
-        max_workers=load_positive_int_config("TTML_APPLE_MUSIC_WORKERS", default=3),
+        max_workers=(
+            max_workers
+            if max_workers is not None
+            else load_positive_int_config("TTML_APPLE_MUSIC_WORKERS", default=3)
+        ),
     )
 
     all_candidates: list[AppleMusicTrackCandidate] = []
@@ -412,99 +419,6 @@ def _collect_apple_music_storefront(
     return store, sorted_store_candidates, errors
 
 
-def confirm_apple_music_candidates(
-    pairs: list[PairMetadata],
-    dry_run: bool,
-    input_func: Callable[[str], str] = input,
-    print_func: Callable[..., None] | None = None,
-) -> None:
-    if print_func is None:
-        print_func = _safe_print
-
-    available = [pair for pair in pairs if pair.apple_music_metadata.candidates]
-    for pair in available:
-        pair.apple_music_metadata.selected = _apple_music_storefront_best_candidates(
-            pair.apple_music_metadata,
-            pair.metadata,
-        )
-        _sync_apple_music_result_values(pair.apple_music_metadata, pair.metadata)
-
-    if dry_run or not available:
-        return
-
-    use_color = (print_func is _safe_print) and (input_func is input)
-
-    print_func("")
-    header_text = "Apple Music 最佳候选："
-    if use_color:
-        header_text = _color_text(header_text, "header")
-    print_func(header_text)
-
-    for pair in available:
-        best = _apple_music_storefront_top_candidates(pair.apple_music_metadata)
-        if not best:
-            cand_str = _color_text("-", "unchanged") if use_color else "-"
-            print_func(f"  {pair.ttml_path.name}: {cand_str}")
-        else:
-            print_func(f"  {pair.ttml_path.name}:")
-            for candidate in best:
-                cand_str = _format_apple_music_candidate(candidate)
-                if use_color:
-                    cand_str = _color_text(cand_str, "highlight")
-                print_func(f"    - {cand_str}")
-
-    while True:
-        prompt_text = "Accept all Apple Music best candidates? Type Y to accept, N to choose alternatives: "
-        if use_color:
-            prompt_text = _color_text(prompt_text, "prompt")
-        answer = input_func(prompt_text).strip()
-        if answer.casefold() in {"y", "n"}:
-            break
-        print_func("Please type Y or N.")
-
-    if answer.casefold() == "y":
-        return
-
-    for pair in available:
-        selected: list[AppleMusicTrackCandidate] = []
-        print_func("")
-        cand_title = f"{pair.ttml_path.name} Apple Music 候选："
-        if use_color:
-            cand_title = _color_text(cand_title, "info")
-        print_func(cand_title)
-
-        storefront_groups = (
-            pair.apple_music_metadata.candidates_by_storefront
-            or _apple_music_candidates_grouped_by_storefront(pair.apple_music_metadata.candidates)
-        )
-        for storefront in _apple_music_store_order_from_mapping(storefront_groups):
-            options = storefront_groups.get(storefront, [])[:5]
-            if not options:
-                continue
-            label = storefront.upper()
-            store_title = f"  {label} Apple Music 候选："
-            if use_color:
-                store_title = _color_text(store_title, "info")
-            print_func(store_title)
-
-            for index, candidate in enumerate(options, start=1):
-                idx_str = f"    {index}."
-                if use_color:
-                    idx_str = _color_text(idx_str, "info")
-                print_func(f"{idx_str} {_format_apple_music_candidate(candidate)}")
-            while True:
-                sel_prompt = f"Select {label} 1-5, or press Enter to skip this storefront: "
-                if use_color:
-                    sel_prompt = _color_text(sel_prompt, "prompt")
-                answer = input_func(sel_prompt).strip()
-                if not answer:
-                    break
-                if answer.isdigit() and 1 <= int(answer) <= len(options):
-                    selected.append(options[int(answer) - 1])
-                    break
-                print_func("Invalid selection.")
-        pair.apple_music_metadata.selected = selected
-        _sync_apple_music_result_values(pair.apple_music_metadata, pair.metadata)
 
 
 def _merge_track_metadata(values: dict[str, list[str]], track: dict[str, Any]) -> None:

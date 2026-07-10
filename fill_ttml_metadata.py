@@ -3,12 +3,7 @@
 
 from __future__ import annotations
 
-import sys
-
-import ttml_metadata as _ttml_metadata
+from ttml_metadata.cli import main
 
 if __name__ == "__main__":
-    raise SystemExit(_ttml_metadata.main())
-
-# Keep patch("fill_ttml_metadata.<name>") pointed at the package facade.
-sys.modules[__name__] = _ttml_metadata
+    raise SystemExit(main())

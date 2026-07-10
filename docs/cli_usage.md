@@ -1,59 +1,70 @@
-# CLI 进阶使用指南
+# CLI 命令行工具使用指南
 
-本文档介绍 CLI 脚本的进阶使用方法，包括单首歌曲处理以及 Windows 环境下的交互脚本。
+`python -m ttml_metadata` 是本项目的命令行工具入口，底层与 Web 流程共享相同的平台注册表、依赖调度器、匹配逻辑和写入规划。
 
-## 单首文件处理
+---
 
-如果音频和 TTML 文件名不一致，或只想处理一首歌，可以显式指定文件：
+## 常用命令示例
 
+### 1. 批量处理目录
+
+- **仅预览匹配结果（不修改文件）**：
+  ```powershell
+  python -m ttml_metadata D:\lyrics --dry-run
+  ```
+- **执行实际匹配并写入文件**：
+  ```powershell
+  python -m ttml_metadata D:\lyrics
+  ```
+
+### 2. 处理单首歌曲（指定 TTML 与音频）
+
+- **仅预览单首歌曲匹配结果**：
+  ```powershell
+  python -m ttml_metadata --ttml lyrics.ttml --dry-run
+  ```
+- **实际匹配并写入单首歌曲**：
+  ```powershell
+  python -m ttml_metadata --ttml lyrics.ttml --audio recording.flac
+  ```
+
+### 3. 生成机器可读预览
+
+输出 JSON 格式的检索候选结果，方便被其他脚本解析：
 ```powershell
-python fill_ttml_metadata.py `
-  --audio "example\2. Disease (Apple Music Live).flac" `
-  --ttml "example\2. Disease (Apple Music Live).ttml"
+python -m ttml_metadata D:\lyrics --dry-run --json
 ```
 
-单首 dry-run：
+---
 
+## 进阶用法：指定候选 ID 写入
+
+如果需要干预匹配结果，传入指定的音乐平台 ID，可以生成一个 JSON 格式的选择文件（结构与 Web API v2 相同）：
+
+`selections.json` 示例：
+```json
+{
+  "selections": [
+    {
+      "pair_id": "pair-xxx",
+      "sources": {
+        "qq_music": ["123456"],
+        "apple_music": ["6768201779"]
+      }
+    }
+  ]
+}
+```
+
+通过 `--selection-file` 参数传入该文件来应用指定的候选 ID：
 ```powershell
-python fill_ttml_metadata.py `
-  --audio "example\2. Disease (Apple Music Live).flac" `
-  --ttml "example\2. Disease (Apple Music Live).ttml" `
-  --dry-run
+python -m ttml_metadata D:\lyrics --selection-file selections.json
 ```
 
-如果没有音频，也可以只指定 TTML。脚本会读取 TTML 已有的 `musicName`、`artists`、`album`，然后复用同一套 QQ 音乐、网易云音乐和 Spotify 搜索流程：
+---
 
-```powershell
-python fill_ttml_metadata.py `
-  --ttml "example\lyrics-only.ttml" `
-  --dry-run
-```
+## 工作机制说明
 
-## Windows 交互脚本
-
-仓库根目录提供 `fill_metadata.bat`，适合在 Windows 上双击或从 CMD/PowerShell 里运行。
-
-双击运行时，脚本会提示你输入要处理的目录。也可以直接带目录参数运行：
-
-```cmd
-fill_metadata.bat "D:\lyrics"
-```
-
-PowerShell 里运行：
-
-```powershell
-.\fill_metadata.bat "D:\lyrics"
-```
-
-如果想直接运行 PowerShell 脚本：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\fill_metadata.ps1 -TargetDir "D:\lyrics"
-```
-
-交互脚本的工作流程与特点：
-1. **预览与确认**：交互脚本会先直接显示 Python 的 dry-run 输出，不会立刻修改文件；只有在预览成功后输入 `Y` 才会进入真实写入。
-2. **并发控制**：默认会把 `-SearchWorkers 3` 传给 Python 脚本；需要串行搜索时可传 `-SearchWorkers 1`。
-3. **交互选择候选**：真实写入阶段会分别汇总 Apple Music、QQ 音乐、网易云音乐和 Spotify 最佳候选：输入 `Y` 接受全部最佳结果，输入 `N` 则逐首从 5 个候选里选择；Apple Music 和 Spotify 会按区域/市场分别选择。
-4. **备份机制**：真实写入仍由 Python 脚本生成 `.bak` 备份。
-5. **依赖说明**：脚本不会自动安装依赖，如果缺少 Python 依赖，请先执行 `python -m pip install -r requirements.txt` 安装。
+1. **同名音频匹配**：命令行工具会自动扫描目录下同名的 `.ttml` 与音频文件（如 `.flac`）进行配对。如果存在多个同名但不同格式的音频，优先选择唯一的 `.flac`。如果同名音频配对存在歧义（例如同名有多个不同非 FLAC 的音频），程序将拒绝处理并给出警告。
+2. **容错机制**：某一个文件的解析或检索失败只会作为警告输出，不影响目录中其他文件的处理。
+3. **安全写入**：在应用修改写入时，程序会首先计算文件哈希校验匹配，随后采用原子写入并自动在同目录下备份一份 `.bak` 原文件，确保数据安全。

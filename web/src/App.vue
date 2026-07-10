@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import { DatabaseZap } from 'lucide-vue-next';
 import { darkTheme, NConfigProvider, NIcon, NMessageProvider } from 'naive-ui';
@@ -79,6 +79,12 @@ const pageCopy = computed(() => {
   return { title: '上传与配对', subtitle: '添加 TTML 与音频文件，先确认识别和配对质量。' };
 });
 
+const activeStep = computed<WorkflowStep>(() => {
+  if (route.name === 'preview') return 'preview';
+  if (route.name === 'result') return 'result';
+  return 'upload';
+});
+
 onMounted(() => {
   const saved = localStorage.getItem('ttml-id-match-theme-mode') as 'light' | 'dark' | 'auto' | null;
   themeMode.value = saved || 'auto';
@@ -91,16 +97,6 @@ onMounted(() => {
     }
   });
 });
-
-watch(
-  () => route.name,
-  (name) => {
-    if (name === 'preview') store.setStep('preview');
-    else if (name === 'result') store.setStep('result');
-    else store.setStep('upload');
-  },
-  { immediate: true },
-);
 
 function go(step: (typeof steps)[number]) {
   router.push(step.path);
@@ -123,7 +119,7 @@ function go(step: (typeof steps)[number]) {
           </div>
 
           <nav class="step-list" aria-label="流程步骤">
-            <button v-for="(step, index) in steps" :key="step.key" class="step-item" :class="{ active: store.currentStep === step.key }" @click="go(step)">
+            <button v-for="(step, index) in steps" :key="step.key" class="step-item" :class="{ active: activeStep === step.key }" @click="go(step)">
               <span class="step-number">{{ index + 1 }}</span>
               <span>
                 <span class="step-title">{{ step.title }}</span>

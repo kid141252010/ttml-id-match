@@ -12,25 +12,10 @@ from typing import Any, Callable, Iterable
 
 from .config import load_config_value, load_positive_int_config
 from .console import _safe_print, _color_text
-from .models import (
-    DEFAULT_SPOTIFY_MARKETS,
-    SPOTIFY_ARTIST_ALBUM_LIMIT,
-    SPOTIFY_ARTIST_ALBUM_PAGE_LIMIT,
-    SPOTIFY_ARTIST_SEARCH_LIMIT,
-    SPOTIFY_CANDIDATE_TARGET,
-    SPOTIFY_SEARCH_LIMIT,
-    SPOTIFY_STRONG_MATCH_SCORE,
-    AudioMetadata,
-    PairMetadata,
-    SpotifyClientProtocol,
-    SpotifyCredentials,
-    SpotifySearchResult,
-    SpotifyTrackCandidate,
-    _SpotifyAlbumCandidate,
-    _SpotifyArtistCandidate,
-)
+from .models import DEFAULT_SPOTIFY_MARKETS, SPOTIFY_ARTIST_ALBUM_LIMIT, SPOTIFY_ARTIST_ALBUM_PAGE_LIMIT, SPOTIFY_ARTIST_SEARCH_LIMIT, SPOTIFY_CANDIDATE_TARGET, SPOTIFY_SEARCH_LIMIT, SPOTIFY_STRONG_MATCH_SCORE, AudioMetadata, SpotifyClientProtocol, SpotifyCredentials, SpotifySearchResult, SpotifyTrackCandidate, _SpotifyAlbumCandidate, _SpotifyArtistCandidate
 from .network import proxy_url_for_source, urlopen_with_retry
 from .parallel import run_ordered_parallel
+from .v2.transport import HttpTransport
 from .text_utils import (
     _add_unique_value,
     _duration_close,
@@ -72,11 +57,15 @@ class SpotifyClient:
         markets: Iterable[str] | None = None,
         read_json: Callable[[str, str], dict[str, Any]] | None = None,
         proxy_url: str | None = None,
+        transport: HttpTransport | None = None,
+        market_workers: int | None = None,
     ):
         self.credentials = credentials
         self.timeout = timeout
         self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("spotify")
         self.markets = list(markets or DEFAULT_SPOTIFY_MARKETS)
+        self._transport = transport
+        self._market_workers = market_workers
         self._read_json = read_json or self._read_json_from_url
         self._access_token: str | None = None
         self._token_lock = threading.Lock()
@@ -104,7 +93,11 @@ class SpotifyClient:
         market_results = run_ordered_parallel(
             self.markets,
             search_market,
-            max_workers=load_positive_int_config("TTML_SPOTIFY_MARKET_WORKERS", default=2),
+            max_workers=(
+                self._market_workers
+                if self._market_workers is not None
+                else load_positive_int_config("TTML_SPOTIFY_MARKET_WORKERS", default=2)
+            ),
         )
 
         candidates: list[SpotifyTrackCandidate] = []
@@ -297,8 +290,17 @@ class SpotifyClient:
             if self._access_token:
                 return self._access_token
             request = self._build_token_request()
-            with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
-                payload = json.loads(response.read().decode("utf-8", "ignore"))
+            if self._transport is not None:
+                payload = self._transport.request(
+                    "spotify",
+                    "POST",
+                    request.full_url,
+                    headers=dict(request.header_items()),
+                    content=request.data,
+                ).json()
+            else:
+                with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
+                    payload = json.loads(response.read().decode("utf-8", "ignore"))
             token = _stringify_tag_value(payload.get("access_token")) if isinstance(payload, dict) else None
             if not token:
                 raise ValueError("Spotify token response did not include access_token")
@@ -372,13 +374,24 @@ class SpotifyClient:
         return f"{self.TRACK_URL.format(track_id=urllib.parse.quote(track_id, safe=''))}?{params}"
 
     def _read_json_from_url(self, url: str, access_token: str) -> dict[str, Any]:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "Mozilla/5.0",
+        }
+        if self._transport is not None:
+            payload = self._transport.request(
+                "spotify",
+                "GET",
+                url,
+                headers=headers,
+            ).json()
+            if not isinstance(payload, dict):
+                raise ValueError("Spotify API returned a non-object payload")
+            return payload
         request = urllib.request.Request(
             url,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {access_token}",
-                "User-Agent": "Mozilla/5.0",
-            },
+            headers=headers,
         )
         with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
@@ -439,92 +452,6 @@ def collect_spotify_metadata(
     return result
 
 
-def confirm_spotify_candidates(
-    pairs: list[PairMetadata],
-    dry_run: bool,
-    input_func: Callable[[str], str] = input,
-    print_func: Callable[..., None] | None = None,
-) -> None:
-    if print_func is None:
-        print_func = _safe_print
-
-    available = [pair for pair in pairs if pair.spotify_metadata.candidates]
-    for pair in available:
-        pair.spotify_metadata.selected = _spotify_market_best_candidates(pair.spotify_metadata, pair.metadata)
-
-    if dry_run or not available:
-        return
-
-    use_color = (print_func is _safe_print) and (input_func is input)
-
-    print_func("")
-    header_text = "Spotify 最佳候选："
-    if use_color:
-        header_text = _color_text(header_text, "header")
-    print_func(header_text)
-
-    for pair in available:
-        best = _spotify_market_best_candidates(pair.spotify_metadata, pair.metadata)
-        if not best:
-            cand_str = _color_text("-", "unchanged") if use_color else "-"
-            print_func(f"  {pair.ttml_path.name}: {cand_str}")
-        else:
-            print_func(f"  {pair.ttml_path.name}:")
-            for candidate in best:
-                cand_str = _format_spotify_candidate(candidate)
-                if use_color:
-                    cand_str = _color_text(cand_str, "highlight")
-                print_func(f"    - {cand_str}")
-
-    while True:
-        prompt_text = "Accept all Spotify best candidates? Type Y to accept, N to choose alternatives: "
-        if use_color:
-            prompt_text = _color_text(prompt_text, "prompt")
-        answer = input_func(prompt_text).strip()
-        if answer.casefold() in {"y", "n"}:
-            break
-        print_func("Please type Y or N.")
-
-    if answer.casefold() == "y":
-        return
-
-    for pair in available:
-        selected: list[SpotifyTrackCandidate] = []
-        print_func("")
-        cand_title = f"{pair.ttml_path.name} Spotify 候选："
-        if use_color:
-            cand_title = _color_text(cand_title, "info")
-        print_func(cand_title)
-
-        market_groups = pair.spotify_metadata.candidates_by_market or _spotify_candidates_grouped_by_market(
-            pair.spotify_metadata.candidates
-        )
-        for market in _spotify_market_order_from_mapping(market_groups):
-            options = market_groups.get(market, [])[:5]
-            if not options:
-                continue
-            market_title = f"  {market} Spotify 候选："
-            if use_color:
-                market_title = _color_text(market_title, "info")
-            print_func(market_title)
-
-            for index, candidate in enumerate(options, start=1):
-                idx_str = f"    {index}."
-                if use_color:
-                    idx_str = _color_text(idx_str, "info")
-                print_func(f"{idx_str} {_format_spotify_candidate(candidate)}")
-            while True:
-                sel_prompt = f"Select {market} 1-5, or press Enter to skip this market: "
-                if use_color:
-                    sel_prompt = _color_text(sel_prompt, "prompt")
-                answer = input_func(sel_prompt).strip()
-                if not answer:
-                    break
-                if answer.isdigit() and 1 <= int(answer) <= len(options):
-                    selected.append(options[int(answer) - 1])
-                    break
-                print_func("Invalid selection.")
-        pair.spotify_metadata.selected = selected
 
 
 def _merge_spotify_metadata(

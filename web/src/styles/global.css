@@ -1275,12 +1275,16 @@ body::after {
   place-items: center;
 }
 
-.candidate-score {
+.candidate-rank {
   display: grid;
-  gap: 7px;
+  place-items: center;
+  min-height: 32px;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: var(--app-surface);
   color: var(--app-text);
   font-family: "JetBrains Mono", "Cascadia Mono", monospace;
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 700;
 }
 
@@ -1320,6 +1324,13 @@ body::after {
   min-width: 0;
 }
 
+.candidate-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
 .candidate-id {
   justify-self: end;
   max-width: 180px;
@@ -1334,6 +1345,26 @@ body::after {
 
 .change-grid {
   gap: 12px;
+}
+
+.normalization-summary {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-surface-muted);
+}
+
+.change-section-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.normalization-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .change-column {

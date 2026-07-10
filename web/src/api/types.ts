@@ -1,6 +1,8 @@
 export type WorkflowStep = 'upload' | 'preview' | 'result';
+export type OperationState = 'idle' | 'uploading' | 'previewing' | 'applying';
+export type SourceKey = string;
 
-export type PairStatus = 'paired' | 'ttml_only' | 'orphan_audio';
+export type PairStatus = 'paired' | 'ttml_only' | 'ambiguous';
 
 export interface SessionFile {
   name: string;
@@ -8,32 +10,72 @@ export interface SessionFile {
   kind: 'audio' | 'ttml' | 'other';
 }
 
+/** Wire representation returned by POST /files. */
+export interface PairingPair {
+  pair_id: string;
+  status: PairStatus;
+  ttml_path: string;
+  audio_path: string | null;
+  audio_candidates: string[];
+}
+
+/** UI representation. Pairing decisions always come from the server. */
 export interface FilePair {
   id: string;
-  ttml: string | null;
+  ttml: string;
   audio: string | null;
   status: PairStatus;
+  audio_candidates: string[];
 }
 
-export interface CandidateBase {
+export interface PairingIssue {
+  code: string;
+  pair_id: string;
+  ttml_path: string;
+  audio_candidates: string[];
+}
+
+export interface PairingPlanResponse {
+  pairs: PairingPair[];
+  issues: PairingIssue[];
+}
+
+export interface Evidence {
+  field: string;
+  relation: string;
+  expected: string | null;
+  actual: string | null;
+}
+
+export interface Candidate {
   id: string;
-  title: string;
+  source: SourceKey;
+  title: string | null;
   artists: string[];
-  album: string;
-  region?: string;
-  isrc?: string;
-  duration_ms?: number;
-  release_date?: string;
-  score: number;
-  source: 'apple_music' | 'qq_music' | 'ncm_music' | 'spotify';
+  album: string | null;
+  aliases: string[];
+  identifiers: Record<string, string>;
+  group: string | null;
+  rank: number;
+  recommended: boolean;
+  evidence: Evidence[];
+  duration_ms: number | null;
+  release_date: string | null;
 }
 
-export interface SourcePreview {
-  best: CandidateBase[];
-  candidates: CandidateBase[];
-  candidates_by_storefront: Record<string, CandidateBase[]>;
-  candidates_by_market: Record<string, CandidateBase[]>;
-  errors: string[];
+export type CandidateBase = Candidate;
+
+export interface SourceResult {
+  source: SourceKey;
+  candidates: Candidate[];
+  groups: Record<string, string[]>;
+  recommended_ids: string[];
+  warnings: string[];
+}
+
+export interface SelectionPayload {
+  pair_id: string;
+  sources: Record<SourceKey, string[]>;
 }
 
 export interface ChangeSet {
@@ -42,53 +84,96 @@ export interface ChangeSet {
   skipped: Record<string, string[]>;
 }
 
-export interface PreviewResult {
-  pair_id: string;
-  ttml: string;
-  audio: string | null;
-  apple_music: SourcePreview;
-  qq_music: SourcePreview;
-  ncm_music: SourcePreview;
-  spotify: SourcePreview;
-  changes: ChangeSet;
+export interface MetadataChangeSummary extends ChangeSet {
+  changed: boolean;
 }
 
-export type PreviewJobStatus = 'pending' | 'running' | 'complete' | 'failed';
+export interface NormalizationSummary {
+  language_changed: boolean;
+  body_text_changed: boolean;
+  removed_translations: number;
+  removed_transliterations: number;
+  changed: boolean;
+}
+
+export interface ChangePlanSummary {
+  input_sha256: string;
+  output_sha256: string;
+  final_text: string;
+  changed: boolean;
+  metadata: MetadataChangeSummary;
+  normalization: NormalizationSummary;
+}
+
+export interface ChangePlanResponse extends ChangePlanSummary {
+  snapshot_id: string;
+  pair_id: string;
+}
+
+export interface PairFile {
+  filename: string;
+  sha256: string;
+}
+
+export interface PairFiles {
+  ttml: PairFile;
+  audio: PairFile | null;
+}
+
+export interface PairPreview {
+  pair_id: string;
+  files: PairFiles;
+  sources: Record<SourceKey, SourceResult>;
+  default_selection: SelectionPayload;
+  baseline_change_plan: ChangePlanSummary;
+}
+
+export type PreviewResult = PairPreview;
+
+export type PreviewJobStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'completed_with_errors'
+  | 'failed';
+
+export interface ApiErrorPayload {
+  code: string;
+  message: string;
+  retryable: boolean;
+  details: Record<string, unknown>;
+}
 
 export interface PreviewJobResponse {
   job_id: string;
   status: PreviewJobStatus;
   total: number;
   completed: number;
-  results: PreviewResult[];
-  error?: string | null;
+  results: PairPreview[];
+  errors: ApiErrorPayload[];
+  snapshot_id: string | null;
 }
 
-export interface SelectionPayload {
+export type ApplyFileStatus = 'applied' | 'unchanged' | 'failed';
+
+export interface ApplyFileResult {
   pair_id: string;
-  apple_music: string[];
-  qq_music: string[];
-  ncm_music: string[];
-  spotify: string[];
+  ttml: string;
+  status: ApplyFileStatus;
+  output_sha256: string | null;
+  backup: string | null;
+  error: ApiErrorPayload | null;
 }
 
 export interface ApplySummary {
+  snapshot_id: string;
   succeeded: number;
   failed: number;
   skipped: number;
-  files: Array<{
-    pair_id: string;
-    ttml: string;
-    status: 'success' | 'failed' | 'skipped';
-    metadata_written: string[];
-    error?: string | null;
-  }>;
+  files: ApplyFileResult[];
 }
 
-export interface UploadResponse {
-  files: SessionFile[];
-  pairs: FilePair[];
-}
+export type UploadResponse = PairingPlanResponse;
 
 export interface ProgressEvent {
   id: string;
@@ -96,4 +181,3 @@ export interface ProgressEvent {
   message: string;
   at: string;
 }
-

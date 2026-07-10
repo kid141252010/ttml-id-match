@@ -1,188 +1,359 @@
 import { defineStore } from 'pinia';
 
-import { client } from '@/api/client';
-import type { IdMatchClient } from '@/api/client';
-import type { ApplySummary, FilePair, PreviewJobResponse, PreviewResult, ProgressEvent, SelectionPayload, SessionFile, WorkflowStep } from '@/api/types';
+import { ApiError, gateway as defaultGateway } from '@/api/client';
+import type { IdMatchGateway } from '@/api/client';
+import type {
+  ApplySummary,
+  ChangePlanResponse,
+  FilePair,
+  OperationState,
+  PairPreview,
+  PairingIssue,
+  PreviewJobResponse,
+  ProgressEvent,
+  SelectionPayload,
+  SessionFile,
+  SourceKey,
+} from '@/api/types';
+import {
+  createReviewDraft,
+  selectionCount as countSelections,
+  selectionsPayload,
+  toggleDraftCandidate,
+} from '@/domain/reviewDraft';
 
-let activeClient: IdMatchClient = client;
+const AUDIO_EXTENSIONS = new Set([
+  'aac', 'aif', 'aiff', 'alac', 'ape', 'flac', 'm4a', 'm4b', 'm4p', 'mp3',
+  'mp4', 'ogg', 'opus', 'wav', 'wma',
+]);
+const CHANGE_PLAN_DEBOUNCE_MS = 120;
 
 interface SessionState {
   sessionId: string | null;
   files: SessionFile[];
   pairs: FilePair[];
-  previewResults: PreviewResult[];
+  pairingIssues: PairingIssue[];
+  previewResults: PairPreview[];
+  previewStaging: PairPreview[];
+  snapshotId: string | null;
   selections: Record<string, SelectionPayload>;
+  changePlans: Record<string, ChangePlanResponse>;
+  baselineChangePlans: Record<string, ChangePlanResponse>;
+  changePlanPending: Record<string, boolean>;
+  changePlanRevisions: Record<string, number>;
   resultSummary: ApplySummary | null;
-  currentStep: WorkflowStep;
   selectedPairId: string | null;
-  loading: boolean;
+  operation: OperationState;
   progressEvents: ProgressEvent[];
 }
 
-const emptySelection = (pairId: string): SelectionPayload => ({
-  pair_id: pairId,
-  apple_music: [],
-  qq_music: [],
-  ncm_music: [],
-  spotify: [],
-});
+export function createSessionStore(gateway: IdMatchGateway, storeId = 'session') {
+  const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export const useSessionStore = defineStore('session', {
-  state: (): SessionState => ({
+  return defineStore(storeId, {
+    state: (): SessionState => initialState(),
+
+    getters: {
+      selectedPreview(state): PairPreview | null {
+        if (state.selectedPairId) {
+          return state.previewResults.find((result) => result.pair_id === state.selectedPairId) ?? null;
+        }
+        return state.previewResults[0] ?? null;
+      },
+      selectedChangePlan(state): ChangePlanResponse | null {
+        const pairId = state.selectedPairId ?? state.previewResults[0]?.pair_id;
+        return pairId ? state.changePlans[pairId] ?? null : null;
+      },
+      selectionCount(state): number {
+        return countSelections({ selections: state.selections });
+      },
+      canPreview(state): boolean {
+        return state.pairs.length > 0 && state.pairingIssues.length === 0;
+      },
+      canApply(state): boolean {
+        if (!state.snapshotId || state.previewResults.length === 0 || state.operation !== 'idle') return false;
+        if (Object.values(state.changePlanPending).some(Boolean)) return false;
+        return state.previewResults.every((preview) => (
+          Boolean(state.selections[preview.pair_id]) && Boolean(state.changePlans[preview.pair_id])
+        ));
+      },
+      loading(state): boolean {
+        return state.operation !== 'idle';
+      },
+    },
+
+    actions: {
+      async ensureSession(): Promise<void> {
+        if (this.sessionId) return;
+        const response = await gateway.createSession();
+        this.sessionId = response.session_id;
+        this.addProgress('info', `Session created ${response.session_id}`);
+      },
+
+      async uploadFiles(files: File[]): Promise<void> {
+        this.operation = 'uploading';
+        try {
+          await this.ensureSession();
+          const response = await gateway.uploadFiles(this.sessionId!, files);
+          this.cancelChangePlanRequests();
+          this.files = files.map(toSessionFile);
+          this.pairs = response.pairs.map((pair) => ({
+            id: pair.pair_id,
+            ttml: pair.ttml_path,
+            audio: pair.audio_path,
+            status: pair.status,
+            audio_candidates: [...pair.audio_candidates],
+          }));
+          this.pairingIssues = response.issues;
+          this.previewResults = [];
+          this.previewStaging = [];
+          this.snapshotId = null;
+          this.selections = {};
+          this.changePlans = {};
+          this.baselineChangePlans = {};
+          this.resultSummary = null;
+          this.selectedPairId = this.pairs[0]?.id ?? null;
+          this.addProgress('success', `Recognized ${this.pairs.length} TTML pairs`);
+        } catch (error) {
+          this.addProgress('error', errorMessage(error));
+          throw error;
+        } finally {
+          this.operation = 'idle';
+        }
+      },
+
+      async previewAll(): Promise<void> {
+        await this.ensureSession();
+        this.operation = 'previewing';
+        this.previewStaging = [];
+        try {
+          let job = await gateway.createPreviewJob(this.sessionId!);
+          this.stagePreviewJob(job);
+          while (job.status === 'pending' || job.status === 'running') {
+            job = await gateway.stepPreviewJob(this.sessionId!, job.job_id);
+            this.stagePreviewJob(job);
+          }
+          if (job.status === 'failed') throw new Error(previewJobError(job));
+          if (!job.snapshot_id) throw new Error('Completed preview job did not publish a snapshot');
+
+          this.commitPreviewJob(job);
+          const suffix = job.status === 'completed_with_errors' ? ' with source errors' : '';
+          this.addProgress('success', `Preview completed ${job.completed}/${job.total}${suffix}`);
+        } catch (error) {
+          this.previewStaging = [];
+          this.addProgress('error', errorMessage(error));
+          throw error;
+        } finally {
+          this.operation = 'idle';
+        }
+      },
+
+      toggleCandidate(pairId: string, source: SourceKey, candidateId: string): void {
+        const next = toggleDraftCandidate({ selections: this.selections }, pairId, source, candidateId);
+        this.selections = next.selections;
+        delete this.changePlans[pairId];
+        this.queueChangePlan(pairId);
+      },
+
+      acceptBestForAll(): void {
+        this.cancelChangePlanRequests();
+        this.selections = createReviewDraft(this.previewResults).selections;
+        this.changePlans = clonePlanMap(this.baselineChangePlans);
+        this.addProgress('info', 'Accepted all recommended candidates');
+      },
+
+      async flushChangePlan(pairId?: string): Promise<void> {
+        const pairIds = pairId
+          ? [pairId]
+          : Object.keys(this.changePlanPending).filter((id) => this.changePlanPending[id]);
+        await Promise.all(pairIds.map(async (id) => {
+          const timer = debounceTimers.get(id);
+          if (timer) {
+            clearTimeout(timer);
+            debounceTimers.delete(id);
+          }
+          const revision = this.changePlanRevisions[id];
+          if (revision !== undefined && this.changePlanPending[id]) {
+            await this.requestChangePlan(id, revision);
+          }
+        }));
+      },
+
+      async applySelections(): Promise<void> {
+        await this.flushChangePlan();
+        await this.ensureSession();
+        if (!this.snapshotId) throw new Error('Preview snapshot is required before apply');
+        const payload = selectionsPayload({ selections: this.selections }, this.previewResults);
+        if (payload.length !== this.previewResults.length || !this.previewResults.every((item) => this.changePlans[item.pair_id])) {
+          throw new Error('Every preview pair requires a current selection plan');
+        }
+
+        this.operation = 'applying';
+        try {
+          this.resultSummary = await gateway.apply(this.sessionId!, this.snapshotId, payload);
+          this.addProgress('success', 'Apply completed');
+        } catch (error) {
+          this.invalidateSnapshot(error);
+          this.addProgress('error', errorMessage(error));
+          throw error;
+        } finally {
+          this.operation = 'idle';
+        }
+      },
+
+      async resetSession(): Promise<void> {
+        const sessionId = this.sessionId;
+        if (sessionId) await gateway.deleteSession(sessionId);
+        this.cancelChangePlanRequests();
+        Object.assign(this, initialState());
+      },
+
+      selectPair(pairId: string): void {
+        this.selectedPairId = pairId;
+      },
+
+      addProgress(level: ProgressEvent['level'], message: string): void {
+        this.progressEvents.unshift({
+          id: `${Date.now()}-${this.progressEvents.length}`,
+          level,
+          message,
+          at: new Date().toLocaleTimeString(),
+        });
+        this.progressEvents = this.progressEvents.slice(0, 8);
+      },
+
+      stagePreviewJob(job: PreviewJobResponse): void {
+        this.previewStaging = [...job.results];
+        if (job.completed > 0 && (job.status === 'pending' || job.status === 'running')) {
+          this.addProgress('info', `Preview progress ${job.completed}/${job.total}`);
+        }
+      },
+
+      commitPreviewJob(job: PreviewJobResponse): void {
+        const snapshotId = job.snapshot_id!;
+        this.cancelChangePlanRequests();
+        this.previewResults = [...job.results];
+        this.previewStaging = [];
+        this.snapshotId = snapshotId;
+        this.selections = createReviewDraft(job.results).selections;
+        this.baselineChangePlans = Object.fromEntries(job.results.map((preview) => [
+          preview.pair_id,
+          {
+            snapshot_id: snapshotId,
+            pair_id: preview.pair_id,
+            ...preview.baseline_change_plan,
+          },
+        ]));
+        this.changePlans = clonePlanMap(this.baselineChangePlans);
+        this.selectedPairId = job.results[0]?.pair_id ?? null;
+        this.resultSummary = null;
+      },
+
+      queueChangePlan(pairId: string): void {
+        const revision = (this.changePlanRevisions[pairId] ?? 0) + 1;
+        this.changePlanRevisions[pairId] = revision;
+        this.changePlanPending[pairId] = true;
+        const previous = debounceTimers.get(pairId);
+        if (previous) clearTimeout(previous);
+        debounceTimers.set(pairId, setTimeout(() => {
+          debounceTimers.delete(pairId);
+          void this.requestChangePlan(pairId, revision).catch(() => undefined);
+        }, CHANGE_PLAN_DEBOUNCE_MS));
+      },
+
+      async requestChangePlan(pairId: string, revision: number): Promise<void> {
+        const sessionId = this.sessionId;
+        const snapshotId = this.snapshotId;
+        const selection = this.selections[pairId];
+        if (!sessionId || !snapshotId || !selection || this.changePlanRevisions[pairId] !== revision) return;
+
+        try {
+          const response = await gateway.changePlan(sessionId, snapshotId, cloneSelection(selection));
+          if (
+            this.sessionId === sessionId
+            && this.snapshotId === snapshotId
+            && this.changePlanRevisions[pairId] === revision
+          ) {
+            this.changePlans[pairId] = response;
+          }
+        } catch (error) {
+          if (this.changePlanRevisions[pairId] === revision) {
+            this.invalidateSnapshot(error);
+            this.addProgress('error', errorMessage(error));
+          }
+          throw error;
+        } finally {
+          if (this.changePlanRevisions[pairId] === revision) {
+            this.changePlanPending[pairId] = false;
+          }
+        }
+      },
+
+      cancelChangePlanRequests(): void {
+        for (const timer of debounceTimers.values()) clearTimeout(timer);
+        debounceTimers.clear();
+        this.changePlanPending = {};
+        this.changePlanRevisions = {};
+      },
+
+      invalidateSnapshot(error: unknown): void {
+        if (!(error instanceof ApiError) || error.code !== 'snapshot_conflict') return;
+        this.cancelChangePlanRequests();
+        this.snapshotId = null;
+        this.changePlans = {};
+        this.baselineChangePlans = {};
+      },
+    },
+  });
+}
+
+export const useSessionStore = createSessionStore(defaultGateway);
+
+function initialState(): SessionState {
+  return {
     sessionId: null,
     files: [],
     pairs: [],
+    pairingIssues: [],
     previewResults: [],
+    previewStaging: [],
+    snapshotId: null,
     selections: {},
+    changePlans: {},
+    baselineChangePlans: {},
+    changePlanPending: {},
+    changePlanRevisions: {},
     resultSummary: null,
-    currentStep: 'upload',
     selectedPairId: null,
-    loading: false,
+    operation: 'idle',
     progressEvents: [],
-  }),
-
-  getters: {
-    selectedPreview(state): PreviewResult | null {
-      return state.previewResults.find((result) => result.pair_id === state.selectedPairId) ?? state.previewResults[0] ?? null;
-    },
-    selectionCount(state): number {
-      return Object.values(state.selections).reduce((total, selection) => {
-        return total + selection.apple_music.length + selection.qq_music.length + selection.ncm_music.length + selection.spotify.length;
-      }, 0);
-    },
-    canPreview(state): boolean {
-      return state.pairs.some((pair) => pair.ttml);
-    },
-    canApply(state): boolean {
-      return state.previewResults.length > 0;
-    },
-  },
-
-  actions: {
-    setClient(nextClient: IdMatchClient) {
-      activeClient = nextClient;
-    },
-
-    async ensureSession() {
-      if (this.sessionId) return;
-      const response = await activeClient.createSession();
-      this.sessionId = response.session_id;
-      this.addProgress('info', `会话已创建 ${response.session_id}`);
-    },
-
-    async uploadFiles(files: File[]) {
-      await this.ensureSession();
-      this.loading = true;
-      try {
-        const response = await activeClient.uploadFiles(this.sessionId!, files);
-        this.files = response.files;
-        this.pairs = response.pairs;
-        this.selectedPairId = response.pairs[0]?.id ?? null;
-        this.previewResults = [];
-        this.resultSummary = null;
-        this.selections = {};
-        this.currentStep = 'upload';
-        this.addProgress('success', `已识别 ${response.pairs.length} 组 TTML`);
-      } catch (error) {
-        this.addProgress('error', error instanceof Error ? error.message : String(error));
-        throw error;
-      } finally {
-        this.loading = false;
-      }
-    },
-
-    async previewAll() {
-      await this.ensureSession();
-      this.loading = true;
-      try {
-        this.addProgress('info', '开始 dry-run 预览');
-        const response = await runPreviewJob(this.sessionId!, this.pairs, (job) => {
-          this.previewResults = job.results;
-          if (job.completed > 0 && job.status !== 'complete') {
-            this.addProgress('info', `预览进度 ${job.completed}/${job.total}`);
-          }
-        });
-        this.previewResults = response.results;
-        if (response.status === 'failed') {
-          throw new Error(response.error ?? '预览失败');
-        }
-        this.selections = Object.fromEntries(response.results.map((result) => [result.pair_id, defaultSelection(result)]));
-        this.selectedPairId = response.results[0]?.pair_id ?? null;
-        this.currentStep = 'preview';
-        this.addProgress('success', `预览完成 ${response.results.length}/${this.pairs.length}`);
-      } catch (error) {
-        this.addProgress('error', error instanceof Error ? error.message : String(error));
-        throw error;
-      } finally {
-        this.loading = false;
-      }
-    },
-
-    toggleCandidate(pairId: string, source: keyof Omit<SelectionPayload, 'pair_id'>, candidateId: string) {
-      const selection = this.selections[pairId] ?? emptySelection(pairId);
-      const values = new Set(selection[source]);
-      if (values.has(candidateId)) {
-        values.delete(candidateId);
-      } else {
-        values.add(candidateId);
-      }
-      this.selections[pairId] = { ...selection, [source]: Array.from(values) };
-    },
-
-    acceptBestForAll() {
-      this.selections = Object.fromEntries(this.previewResults.map((result) => [result.pair_id, defaultSelection(result)]));
-      this.addProgress('info', '已选择全部最佳候选');
-    },
-
-    async applySelections() {
-      await this.ensureSession();
-      this.loading = true;
-      try {
-        const payload = Object.values(this.selections);
-        this.addProgress('info', `写入 ${payload.length} 组选择`);
-        this.resultSummary = await activeClient.apply(this.sessionId!, payload, this.previewResults);
-        this.currentStep = 'result';
-        this.addProgress('success', '写入流程已完成');
-      } catch (error) {
-        this.addProgress('error', error instanceof Error ? error.message : String(error));
-        throw error;
-      } finally {
-        this.loading = false;
-      }
-    },
-
-    setStep(step: WorkflowStep) {
-      this.currentStep = step;
-    },
-
-    selectPair(pairId: string) {
-      this.selectedPairId = pairId;
-    },
-
-    addProgress(level: ProgressEvent['level'], message: string) {
-      this.progressEvents.unshift({ id: `${Date.now()}-${this.progressEvents.length}`, level, message, at: new Date().toLocaleTimeString() });
-      this.progressEvents = this.progressEvents.slice(0, 8);
-    },
-  },
-});
-
-async function runPreviewJob(sessionId: string, pairs: FilePair[], onProgress: (job: PreviewJobResponse) => void): Promise<PreviewJobResponse> {
-  let job = await activeClient.createPreviewJob(sessionId, pairs);
-  onProgress(job);
-  while (job.status === 'pending' || job.status === 'running') {
-    job = await activeClient.stepPreviewJob(sessionId, job.job_id);
-    onProgress(job);
-  }
-  return job;
-}
-
-function defaultSelection(result: PreviewResult): SelectionPayload {
-  return {
-    pair_id: result.pair_id,
-    apple_music: result.apple_music.best.map((candidate) => candidate.id),
-    qq_music: result.qq_music.best.map((candidate) => candidate.id),
-    ncm_music: result.ncm_music.best.map((candidate) => candidate.id),
-    spotify: result.spotify.best.map((candidate) => candidate.id),
   };
 }
 
+function toSessionFile(file: File): SessionFile {
+  const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const kind = extension === 'ttml' ? 'ttml' : AUDIO_EXTENSIONS.has(extension) ? 'audio' : 'other';
+  return { name: file.name, size: file.size, kind };
+}
+
+function previewJobError(job: PreviewJobResponse): string {
+  return job.errors[0]?.message ?? 'Preview failed';
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function cloneSelection(selection: SelectionPayload): SelectionPayload {
+  return {
+    pair_id: selection.pair_id,
+    sources: Object.fromEntries(Object.entries(selection.sources).map(([source, ids]) => [source, [...ids]])),
+  };
+}
+
+function clonePlanMap(plans: Record<string, ChangePlanResponse>): Record<string, ChangePlanResponse> {
+  return Object.fromEntries(Object.entries(plans).map(([pairId, plan]) => [
+    pairId,
+    JSON.parse(JSON.stringify(plan)) as ChangePlanResponse,
+  ]));
+}

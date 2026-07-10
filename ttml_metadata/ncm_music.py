@@ -8,23 +8,10 @@ from typing import Any, Callable, Iterable
 
 from .config import load_positive_int_config
 from .console import _safe_print, _color_text
-from .models import (
-    DEFAULT_NCM_API_BASES,
-    NCM_ARTIST_ALBUM_LIMIT,
-    NCM_ARTIST_SEARCH_LIMIT,
-    NCM_SEARCH_LIMIT,
-    AudioMetadata,
-    NCMusicCandidate,
-    NCMusicClientProtocol,
-    NCMusicSearchContext,
-    NCMusicSearchResult,
-    PairMetadata,
-    QQMusicCandidate,
-    _NCMusicAlbumCandidate,
-    _NCMusicArtistCandidate,
-)
+from .models import DEFAULT_NCM_API_BASES, NCM_ARTIST_ALBUM_LIMIT, NCM_ARTIST_SEARCH_LIMIT, NCM_SEARCH_LIMIT, AudioMetadata, NCMusicCandidate, NCMusicClientProtocol, NCMusicSearchContext, NCMusicSearchResult, QQMusicCandidate, _NCMusicAlbumCandidate, _NCMusicArtistCandidate
 from .network import proxy_url_for_source, urlopen_with_retry
 from .parallel import run_ordered_parallel
+from .v2.transport import HttpTransport
 from .text_utils import (
     _add_text_with_simplified_variants,
     _add_unique_value,
@@ -43,10 +30,16 @@ class NCMusicClient:
         api_bases: Iterable[str] | None = None,
         read_json: Callable[[str], dict[str, Any]] | None = None,
         proxy_url: str | None = None,
+        transport: HttpTransport | None = None,
+        api_workers: int | None = None,
+        query_workers: int | None = None,
     ):
         self.timeout = timeout
         self.proxy_url = proxy_url if proxy_url is not None else proxy_url_for_source("ncm_music")
         self.api_bases = [base.rstrip("/") for base in (api_bases or DEFAULT_NCM_API_BASES) if base]
+        self._transport = transport
+        self._api_workers = api_workers
+        self._query_workers = query_workers
         self._read_json = read_json or self._read_json_from_url
 
     def search_songs(self, context: NCMusicSearchContext | str) -> list[NCMusicCandidate]:
@@ -55,7 +48,26 @@ class NCMusicClient:
         if isinstance(context, str):
             context = NCMusicSearchContext(titles=_text_with_simplified_variants(context))
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.api_bases))
+        api_workers = self._api_workers or len(self.api_bases)
+        if api_workers == 1:
+            errors: list[str] = []
+            successful_responses = 0
+            for base in self.api_bases:
+                try:
+                    candidates = self._search_base(base, context)
+                except Exception as exc:
+                    errors.append(f"{base}: {exc}")
+                    continue
+                successful_responses += 1
+                if candidates:
+                    return candidates
+            if errors and not successful_responses:
+                raise LookupError("; ".join(errors))
+            return []
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(api_workers, len(self.api_bases))
+        )
         futures = {
             executor.submit(self._search_base, base, context): base
             for base in self.api_bases
@@ -84,7 +96,9 @@ class NCMusicClient:
     def _search_base(self, base: str, context: NCMusicSearchContext) -> list[NCMusicCandidate]:
         candidates: list[NCMusicCandidate] = []
         errors: list[str] = []
-        query_workers = load_positive_int_config("TTML_NCM_QUERY_WORKERS", default=2)
+        query_workers = self._query_workers or load_positive_int_config(
+            "TTML_NCM_QUERY_WORKERS", default=2
+        )
 
         def search_title(query: str) -> tuple[list[NCMusicCandidate], str | None]:
             try:
@@ -212,12 +226,23 @@ class NCMusicClient:
         return f"{base.rstrip('/')}/album?{params}"
 
     def _read_json_from_url(self, url: str) -> dict[str, Any]:
+        headers = {
+            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "Mozilla/5.0",
+        }
+        if self._transport is not None:
+            payload = self._transport.request(
+                "ncm_music",
+                "GET",
+                url,
+                headers=headers,
+            ).json()
+            if not isinstance(payload, dict):
+                raise ValueError("NCM API returned a non-object payload")
+            return payload
         request = urllib.request.Request(
             url,
-            headers={
-                "Accept": "application/json,text/plain,*/*",
-                "User-Agent": "Mozilla/5.0",
-            },
+            headers=headers,
         )
         with urlopen_with_retry(request, timeout=self.timeout, proxy_url=self.proxy_url) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
@@ -252,75 +277,6 @@ def collect_ncm_music_metadata(
     return result
 
 
-def confirm_ncm_music_candidates(
-    pairs: list[PairMetadata],
-    dry_run: bool,
-    input_func: Callable[[str], str] = input,
-    print_func: Callable[..., None] | None = None,
-) -> None:
-    if print_func is None:
-        print_func = _safe_print
-
-    available = [pair for pair in pairs if pair.ncm_music_metadata.candidates]
-    for pair in available:
-        pair.ncm_music_metadata.selected = pair.ncm_music_metadata.candidates[0]
-
-    if dry_run or not available:
-        return
-
-    use_color = (print_func is _safe_print) and (input_func is input)
-
-    print_func("")
-    header_text = "网易云音乐最佳候选："
-    if use_color:
-        header_text = _color_text(header_text, "header")
-    print_func(header_text)
-
-    for pair in available:
-        best = pair.ncm_music_metadata.candidates[0]
-        cand_str = _format_ncm_music_candidate(best)
-        if use_color:
-            cand_str = _color_text(cand_str, "highlight")
-        print_func(f"  {pair.ttml_path.name}:")
-        print_func(f"    - {cand_str}")
-
-    while True:
-        prompt_text = "Accept all NetEase Cloud Music best candidates? Type Y to accept, N to choose alternatives: "
-        if use_color:
-            prompt_text = _color_text(prompt_text, "prompt")
-        answer = input_func(prompt_text).strip()
-        if answer.casefold() in {"y", "n"}:
-            break
-        print_func("Please type Y or N.")
-
-    if answer.casefold() == "y":
-        return
-
-    for pair in available:
-        options = pair.ncm_music_metadata.candidates[:5]
-        print_func("")
-        cand_title = f"{pair.ttml_path.name} 网易云音乐候选："
-        if use_color:
-            cand_title = _color_text(cand_title, "info")
-        print_func(cand_title)
-
-        for index, candidate in enumerate(options, start=1):
-            idx_str = f"  {index}."
-            if use_color:
-                idx_str = _color_text(idx_str, "info")
-            print_func(f"{idx_str} {_format_ncm_music_candidate(candidate)}")
-        while True:
-            sel_prompt = "Select 1-5, or press Enter to skip this song: "
-            if use_color:
-                sel_prompt = _color_text(sel_prompt, "prompt")
-            answer = input_func(sel_prompt).strip()
-            if not answer:
-                pair.ncm_music_metadata.selected = None
-                break
-            if answer.isdigit() and 1 <= int(answer) <= len(options):
-                pair.ncm_music_metadata.selected = options[int(answer) - 1]
-                break
-            print_func("Invalid selection.")
 
 
 def _merge_ncm_music_metadata(

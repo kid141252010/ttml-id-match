@@ -6,8 +6,12 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vue-tsc --noEmit && vite build",
+    "openapi:export": "python ../scripts/export_openapi.py",
+    "openapi:generate": "npm run openapi:export && openapi-typescript ../openapi/v2.json -o src/api/generated.ts",
+    "openapi:check": "npm run openapi:generate && git -C .. diff --exit-code -- openapi/v2.json web/src/api/generated.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:e2e": "node scripts/run-e2e.mjs"
   },
   "dependencies": {
     "lucide-vue-next": "^0.556.0",
@@ -17,10 +21,12 @@
     "vue-router": "^4.6.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^25.9.1",
     "@vitejs/plugin-vue": "^6.0.3",
     "@vue/test-utils": "^2.4.6",
     "jsdom": "^27.3.0",
+    "openapi-typescript": "^7.13.0",
     "typescript": "^5.9.3",
     "vite": "^7.2.4",
     "vitest": "^4.0.14",

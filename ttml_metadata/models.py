@@ -248,23 +248,6 @@ class _AppleMusicAlbumCandidate:
 
 
 @dataclass
-class PairMetadata:
-    audio_path: Path | None
-    ttml_path: Path
-    metadata: AudioMetadata
-    apple_music_metadata: AppleMusicMetadataResult
-    qq_music_metadata: QQMusicSearchResult
-    ncm_music_metadata: NCMusicSearchResult = field(default_factory=NCMusicSearchResult)
-    spotify_metadata: SpotifySearchResult = field(default_factory=SpotifySearchResult)
-
-
-@dataclass(frozen=True)
-class WorkItem:
-    ttml_path: Path
-    audio_path: Path | None = None
-
-
-@dataclass
 class TtmlUpdateResult:
     added: dict[str, list[str]] = field(default_factory=dict)
     replaced: dict[str, list[str]] = field(default_factory=dict)

@@ -1,71 +1,51 @@
-# 常见问题与故障排查
+# v2 常见问题
 
-本文档列出了在使用 TTML 元数据快速填充脚本和 Web 服务时可能遇到的常见问题及其解决方法。
+## 为什么 preview job 是 `completed_with_errors`？
 
-## 1. 批量运行时某个 TTML 被跳过
+一个或多个来源返回了 warning，但 snapshot 仍成功发布。已成功的来源候选可以继续 review 和 apply；warning 会保存在对应 `SourceResult` 与 job errors 中。
 
-- **配对机制**：批量模式优先按同名 stem 自动配对音频和 TTML。
-  - 例如，以下结构可以自动配对：
-    ```text
-    song.flac
-    song.ttml
-    ```
-  - 如果同目录下同时存在同名 `.flac` 和 `.m4a`，批量模式会优先使用 `.flac`：
-    ```text
-    song.flac
-    song.m4a
-    song.ttml
-    ```
-- **TTML-only 模式限制**：如果文件名不匹配（例如 `song-audio.flac` 和 `song-lyrics.ttml`），音频将不会被自动读取，脚本会转为 **TTML-only 模式**。
-  - 在 TTML-only 模式下，只要 TTML 中已有有效的 `musicName`，脚本仍会尝试搜索并匹配。
-  - 但由于没有音频中的发行日期和时长等信息，脚本不会启用 Apple Music 或 Spotify 的艺人-专辑降级检索 (Artist-Album Fallback)。
-- **解决方法**：如果需要强制配对非同名音频与 TTML，请使用 `--audio` 和 `--ttml` 单首模式：
-  ```powershell
-  python fill_ttml_metadata.py --audio "path/to/audio.flac" --ttml "path/to/lyrics.ttml"
-  ```
+## 为什么出现 `snapshot_conflict`（409）？
 
-## 2. 找不到 Apple Music ID
+上传内容在 preview 后发生了变化、snapshot 已删除，或请求引用了不存在的 snapshot。v2 会在写入任何输出前拒绝整批 apply。重新上传或重新 preview 后再提交选择。
 
-常见原因：
-- 音频标签缺少 `ITUNESPLAYLISTID`（专辑ID），且普通歌名搜索（song search）未返回合适候选。
-- 目标歌曲未在脚本固定查询的五个区域（`cn`、`us`、`kr`、`jp`、`tw`）上架。
-- Apple Music 上的歌曲元数据（歌名、曲目号、发行日期、歌手或时长）与音频文件中的标签信息相差过大。
-- 搜索出的最佳候选为伴奏版（带有 `Instrumental` 等标记），但您的源歌名中并不包含伴奏标记，导致脚本将其过滤。
-- 未配置 `APPLE_MUSIC_BEARER_TOKEN`，且此时 Apple Music 页面已不再暴露可提取的临时 Web Token，或您配置的 Token 已经过期。
-- 当前局域网/网络环境无法正常访问 Apple Music 服务（需要检查代理配置）。
+## 为什么出现 `job_busy`（409）？
 
-## 3. 找不到 QQ 音乐 ID
+另一个实例持有同一 preview job 的短期 lease。客户端应稍后重试 step；同一 pair 不会被两个实例重复推进。
 
-常见原因：
-- 音频或 TTML 文件中均缺少歌名（`musicName`/`title`），无法发起搜索。
-- QQ 音乐搜索结果中没有同时包含 `songid` 和 `mid` 的候选。
-- 音频文件或 TTML 里的歌名、歌手或专辑等标签与 QQ 音乐库的名称差异过大（例如多出一个特殊字符）。此时若使用真实写入模式，建议输入 `N` 进行手动交互选择。
-- 当前网络无法正常访问 QQ 音乐的移动端搜索接口。
+## 为什么 TTML 没有进入 preview？
 
-## 4. 找不到网易云音乐 ID
+- 同 stem 存在多个音频且不能由“唯一 FLAC”规则消歧时，会产生 `ambiguous_audio` 并阻止 preview。
+- TTML 本身无法解析时，仅该 pair 失败；其他 pair 继续。
+- TTML-only 文件应已有 `musicName`，否则各来源通常只能返回缺少查询依据的 warning。
 
-常见原因：
-- 音频或 TTML 文件中均缺少歌名，无法发起搜索。
-- 本地 Python 环境缺少 `opencc-python-reimplemented` 依赖，无法进行繁简归一匹配。请运行以下命令重新安装依赖：
-  ```powershell
-  python -m pip install -r requirements.txt
-  ```
-- 用于检索的三个公开网易云 API 均不可用、超时或返回的结构发生了变化。
-- 网易云音乐搜索结果、歌手专辑列表或专辑详情里没有带有效歌曲 ID 的候选。
-- 标签差异过大。同样建议在真实写入时输入 `N` 进行手动交互选择。
+## 如何强制配对不同文件名的音频与 TTML？
 
-## 5. 找不到 Spotify ID
+CLI 可显式指定：
 
-常见原因：
-- 未在 `.env` 或系统环境变量中配置 `SPOTIFY_CLIENT_ID` 和 `SPOTIFY_CLIENT_SECRET`。
-- 音频或 TTML 文件中均缺少歌名，无法发起检索。
-- 目标歌曲未在 `US`、`KR`、`JP`、`TW` 四个市场发行。
-- 当前网络无法访问 Spotify Token 验证或搜索 API。
+```powershell
+python -m ttml_metadata --ttml lyrics.ttml --audio recording.flac
+```
 
-## 6. 不想覆盖原 TTML 文件
+Web 的自动 PairingPlan 不猜测不同 stem 的对应关系。
 
-- **备份机制**：真实写入时，脚本在修改前总会先生成一份 `.bak` 备份文件。
-- **只预览不写入**：如果仅想查看匹配结果而不做任何修改，请使用 `--dry-run` 参数：
-  ```powershell
-  python fill_ttml_metadata.py example --dry-run
-  ```
+## 为什么没有 Spotify 候选？
+
+确认 `SPOTIFY_CLIENT_ID` 与 `SPOTIFY_CLIENT_SECRET` 都已配置。缺少凭据只会产生来源 warning，不影响其他来源。
+
+## 网络超时或 429 如何处理？
+
+共享 HTTP transport 会统一重试。可配置来源代理，并降低全局/来源并发：
+
+```text
+TTML_SEARCH_WORKERS=2
+TTML_SOURCE_SPOTIFY_WORKERS=1
+TTML_PROXY_SPOTIFY=http://proxy.example.com:8080
+```
+
+## 写入会覆盖原文件吗？
+
+真实 apply 在写入前校验 preview SHA-256，先创建 `.bak`，再通过同目录临时文件原子替换。仅预览可使用：
+
+```powershell
+python -m ttml_metadata D:\lyrics --dry-run
+```

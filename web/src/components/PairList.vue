@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { FileAudio, FileText, Link2, Unlink } from 'lucide-vue-next';
+import { FileAudio, FileText, Link2, TriangleAlert, Unlink } from 'lucide-vue-next';
 import { NEmpty, NIcon, NTag } from 'naive-ui';
 
 import type { FilePair } from '@/api/types';
@@ -19,7 +19,26 @@ const emit = defineEmits<{ select: [pairId: string] }>();
 const counts = computed(() => ({
   paired: props.pairs.filter((pair) => pair.status === 'paired').length,
   ttmlOnly: props.pairs.filter((pair) => pair.status === 'ttml_only').length,
+  ambiguous: props.pairs.filter((pair) => pair.status === 'ambiguous').length,
 }));
+
+function statusLabel(status: FilePair['status']) {
+  if (status === 'paired') return '已配对';
+  if (status === 'ambiguous') return '音频冲突';
+  return '仅歌词';
+}
+
+function statusType(status: FilePair['status']): 'success' | 'warning' | 'error' {
+  if (status === 'paired') return 'success';
+  if (status === 'ambiguous') return 'error';
+  return 'warning';
+}
+
+function audioLabel(pair: FilePair) {
+  if (pair.status === 'paired') return pair.audio || '-';
+  if (pair.status === 'ambiguous') return pair.audio_candidates.join(' / ');
+  return '未匹配音频文件';
+}
 </script>
 
 <template>
@@ -31,7 +50,8 @@ const counts = computed(() => ({
       </div>
       <div class="status-tags">
         <NTag size="small" type="success" round>{{ counts.paired }} 已配对</NTag>
-        <NTag size="small" type="warning" round>{{ counts.ttmlOnly }} TTML-only</NTag>
+        <NTag v-if="counts.ttmlOnly" size="small" type="warning" round>{{ counts.ttmlOnly }} TTML-only</NTag>
+        <NTag v-if="counts.ambiguous" size="small" type="error" round>{{ counts.ambiguous }} 音频冲突</NTag>
       </div>
     </div>
     <div class="panel-body">
@@ -41,16 +61,16 @@ const counts = computed(() => ({
           v-for="pair in pairs"
           :key="pair.id"
           class="pair-row"
-          :class="{ active: pair.id === selectedId, selectable }"
+          :class="[{ active: pair.id === selectedId, selectable }, `status-${pair.status}`]"
           @click="selectable && emit('select', pair.id)"
         >
           <div class="pair-main">
             <div class="pair-name">{{ pair.ttml }}</div>
-            <NTag :type="pair.status === 'paired' ? 'success' : 'warning'" size="small" round strong>
+            <NTag :type="statusType(pair.status)" size="small" round strong>
               <template #icon>
-                <NIcon :component="pair.status === 'paired' ? Link2 : Unlink" />
+                <NIcon :component="pair.status === 'paired' ? Link2 : pair.status === 'ambiguous' ? TriangleAlert : Unlink" />
               </template>
-              {{ pair.status === 'paired' ? '已配对' : '仅歌词' }}
+              {{ statusLabel(pair.status) }}
             </NTag>
           </div>
           <div class="pair-paths muted">
@@ -61,7 +81,7 @@ const counts = computed(() => ({
             <div class="pair-path">
               <NIcon :component="FileAudio" :color="pair.status === 'paired' ? 'var(--app-info)' : 'var(--app-text-muted)'" />
               <span class="mono-text" :class="{ muted: pair.status !== 'paired' }">
-                {{ pair.audio || '未匹配音频文件' }}
+                {{ audioLabel(pair) }}
               </span>
             </div>
           </div>
