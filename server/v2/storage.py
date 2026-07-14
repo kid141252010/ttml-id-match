@@ -15,6 +15,7 @@ from typing import Any, Protocol, runtime_checkable
 JsonObject = dict[str, Any]
 _LOCKS_GUARD = threading.Lock()
 _ROOT_LOCKS: dict[Path, threading.RLock] = {}
+_ROOT_RATE_LIMITS: dict[Path, dict[str, tuple[int, float]]] = {}
 
 
 class VersionConflictError(RuntimeError):
@@ -27,6 +28,13 @@ class LeaseConflictError(RuntimeError):
 
 class InvalidArtifactKeyError(ValueError):
     """Raised when an artifact key is not a safe root-relative path."""
+
+
+@dataclass(frozen=True)
+class RateLimitResult:
+    allowed: bool
+    count: int
+    retry_after_seconds: int
 
 
 def validate_identifier(value: str, *, label: str = "identifier") -> str:
@@ -97,12 +105,37 @@ class SessionRepository(Protocol):
         ttl_seconds: float,
     ) -> bool: ...
 
+    def register_expiry(
+        self,
+        session_id: str,
+        *,
+        expires_at: float,
+        ttl_seconds: float,
+    ) -> None: ...
+
+    def list_expired(self, *, before: float, limit: int) -> list[str]: ...
+
+    def remove_expiry(self, session_id: str) -> None: ...
+
+    def consume_rate_limit(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now: float | None = None,
+    ) -> RateLimitResult: ...
+
 
 @runtime_checkable
 class ArtifactStore(Protocol):
     def put_bytes(self, key: str, content: bytes) -> str: ...
 
     def get_bytes(self, key: str) -> bytes: ...
+
+    def put_file(self, key: str, source: Path) -> str: ...
+
+    def get_file(self, key: str, destination: Path) -> Path: ...
 
     def put_json(self, key: str, payload: JsonObject) -> str: ...
 
@@ -131,6 +164,7 @@ class LocalJsonSessionRepository:
         self.leases_dir.mkdir(parents=True, exist_ok=True)
         with _LOCKS_GUARD:
             self._lock = _ROOT_LOCKS.setdefault(self.root, threading.RLock())
+            self._rate_limits = _ROOT_RATE_LIMITS.setdefault(self.root, {})
 
     def create(
         self,
@@ -330,6 +364,65 @@ class LocalJsonSessionRepository:
             self._write_json(path, current)
             return True
 
+    def register_expiry(
+        self,
+        session_id: str,
+        *,
+        expires_at: float,
+        ttl_seconds: float,
+    ) -> None:
+        validate_identifier(session_id, label="session id")
+        if expires_at <= 0 or ttl_seconds <= 0:
+            raise ValueError("session expiry must be greater than zero")
+
+    def list_expired(self, *, before: float, limit: int) -> list[str]:
+        if limit <= 0:
+            return []
+        expired: list[tuple[float, str]] = []
+        with self._lock:
+            for path in self.sessions_dir.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    expires_at = float(payload.get("data", {}).get("expires_at", 0))
+                    session_id = str(payload["session_id"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if expires_at and expires_at <= before:
+                    expired.append((expires_at, session_id))
+        return [session_id for _, session_id in sorted(expired)[:limit]]
+
+    def remove_expiry(self, session_id: str) -> None:
+        validate_identifier(session_id, label="session id")
+
+    def consume_rate_limit(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now: float | None = None,
+    ) -> RateLimitResult:
+        if limit <= 0 or window_seconds <= 0:
+            raise ValueError("rate limit and window must be greater than zero")
+        current_time = time.time() if now is None else float(now)
+        with self._lock:
+            for expired_key in [
+                item_key
+                for item_key, (_, reset_at) in self._rate_limits.items()
+                if reset_at <= current_time
+            ]:
+                self._rate_limits.pop(expired_key, None)
+            count, reset_at = self._rate_limits.get(
+                key,
+                (0, current_time + window_seconds),
+            )
+            if reset_at <= current_time:
+                count, reset_at = 0, current_time + window_seconds
+            count += 1
+            self._rate_limits[key] = (count, reset_at)
+        retry_after = max(1, int(reset_at - current_time + 0.999))
+        return RateLimitResult(count <= limit, count, retry_after)
+
     def _write_session(self, record: VersionedSession) -> None:
         self._write_json(
             self._path(record.session_id),
@@ -375,6 +468,21 @@ class FileArtifactStore:
     def get_bytes(self, key: str) -> bytes:
         _, path = self._resolve_key(key)
         return path.read_bytes()
+
+    def put_file(self, key: str, source: Path) -> str:
+        normalized_key, path = self._resolve_key(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        shutil.copyfile(source, temporary)
+        temporary.replace(path)
+        return normalized_key
+
+    def get_file(self, key: str, destination: Path) -> Path:
+        _, source = self._resolve_key(key)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        return destination
 
     def put_json(self, key: str, payload: JsonObject) -> str:
         return self.put_bytes(

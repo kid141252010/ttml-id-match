@@ -104,6 +104,12 @@ class TtmlPlannerTests(unittest.TestCase):
         self.assertEqual(plan.metadata.skipped, {"musicName": ["Song"]})
         self.assertFalse(plan.changed)
 
+    def test_malformed_input_is_rejected_even_when_no_change_is_requested(self) -> None:
+        malformed = "<tt><head><metadata></metadata></head><body></tt>"
+
+        with self.assertRaisesRegex(ValueError, "input TTML is not valid XML"):
+            TtmlPlanner().plan(malformed, {})
+
 
 class TtmlWriterTests(unittest.TestCase):
     def test_write_atomically_applies_exact_plan_bytes_and_backs_up_original(self) -> None:

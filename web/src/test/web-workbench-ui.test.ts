@@ -55,7 +55,11 @@ vi.mock('@/api/client', async (importOriginal) => {
     baseline_change_plan: summary,
   };
   const boundary = {
-    createSession: vi.fn(async () => ({ session_id: 'ui-session' })),
+    createSession: vi.fn(async () => ({
+      session_id: 'ui-session',
+      session_token: 'ui-token',
+      expires_at: '2026-07-14T00:00:00Z',
+    })),
     deleteSession: vi.fn(async () => undefined),
     uploadFiles: vi.fn(async () => ({
       pairs: [
@@ -66,12 +70,12 @@ vi.mock('@/api/client', async (importOriginal) => {
     })),
     createPreviewJob: vi.fn(async () => ({
       job_id: 'job-1', status: 'pending', total: 1, completed: 0,
-      results: [], errors: [], snapshot_id: null,
+      results: [], pair_failures: [], errors: [], snapshot_id: null,
     })),
     getPreviewJob: vi.fn(),
     stepPreviewJob: vi.fn(async () => ({
       job_id: 'job-1', status: 'completed', total: 1, completed: 1,
-      results: [preview], errors: [], snapshot_id: 'snapshot-1',
+      results: [preview], pair_failures: [], errors: [], snapshot_id: 'snapshot-1',
     })),
     changePlan: vi.fn(async () => ({
       snapshot_id: 'snapshot-1', pair_id: 'pair-disease', ...summary,
@@ -83,6 +87,8 @@ vi.mock('@/api/client', async (importOriginal) => {
         output_sha256: 'after', backup: 'Disease.ttml.bak', error: null,
       }],
     })),
+    downloadAll: vi.fn(async () => new Blob()),
+    downloadFile: vi.fn(async () => new Blob()),
   };
   return { ...actual, client: boundary, gateway: boundary };
 });
@@ -197,6 +203,25 @@ describe('workbench-oriented web UI', () => {
     expect(wrapper.text()).toContain('Disease.flac');
     expect(wrapper.text()).toContain('disease.mp3');
     expect(wrapper.text()).not.toContain('TTML-only');
+  });
+
+  it('marks pair-level preview failures in the queue', () => {
+    const wrapper = mount(PairList, {
+      props: {
+        pairs: [{
+          id: 'pair-failed',
+          ttml: 'Broken.ttml',
+          audio: null,
+          status: 'ttml_only',
+          audio_candidates: [],
+        }],
+        failedIds: ['pair-failed'],
+      },
+      global: { stubs: { NIcon: true } },
+    });
+
+    expect(wrapper.text()).toContain('预览失败');
+    expect(wrapper.find('.status-preview-failed').exists()).toBe(true);
   });
 
   it('shows upload workbench summary after files are uploaded', async () => {

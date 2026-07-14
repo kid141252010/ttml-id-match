@@ -27,7 +27,7 @@ test('upload, preview, change selection, apply and download exact TTML output', 
   await expect(page.getByTestId('result-file-review')).toContainText('Song.ttml');
 
   const downloadPromise = page.waitForEvent('download');
-  await page.getByRole('link', { name: '单文件下载' }).click();
+  await page.getByRole('button', { name: '单文件下载' }).click();
   const download = await downloadPromise;
   const downloadedPath = await download.path();
   expect(downloadedPath).not.toBeNull();

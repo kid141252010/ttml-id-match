@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { FileAudio, FileText, Link2, TriangleAlert, Unlink } from 'lucide-vue-next';
+import { CircleX, FileAudio, FileText, Link2, TriangleAlert, Unlink } from 'lucide-vue-next';
 import { NEmpty, NIcon, NTag } from 'naive-ui';
 
 import type { FilePair } from '@/api/types';
@@ -10,8 +10,9 @@ const props = withDefaults(
     pairs: FilePair[];
     selectedId?: string | null;
     selectable?: boolean;
+    failedIds?: string[];
   }>(),
-  { selectedId: null, selectable: false },
+  { selectedId: null, selectable: false, failedIds: () => [] },
 );
 
 const emit = defineEmits<{ select: [pairId: string] }>();
@@ -20,7 +21,12 @@ const counts = computed(() => ({
   paired: props.pairs.filter((pair) => pair.status === 'paired').length,
   ttmlOnly: props.pairs.filter((pair) => pair.status === 'ttml_only').length,
   ambiguous: props.pairs.filter((pair) => pair.status === 'ambiguous').length,
+  failed: props.failedIds.length,
 }));
+
+function isPreviewFailed(pairId: string) {
+  return props.failedIds.includes(pairId);
+}
 
 function statusLabel(status: FilePair['status']) {
   if (status === 'paired') return '已配对';
@@ -52,6 +58,7 @@ function audioLabel(pair: FilePair) {
         <NTag size="small" type="success" round>{{ counts.paired }} 已配对</NTag>
         <NTag v-if="counts.ttmlOnly" size="small" type="warning" round>{{ counts.ttmlOnly }} TTML-only</NTag>
         <NTag v-if="counts.ambiguous" size="small" type="error" round>{{ counts.ambiguous }} 音频冲突</NTag>
+        <NTag v-if="counts.failed" size="small" type="error" round>{{ counts.failed }} 预览失败</NTag>
       </div>
     </div>
     <div class="panel-body">
@@ -61,16 +68,16 @@ function audioLabel(pair: FilePair) {
           v-for="pair in pairs"
           :key="pair.id"
           class="pair-row"
-          :class="[{ active: pair.id === selectedId, selectable }, `status-${pair.status}`]"
+          :class="[{ active: pair.id === selectedId, selectable }, isPreviewFailed(pair.id) ? 'status-preview-failed' : `status-${pair.status}`]"
           @click="selectable && emit('select', pair.id)"
         >
           <div class="pair-main">
             <div class="pair-name">{{ pair.ttml }}</div>
-            <NTag :type="statusType(pair.status)" size="small" round strong>
+            <NTag :type="isPreviewFailed(pair.id) ? 'error' : statusType(pair.status)" size="small" round strong>
               <template #icon>
-                <NIcon :component="pair.status === 'paired' ? Link2 : pair.status === 'ambiguous' ? TriangleAlert : Unlink" />
+                <NIcon :component="isPreviewFailed(pair.id) ? CircleX : pair.status === 'paired' ? Link2 : pair.status === 'ambiguous' ? TriangleAlert : Unlink" />
               </template>
-              {{ statusLabel(pair.status) }}
+              {{ isPreviewFailed(pair.id) ? '预览失败' : statusLabel(pair.status) }}
             </NTag>
           </div>
           <div class="pair-paths muted">

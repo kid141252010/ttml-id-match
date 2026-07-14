@@ -355,6 +355,33 @@
         "title": "ChangePlanSummary",
         "type": "object"
       },
+      "CleanupResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "minimum": 0.0,
+            "title": "Deleted",
+            "type": "integer"
+          },
+          "examined": {
+            "minimum": 0.0,
+            "title": "Examined",
+            "type": "integer"
+          },
+          "failed": {
+            "minimum": 0.0,
+            "title": "Failed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "examined",
+          "deleted",
+          "failed"
+        ],
+        "title": "CleanupResponse",
+        "type": "object"
+      },
       "ErrorResponse": {
         "additionalProperties": false,
         "properties": {
@@ -576,6 +603,40 @@
         "title": "PairPreview",
         "type": "object"
       },
+      "PairPreviewFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "audio_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Path"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorResponse"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "ttml_path": {
+            "title": "Ttml Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pair_id",
+          "ttml_path",
+          "error"
+        ],
+        "title": "PairPreviewFailure",
+        "type": "object"
+      },
       "PairingIssue": {
         "additionalProperties": false,
         "properties": {
@@ -694,6 +755,13 @@
             "title": "Job Id",
             "type": "string"
           },
+          "pair_failures": {
+            "items": {
+              "$ref": "#/components/schemas/PairPreviewFailure"
+            },
+            "title": "Pair Failures",
+            "type": "array"
+          },
           "results": {
             "items": {
               "$ref": "#/components/schemas/PairPreview"
@@ -765,13 +833,24 @@
       "SessionResponse": {
         "additionalProperties": false,
         "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
           "session_id": {
             "title": "Session Id",
+            "type": "string"
+          },
+          "session_token": {
+            "title": "Session Token",
             "type": "string"
           }
         },
         "required": [
-          "session_id"
+          "session_id",
+          "session_token",
+          "expires_at"
         ],
         "title": "SessionResponse",
         "type": "object"
@@ -821,6 +900,12 @@
         "title": "SourceResult",
         "type": "object"
       }
+    },
+    "securitySchemes": {
+      "SessionBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
     }
   },
   "info": {
@@ -829,6 +914,34 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v2/maintenance/cleanup": {
+      "get": {
+        "operationId": "cleanup_expired_sessions_api_v2_maintenance_cleanup_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanupResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "summary": "Cleanup Expired Sessions"
+      }
+    },
     "/api/v2/sessions": {
       "post": {
         "operationId": "create_session_api_v2_sessions_post",
@@ -886,6 +999,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Delete Session"
       }
     },
@@ -935,6 +1053,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Apply"
       }
     },
@@ -984,6 +1107,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Change Plan"
       }
     },
@@ -1033,6 +1161,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Upload Files"
       }
     },
@@ -1070,6 +1203,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Download Outputs Zip"
       }
     },
@@ -1116,6 +1254,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Download Output"
       }
     },
@@ -1155,6 +1298,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Create Preview Job"
       }
     },
@@ -1203,6 +1351,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Get Preview Job"
       }
     },
@@ -1251,6 +1404,11 @@
             "description": "Invalid request"
           }
         },
+        "security": [
+          {
+            "SessionBearer": []
+          }
+        ],
         "summary": "Step Preview Job"
       }
     }

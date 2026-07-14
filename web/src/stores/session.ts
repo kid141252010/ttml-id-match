@@ -8,6 +8,7 @@ import type {
   FilePair,
   OperationState,
   PairPreview,
+  PairPreviewFailure,
   PairingIssue,
   PreviewJobResponse,
   ProgressEvent,
@@ -30,11 +31,15 @@ const CHANGE_PLAN_DEBOUNCE_MS = 120;
 
 interface SessionState {
   sessionId: string | null;
+  sessionToken: string | null;
+  expiresAt: string | null;
   files: SessionFile[];
   pairs: FilePair[];
   pairingIssues: PairingIssue[];
   previewResults: PairPreview[];
   previewStaging: PairPreview[];
+  previewFailures: PairPreviewFailure[];
+  previewFailureStaging: PairPreviewFailure[];
   snapshotId: string | null;
   selections: Record<string, SelectionPayload>;
   changePlans: Record<string, ChangePlanResponse>;
@@ -64,6 +69,16 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
         const pairId = state.selectedPairId ?? state.previewResults[0]?.pair_id;
         return pairId ? state.changePlans[pairId] ?? null : null;
       },
+      selectedPreviewFailure(state): PairPreviewFailure | null {
+        if (!state.selectedPairId) return state.previewFailures[0] ?? null;
+        return state.previewFailures.find((failure) => failure.pair_id === state.selectedPairId) ?? null;
+      },
+      failedPairIds(state): string[] {
+        return state.previewFailures.map((failure) => failure.pair_id);
+      },
+      hasPreviewOutcomes(state): boolean {
+        return state.previewResults.length + state.previewFailures.length > 0;
+      },
       selectionCount(state): number {
         return countSelections({ selections: state.selections });
       },
@@ -71,7 +86,7 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
         return state.pairs.length > 0 && state.pairingIssues.length === 0;
       },
       canApply(state): boolean {
-        if (!state.snapshotId || state.previewResults.length === 0 || state.operation !== 'idle') return false;
+        if (!state.snapshotId || state.previewResults.length === 0 || state.previewFailures.length > 0 || state.operation !== 'idle') return false;
         if (Object.values(state.changePlanPending).some(Boolean)) return false;
         return state.previewResults.every((preview) => (
           Boolean(state.selections[preview.pair_id]) && Boolean(state.changePlans[preview.pair_id])
@@ -84,9 +99,11 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
 
     actions: {
       async ensureSession(): Promise<void> {
-        if (this.sessionId) return;
+        if (this.sessionId && this.sessionToken) return;
         const response = await gateway.createSession();
         this.sessionId = response.session_id;
+        this.sessionToken = response.session_token;
+        this.expiresAt = response.expires_at;
         this.addProgress('info', `Session created ${response.session_id}`);
       },
 
@@ -94,7 +111,7 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
         this.operation = 'uploading';
         try {
           await this.ensureSession();
-          const response = await gateway.uploadFiles(this.sessionId!, files);
+          const response = await gateway.uploadFiles(this.sessionId!, this.sessionToken!, files);
           this.cancelChangePlanRequests();
           this.files = files.map(toSessionFile);
           this.pairs = response.pairs.map((pair) => ({
@@ -107,6 +124,8 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
           this.pairingIssues = response.issues;
           this.previewResults = [];
           this.previewStaging = [];
+          this.previewFailures = [];
+          this.previewFailureStaging = [];
           this.snapshotId = null;
           this.selections = {};
           this.changePlans = {};
@@ -127,20 +146,26 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
         this.operation = 'previewing';
         this.previewStaging = [];
         try {
-          let job = await gateway.createPreviewJob(this.sessionId!);
+          let job = await gateway.createPreviewJob(this.sessionId!, this.sessionToken!);
           this.stagePreviewJob(job);
           while (job.status === 'pending' || job.status === 'running') {
-            job = await gateway.stepPreviewJob(this.sessionId!, job.job_id);
+            job = await gateway.stepPreviewJob(this.sessionId!, this.sessionToken!, job.job_id);
             this.stagePreviewJob(job);
           }
           if (job.status === 'failed') throw new Error(previewJobError(job));
           if (!job.snapshot_id) throw new Error('Completed preview job did not publish a snapshot');
 
           this.commitPreviewJob(job);
-          const suffix = job.status === 'completed_with_errors' ? ' with source errors' : '';
-          this.addProgress('success', `Preview completed ${job.completed}/${job.total}${suffix}`);
+          const pairFailures = job.pair_failures ?? [];
+          if (pairFailures.length > 0) {
+            this.addProgress('warning', `Preview completed with ${pairFailures.length} failed pair(s)`);
+          } else {
+            const suffix = job.status === 'completed_with_errors' ? ' with source errors' : '';
+            this.addProgress('success', `Preview completed ${job.completed}/${job.total}${suffix}`);
+          }
         } catch (error) {
           this.previewStaging = [];
+          this.previewFailureStaging = [];
           this.addProgress('error', errorMessage(error));
           throw error;
         } finally {
@@ -190,7 +215,12 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
 
         this.operation = 'applying';
         try {
-          this.resultSummary = await gateway.apply(this.sessionId!, this.snapshotId, payload);
+          this.resultSummary = await gateway.apply(
+            this.sessionId!,
+            this.sessionToken!,
+            this.snapshotId,
+            payload,
+          );
           this.addProgress('success', 'Apply completed');
         } catch (error) {
           this.invalidateSnapshot(error);
@@ -203,7 +233,7 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
 
       async resetSession(): Promise<void> {
         const sessionId = this.sessionId;
-        if (sessionId) await gateway.deleteSession(sessionId);
+        if (sessionId) await gateway.deleteSession(sessionId, this.sessionToken ?? '');
         this.cancelChangePlanRequests();
         Object.assign(this, initialState());
       },
@@ -224,6 +254,7 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
 
       stagePreviewJob(job: PreviewJobResponse): void {
         this.previewStaging = [...job.results];
+        this.previewFailureStaging = [...(job.pair_failures ?? [])];
         if (job.completed > 0 && (job.status === 'pending' || job.status === 'running')) {
           this.addProgress('info', `Preview progress ${job.completed}/${job.total}`);
         }
@@ -234,6 +265,8 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
         this.cancelChangePlanRequests();
         this.previewResults = [...job.results];
         this.previewStaging = [];
+        this.previewFailures = [...(job.pair_failures ?? [])];
+        this.previewFailureStaging = [];
         this.snapshotId = snapshotId;
         this.selections = createReviewDraft(job.results).selections;
         this.baselineChangePlans = Object.fromEntries(job.results.map((preview) => [
@@ -245,8 +278,21 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
           },
         ]));
         this.changePlans = clonePlanMap(this.baselineChangePlans);
-        this.selectedPairId = job.results[0]?.pair_id ?? null;
+        this.selectedPairId = this.pairs.find((pair) => (
+          job.results.some((result) => result.pair_id === pair.id)
+          || (job.pair_failures ?? []).some((failure) => failure.pair_id === pair.id)
+        ))?.id ?? null;
         this.resultSummary = null;
+      },
+
+      async downloadAllOutputs(): Promise<Blob> {
+        if (!this.sessionId || !this.sessionToken) throw new Error('Session credentials are required');
+        return gateway.downloadAll(this.sessionId, this.sessionToken);
+      },
+
+      async downloadOutput(filename: string): Promise<Blob> {
+        if (!this.sessionId || !this.sessionToken) throw new Error('Session credentials are required');
+        return gateway.downloadFile(this.sessionId, this.sessionToken, filename);
       },
 
       queueChangePlan(pairId: string): void {
@@ -268,7 +314,12 @@ export function createSessionStore(gateway: IdMatchGateway, storeId = 'session')
         if (!sessionId || !snapshotId || !selection || this.changePlanRevisions[pairId] !== revision) return;
 
         try {
-          const response = await gateway.changePlan(sessionId, snapshotId, cloneSelection(selection));
+          const response = await gateway.changePlan(
+            sessionId,
+            this.sessionToken!,
+            snapshotId,
+            cloneSelection(selection),
+          );
           if (
             this.sessionId === sessionId
             && this.snapshotId === snapshotId
@@ -312,11 +363,15 @@ export const useSessionStore = createSessionStore(defaultGateway);
 function initialState(): SessionState {
   return {
     sessionId: null,
+    sessionToken: null,
+    expiresAt: null,
     files: [],
     pairs: [],
     pairingIssues: [],
     previewResults: [],
     previewStaging: [],
+    previewFailures: [],
+    previewFailureStaging: [],
     snapshotId: null,
     selections: {},
     changePlans: {},
@@ -337,7 +392,7 @@ function toSessionFile(file: File): SessionFile {
 }
 
 function previewJobError(job: PreviewJobResponse): string {
-  return job.errors[0]?.message ?? 'Preview failed';
+  return job.pair_failures?.[0]?.error.message ?? job.errors[0]?.message ?? 'Preview failed';
 }
 
 function errorMessage(error: unknown): string {

@@ -34,6 +34,20 @@ class RuntimeSettings:
     redis_token: str | None
     blob_token: str | None
     cors_origins: tuple[str, ...]
+    session_ttl_seconds: int = 86_400
+    gc_grace_seconds: int = 86_400
+    max_files: int = 40
+    max_pairs: int = 20
+    max_file_bytes: int = 64 * 1024 * 1024
+    max_session_bytes: int = 256 * 1024 * 1024
+    max_preview_jobs: int = 5
+    max_applies: int = 5
+    request_limit: int = 240
+    request_window_seconds: int = 60
+    session_create_limit: int = 10
+    session_create_window_seconds: int = 3600
+    trust_proxy_headers: bool = False
+    cleanup_token: str | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "RuntimeSettings":
@@ -84,6 +98,47 @@ class RuntimeSettings:
             redis_token=values.get("KV_REST_API_TOKEN") or values.get("UPSTASH_REDIS_REST_TOKEN"),
             blob_token=values.get("BLOB_READ_WRITE_TOKEN"),
             cors_origins=cors,
+            session_ttl_seconds=load_positive_int_config(
+                "ID_MATCH_SESSION_TTL_SECONDS", default=86_400, environ=dict(values)
+            ),
+            gc_grace_seconds=load_positive_int_config(
+                "ID_MATCH_GC_GRACE_SECONDS", default=86_400, environ=dict(values)
+            ),
+            max_files=load_positive_int_config(
+                "ID_MATCH_MAX_FILES", default=40, environ=dict(values)
+            ),
+            max_pairs=load_positive_int_config(
+                "ID_MATCH_MAX_PAIRS", default=20, environ=dict(values)
+            ),
+            max_file_bytes=load_positive_int_config(
+                "ID_MATCH_MAX_FILE_BYTES", default=64 * 1024 * 1024, environ=dict(values)
+            ),
+            max_session_bytes=load_positive_int_config(
+                "ID_MATCH_MAX_SESSION_BYTES", default=256 * 1024 * 1024, environ=dict(values)
+            ),
+            max_preview_jobs=load_positive_int_config(
+                "ID_MATCH_MAX_PREVIEW_JOBS", default=5, environ=dict(values)
+            ),
+            max_applies=load_positive_int_config(
+                "ID_MATCH_MAX_APPLIES", default=5, environ=dict(values)
+            ),
+            request_limit=load_positive_int_config(
+                "ID_MATCH_RATE_LIMIT_REQUESTS", default=240, environ=dict(values)
+            ),
+            request_window_seconds=load_positive_int_config(
+                "ID_MATCH_RATE_LIMIT_WINDOW_SECONDS", default=60, environ=dict(values)
+            ),
+            session_create_limit=load_positive_int_config(
+                "ID_MATCH_SESSION_CREATE_LIMIT", default=10, environ=dict(values)
+            ),
+            session_create_window_seconds=load_positive_int_config(
+                "ID_MATCH_SESSION_CREATE_WINDOW_SECONDS", default=3600, environ=dict(values)
+            ),
+            trust_proxy_headers=_load_bool(
+                values.get("ID_MATCH_TRUST_PROXY_HEADERS"),
+                default=bool(values.get("VERCEL")),
+            ),
+            cleanup_token=values.get("CRON_SECRET") or None,
         )
 
 
@@ -103,6 +158,7 @@ def build_v2_workflow(
                 ("BLOB_READ_WRITE_TOKEN", settings.blob_token),
                 ("KV_REST_API_URL", settings.redis_url),
                 ("KV_REST_API_TOKEN", settings.redis_token),
+                ("CRON_SECRET", settings.cleanup_token),
             )
             if not value
         ]
@@ -129,4 +185,23 @@ def build_v2_workflow(
         artifacts,
         MatchingApplication(engine),
         work_root=settings.work_root,
+        session_ttl_seconds=settings.session_ttl_seconds,
+        gc_grace_seconds=settings.gc_grace_seconds,
+        max_files=settings.max_files,
+        max_pairs=settings.max_pairs,
+        max_file_bytes=settings.max_file_bytes,
+        max_session_bytes=settings.max_session_bytes,
+        max_preview_jobs=settings.max_preview_jobs,
+        max_applies=settings.max_applies,
     )
+
+
+def _load_bool(value: str | None, *, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("boolean environment variable must be true or false")

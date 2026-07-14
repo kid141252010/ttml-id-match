@@ -15,6 +15,7 @@ from server.v2.storage import (
     InvalidArtifactKeyError,
     JsonObject,
     LeaseConflictError,
+    RateLimitResult,
     VersionConflictError,
     VersionedSession,
     validate_identifier,
@@ -80,12 +81,38 @@ class RedisJsonClient(Protocol):
         ttl_seconds: float,
     ) -> bool: ...
 
+    def expire(self, key: str, *, ttl_seconds: float) -> bool: ...
+
+    def sorted_set_add(self, key: str, member: str, score: float) -> None: ...
+
+    def sorted_set_range_by_score(
+        self,
+        key: str,
+        *,
+        maximum: float,
+        limit: int,
+    ) -> list[str]: ...
+
+    def sorted_set_remove(self, key: str, member: str) -> None: ...
+
+    def consume_fixed_window(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> RateLimitResult: ...
+
 
 @runtime_checkable
 class VercelBlobClient(Protocol):
     def put_bytes(self, pathname: str, content: bytes) -> None: ...
 
     def get_bytes(self, pathname: str) -> bytes: ...
+
+    def put_file(self, pathname: str, source: Path) -> None: ...
+
+    def get_file(self, pathname: str, destination: Path) -> Path: ...
 
     def delete(self, pathname: str) -> bool: ...
 
@@ -100,6 +127,7 @@ class SdkVercelBlobClient:
         token: str,
         *,
         upload_file: Callable[..., Any] | None = None,
+        download_file: Callable[..., Any] | None = None,
         get_blob: Callable[..., Any] | None = None,
         delete_blob: Callable[..., Any] | None = None,
         list_blobs: Callable[..., Any] | None = None,
@@ -117,6 +145,7 @@ class SdkVercelBlobClient:
                     "Vercel Blob SDK is required for the Vercel storage backend"
                 ) from exc
             upload_file = upload_file or getattr(sdk_blob, "upload_file", None)
+            download_file = download_file or getattr(sdk_blob, "download_file", None)
             get_blob = get_blob or getattr(sdk_blob, "get", None)
             delete_blob = delete_blob or getattr(sdk_blob, "delete", None)
             list_blobs = list_blobs or (
@@ -131,6 +160,7 @@ class SdkVercelBlobClient:
             raise RuntimeError("installed Vercel Blob SDK lacks required operations")
         self.token = token
         self._upload_file = upload_file
+        self._download_file = download_file
         self._get_blob = get_blob
         self._delete_blob = delete_blob
         self._list_blobs = list_blobs
@@ -164,6 +194,31 @@ class SdkVercelBlobClient:
         elif hasattr(result, "content"):
             result = result.content
         return bytes(result)
+
+    def put_file(self, pathname: str, source: Path) -> None:
+        self._upload_file(
+            str(source),
+            pathname,
+            token=self.token,
+            access="private",
+            overwrite=True,
+        )
+
+    def get_file(self, pathname: str, destination: Path) -> Path:
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if self._download_file is None:
+            destination.write_bytes(self.get_bytes(pathname))
+            return destination
+        self._download_file(
+            pathname,
+            str(destination),
+            token=self.token,
+            access="private",
+            overwrite=True,
+            create_parents=True,
+        )
+        return destination
 
     def delete(self, pathname: str) -> bool:
         result = self._delete_blob(pathname, token=self.token)
@@ -202,7 +257,9 @@ local current = redis.call('GET', KEYS[1])
 if not current then return -1 end
 local document = cjson.decode(current)
 if tonumber(document['version']) ~= tonumber(ARGV[1]) then return 0 end
+local ttl = redis.call('PTTL', KEYS[1])
 redis.call('SET', KEYS[1], ARGV[2])
+if ttl >= 0 then redis.call('PEXPIRE', KEYS[1], math.max(ttl, 1)) end
 return 1
 """.strip()
 
@@ -213,7 +270,9 @@ local document = cjson.decode(current)
 if tonumber(document['version']) ~= tonumber(ARGV[1]) then return 0 end
 local lease_owner = redis.call('GET', KEYS[2])
 if lease_owner ~= ARGV[2] then return -2 end
+local ttl = redis.call('PTTL', KEYS[1])
 redis.call('SET', KEYS[1], ARGV[3])
+if ttl >= 0 then redis.call('PEXPIRE', KEYS[1], math.max(ttl, 1)) end
 return 1
 """.strip()
 
@@ -236,6 +295,13 @@ _COMPARE_EXPIRE_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if current ~= ARGV[1] then return 0 end
 return redis.call('EXPIRE', KEYS[1], ARGV[2])
+""".strip()
+
+_FIXED_WINDOW_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+local ttl = redis.call('TTL', KEYS[1])
+return {count, ttl}
 """.strip()
 
 
@@ -384,6 +450,49 @@ class UpstashRestRedisClient:
             math.ceil(ttl_seconds),
         )
         return int(result or 0) > 0
+
+    def expire(self, key: str, *, ttl_seconds: float) -> bool:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be greater than zero")
+        return int(self._command("EXPIRE", key, math.ceil(ttl_seconds)) or 0) > 0
+
+    def sorted_set_add(self, key: str, member: str, score: float) -> None:
+        self._command("ZADD", key, score, member)
+
+    def sorted_set_range_by_score(
+        self,
+        key: str,
+        *,
+        maximum: float,
+        limit: int,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+        result = self._command("ZRANGEBYSCORE", key, "-inf", maximum, "LIMIT", 0, limit)
+        return [str(value) for value in (result or [])]
+
+    def sorted_set_remove(self, key: str, member: str) -> None:
+        self._command("ZREM", key, member)
+
+    def consume_fixed_window(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> RateLimitResult:
+        if limit <= 0 or window_seconds <= 0:
+            raise ValueError("rate limit and window must be greater than zero")
+        result = self._command(
+            "EVAL",
+            _FIXED_WINDOW_SCRIPT,
+            1,
+            key,
+            window_seconds,
+        )
+        count, ttl = (list(result) + [window_seconds, window_seconds])[:2]
+        retry_after = max(1, int(ttl or window_seconds))
+        return RateLimitResult(int(count) <= limit, int(count), retry_after)
 
     def _command(self, *parts: Any) -> Any:
         body = json.dumps(
@@ -585,11 +694,55 @@ class RedisSessionRepository:
             ttl_seconds=ttl_seconds,
         )
 
+    def register_expiry(
+        self,
+        session_id: str,
+        *,
+        expires_at: float,
+        ttl_seconds: float,
+    ) -> None:
+        validate_identifier(session_id, label="session id")
+        if not self.client.expire(
+            self._session_key(session_id),
+            ttl_seconds=ttl_seconds,
+        ):
+            raise KeyError(f"session not found: {session_id}")
+        self.client.sorted_set_add(self._expiry_key(), session_id, expires_at)
+
+    def list_expired(self, *, before: float, limit: int) -> list[str]:
+        return self.client.sorted_set_range_by_score(
+            self._expiry_key(),
+            maximum=before,
+            limit=limit,
+        )
+
+    def remove_expiry(self, session_id: str) -> None:
+        validate_identifier(session_id, label="session id")
+        self.client.sorted_set_remove(self._expiry_key(), session_id)
+
+    def consume_rate_limit(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now: float | None = None,
+    ) -> RateLimitResult:
+        del now
+        return self.client.consume_fixed_window(
+            f"{self.namespace}:rate:{key}",
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+
     def _session_key(self, session_id: str) -> str:
         return f"{self.namespace}:sessions:{session_id}"
 
     def _lease_key(self, session_id: str, job_id: str) -> str:
         return f"{self._session_key(session_id)}:jobs:{job_id}:lease"
+
+    def _expiry_key(self) -> str:
+        return f"{self.namespace}:session-expirations"
 
     @staticmethod
     def _serialize(record: VersionedSession) -> JsonObject:
@@ -634,6 +787,15 @@ class VercelBlobArtifactStore:
     def get_bytes(self, key: str) -> bytes:
         normalized = _normalize_artifact_key(key, allow_session_root=False)
         return bytes(self.client.get_bytes(self._pathname(normalized)))
+
+    def put_file(self, key: str, source: Path) -> str:
+        normalized = _normalize_artifact_key(key, allow_session_root=False)
+        self.client.put_file(self._pathname(normalized), Path(source))
+        return normalized
+
+    def get_file(self, key: str, destination: Path) -> Path:
+        normalized = _normalize_artifact_key(key, allow_session_root=False)
+        return self.client.get_file(self._pathname(normalized), Path(destination))
 
     def put_json(self, key: str, payload: JsonObject) -> str:
         return self.put_bytes(

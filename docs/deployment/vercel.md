@@ -22,6 +22,7 @@
    - `KV_REST_API_URL` 与 `KV_REST_API_TOKEN`
    - `UPSTASH_REDIS_REST_URL` 与 `UPSTASH_REDIS_REST_TOKEN`
 4. **音乐平台凭据（可选）**：用于 Apple Music 和 Spotify 的高级检索接口认证。
+5. **Cron Secret**：生成一个高熵随机字符串并保存为 `CRON_SECRET`，用于鉴权每小时会话清理任务。
 
 ---
 
@@ -36,9 +37,17 @@
 | `ID_MATCH_STORAGE_BACKEND` | 存储后端类型，必须显式设置为 `vercel`。 | 手动填入 `vercel` |
 | `BLOB_READ_WRITE_TOKEN` | 读写 Vercel Blob 的鉴权 Token。 | 创建 Blob 后 Vercel 会自动注入，或从 Blob 连接详情中手动复制。 |
 | `KV_REST_API_URL` <br> `KV_REST_API_TOKEN` | 用于存储会话索引的 Redis REST 接口与 Token。 | 创建 KV (Redis) 后由 Vercel 自动注入，或从资源连接面板中复制。 |
+| `CRON_SECRET` | 每小时清理过期 Redis 会话和 Blob 对象的 Bearer 密钥。 | 使用密码生成器创建至少 32 字节随机值。 |
 
 > [!NOTE]
 > 如果您使用的是 Upstash 自建 Redis，可以用 `UPSTASH_REDIS_REST_URL` 和 `UPSTASH_REDIS_REST_TOKEN` 代替 `KV_REST_API_*` 变量。
+
+### 会话与资源限制（可选）
+
+默认会话固定保留 24 小时，并由 `vercel.json` 中的 Cron 每小时清理。可通过 `ID_MATCH_SESSION_TTL_SECONDS`、`ID_MATCH_GC_GRACE_SECONDS`、`ID_MATCH_MAX_FILES`、`ID_MATCH_MAX_PAIRS`、`ID_MATCH_MAX_FILE_BYTES`、`ID_MATCH_MAX_SESSION_BYTES`、`ID_MATCH_MAX_PREVIEW_JOBS` 和 `ID_MATCH_MAX_APPLIES` 调整。限流默认每 IP 每分钟 240 次请求、每小时 10 个新会话。
+
+> [!IMPORTANT]
+> 后端会分块暂存 multipart 文件并限制应用层内存，但 Vercel Function 仍会在代码执行前应用平台自身的请求体上限。生产环境的有效上传上限取应用配置与当前 Vercel 套餐限制中的较小值；超大音频需要后续采用浏览器直传 Blob 协议。
 
 ### 音乐平台与代理配置 (可选)
 
@@ -57,7 +66,7 @@
 
 点击下方按钮，即可自动克隆本仓库并在 Vercel 中引导创建项目，创建时需按照提示输入上述核心环境变量。
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,APPLE_MUSIC_BEARER_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20REST%20credentials.%20Apple%20Music%20and%20Spotify%20credentials%20are%20optional.)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/kid141252010/ttml-id-match&env=ID_MATCH_STORAGE_BACKEND,BLOB_READ_WRITE_TOKEN,KV_REST_API_URL,KV_REST_API_TOKEN,CRON_SECRET,APPLE_MUSIC_BEARER_TOKEN,SPOTIFY_CLIENT_ID,SPOTIFY_CLIENT_SECRET&envDescription=Set%20ID_MATCH_STORAGE_BACKEND%3Dvercel%20and%20configure%20Vercel%20Blob%20plus%20Redis%2FKV%20and%20CRON_SECRET.)
 
 ---
 
@@ -103,8 +112,9 @@
    ```
    若返回以下结构，说明后端 Serverless 函数和会话存储运行正常：
    ```json
-   {"session_id":"<32-character-id>"}
+   {"session_id":"<32-character-id>","session_token":"<one-time-bearer-token>","expires_at":"<UTC timestamp>"}
    ```
+   保存该响应中的 `session_token`，后续命令行请求需要增加 `Authorization: Bearer <session_token>`。网页端会自动在内存中管理令牌，下载请求也不会把令牌放进 URL。
 
 2. **验证文件上传与匹配**：
    打开您的 Vercel 站点域名，在界面中上传一个只包含基本元数据的简单 `.ttml` 文件（例如必须声明 `musicName`）。
@@ -118,6 +128,10 @@
 ## 6. 常见部署问题
 
 - **报错 `session not found`**：
-  请务必检查环境变量中 `ID_MATCH_STORAGE_BACKEND` 是否已正确填入为 `vercel`。若忘记配置或误设为 `local`，会话数据仅能保存在临时且极易随冷启动而销毁的 Serverless 节点本地目录中。
+  请检查会话是否已超过固定 TTL，并确认环境变量中 `ID_MATCH_STORAGE_BACKEND` 已正确填入 `vercel`。若误设为 `local`，会话数据仅能保存在临时且极易随冷启动而销毁的 Serverless 节点本地目录中。
+- **报错 `unauthorized`**：
+  确认请求携带了创建会话时返回的 Bearer Token，且 Token 属于 URL 中的同一个 session。刷新网页后旧 Token 不会从持久化存储恢复。
+- **Cron 返回 401**：
+  确认 Vercel 项目配置了 `CRON_SECRET`，并重新部署以使 Cron 请求自动携带对应 Authorization Header。
 - **构建过程中报错**：
   请检查 Vercel Build Logs 中的依赖安装日志。本仓库完全依赖 `requirements.txt` 和 `web/package-lock.json`。如遇构建超时或版本冲突，请先在本地终端运行单元测试与构建测试以排查原因。

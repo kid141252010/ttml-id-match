@@ -4,6 +4,12 @@ export type SourceKey = string;
 
 export type PairStatus = 'paired' | 'ttml_only' | 'ambiguous';
 
+export interface SessionCredentials {
+  session_id: string;
+  session_token: string;
+  expires_at: string;
+}
+
 export interface SessionFile {
   name: string;
   size: number;
@@ -128,6 +134,13 @@ export interface PairPreview {
   baseline_change_plan: ChangePlanSummary;
 }
 
+export interface PairPreviewFailure {
+  pair_id: string;
+  ttml_path: string;
+  audio_path: string | null;
+  error: ApiErrorPayload;
+}
+
 export type PreviewResult = PairPreview;
 
 export type PreviewJobStatus =
@@ -150,6 +163,7 @@ export interface PreviewJobResponse {
   total: number;
   completed: number;
   results: PairPreview[];
+  pair_failures: PairPreviewFailure[];
   errors: ApiErrorPayload[];
   snapshot_id: string | null;
 }

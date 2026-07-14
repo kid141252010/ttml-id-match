@@ -16,6 +16,7 @@ const router = useRouter();
 const activeSource = ref<SourceKey | null>(null);
 
 const preview = computed(() => store.selectedPreview);
+const previewFailure = computed(() => store.selectedPreviewFailure);
 const sourceOptions = computed(() => orderedSourceDescriptors(
   Object.keys(preview.value?.sources ?? {}),
 ));
@@ -40,7 +41,7 @@ async function apply() {
 </script>
 
 <template>
-  <NEmpty v-if="store.previewResults.length === 0" description="还没有预览结果">
+  <NEmpty v-if="!store.hasPreviewOutcomes" description="还没有预览结果">
     <template #extra>
       <NButton @click="router.push('/upload')">返回上传</NButton>
     </template>
@@ -48,7 +49,13 @@ async function apply() {
 
   <div v-else class="workbench-grid preview-workbench">
     <div class="workbench-queue">
-      <PairList :pairs="store.pairs" :selected-id="store.selectedPairId" selectable @select="store.selectPair" />
+      <PairList
+        :pairs="store.pairs"
+        :selected-id="store.selectedPairId"
+        :failed-ids="store.failedPairIds"
+        selectable
+        @select="store.selectPair"
+      />
     </div>
 
     <div class="workbench-primary stack">
@@ -61,7 +68,16 @@ async function apply() {
           <NTag size="small" round>已选 {{ store.selectionCount }}</NTag>
         </div>
         <div class="panel-body">
-          <div class="source-tabs" data-testid="source-switcher">
+          <NAlert
+            v-if="previewFailure"
+            type="error"
+            title="此文件预览失败"
+            class="source-warning"
+          >
+            {{ previewFailure.error.message }}
+          </NAlert>
+
+          <div v-if="!previewFailure" class="source-tabs" data-testid="source-switcher">
             <button
               v-for="source in sourceOptions"
               :key="source.key"
@@ -78,6 +94,7 @@ async function apply() {
           </div>
 
           <NAlert
+            v-if="!previewFailure"
             v-for="warning in sourcePreview?.warnings ?? []"
             :key="warning"
             type="warning"
@@ -85,7 +102,7 @@ async function apply() {
             class="source-warning"
           />
 
-          <div v-if="sourcePreview?.candidates.length" class="candidate-grid">
+          <div v-if="!previewFailure && sourcePreview?.candidates.length" class="candidate-grid">
             <CandidateCard
               v-for="candidate in sourcePreview.candidates"
               :key="candidate.id"
@@ -94,10 +111,10 @@ async function apply() {
               @toggle="preview && activeSource && store.toggleCandidate(preview.pair_id, activeSource, $event)"
             />
           </div>
-          <NEmpty v-else description="当前来源无候选" />
+          <NEmpty v-else-if="!previewFailure" description="当前来源无候选" />
 
           <div class="action-row">
-            <NButton secondary @click="store.acceptBestForAll">
+            <NButton secondary :disabled="Boolean(previewFailure)" @click="store.acceptBestForAll">
               <template #icon><NIcon :component="CheckCheck" /></template>
               全部接受推荐
             </NButton>

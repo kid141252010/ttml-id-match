@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -128,8 +129,23 @@ class ErrorResponse(WireModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class PairPreviewFailure(WireModel):
+    pair_id: str
+    ttml_path: str
+    audio_path: str | None = None
+    error: ErrorResponse
+
+
 class SessionResponse(WireModel):
     session_id: str
+    session_token: str
+    expires_at: datetime
+
+
+class CleanupResponse(WireModel):
+    examined: int = Field(ge=0)
+    deleted: int = Field(ge=0)
+    failed: int = Field(ge=0)
 
 
 class PreviewJob(WireModel):
@@ -138,6 +154,7 @@ class PreviewJob(WireModel):
     total: int = Field(ge=0)
     completed: int = Field(ge=0)
     results: list[PairPreview] = Field(default_factory=list)
+    pair_failures: list[PairPreviewFailure] = Field(default_factory=list)
     errors: list[ErrorResponse] = Field(default_factory=list)
     snapshot_id: str | None = None
 

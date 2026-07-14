@@ -15,7 +15,9 @@ from server.v2.workflow import (
     InvalidSelectionError,
     JobBusyError,
     PairingConflictError,
+    PreviewIncompleteError,
     SessionNotFoundError,
+    SessionQuotaExceededError,
     SessionWorkflow,
     SnapshotConflictError,
     UploadData,
@@ -57,6 +59,130 @@ class PreviewQQClient:
 
 
 class SessionWorkflowTests(unittest.TestCase):
+    def test_failed_pair_is_published_and_blocks_the_entire_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = FileArtifactStore(root / "artifacts")
+            workflow = SessionWorkflow(
+                LocalJsonSessionRepository(root / "state"),
+                artifacts,
+                MatchingApplication(MatchingEngine([])),
+                work_root=root / "work",
+            )
+            session_id = workflow.create_session()
+            workflow.upload_files(
+                session_id,
+                [UploadData("Broken.ttml", b"<tt><head></head><body></tt>")],
+            )
+            job = workflow.create_preview_job(session_id)
+
+            completed = workflow.step_preview_job(
+                session_id,
+                job["job_id"],
+                owner="worker",
+            )
+
+            self.assertEqual(completed["status"], "completed_with_errors")
+            self.assertEqual(completed["completed"], 1)
+            self.assertEqual(completed["results"], [])
+            self.assertEqual(completed["pair_failures"][0]["ttml_path"], "Broken.ttml")
+            self.assertEqual(
+                completed["pair_failures"][0]["error"]["code"],
+                "pair_preview_failed",
+            )
+            snapshot = artifacts.get_json(
+                f"sessions/{session_id}/snapshots/{completed['snapshot_id']}.json"
+            )
+            self.assertEqual(snapshot["version"], 2)
+            self.assertEqual(len(snapshot["pair_failures"]), 1)
+            with self.assertRaises(PreviewIncompleteError):
+                workflow.apply(session_id, completed["snapshot_id"], [])
+
+    def test_source_warning_does_not_block_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = SessionWorkflow(
+                LocalJsonSessionRepository(root / "state"),
+                FileArtifactStore(root / "artifacts"),
+                MatchingApplication(
+                    MatchingEngine([QQMusicSourceAdapter(PreviewQQClient(fail=True))])
+                ),
+                work_root=root / "work",
+            )
+            session_id = workflow.create_session()
+            workflow.upload_files(session_id, [UploadData("Song.ttml", TTML.encode())])
+            job = workflow.create_preview_job(session_id)
+
+            completed = workflow.step_preview_job(
+                session_id,
+                job["job_id"],
+                owner="worker",
+            )
+
+            self.assertEqual(completed["status"], "completed_with_errors")
+            self.assertEqual(completed["pair_failures"], [])
+            self.assertEqual(completed["errors"][0]["code"], "source_warning")
+            selection = _selection_from_preview(completed["results"][0])
+            applied = workflow.apply(
+                session_id,
+                completed["snapshot_id"],
+                [selection],
+            )
+            self.assertEqual(applied["failed"], 0)
+
+    def test_repeated_upload_replaces_the_previous_batch_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = LocalJsonSessionRepository(root / "state")
+            artifacts = FileArtifactStore(root / "artifacts")
+            workflow = SessionWorkflow(
+                repository,
+                artifacts,
+                MatchingApplication(MatchingEngine([])),
+                work_root=root / "work",
+            )
+            session_id = workflow.create_session()
+            workflow.upload_files(session_id, [UploadData("First.ttml", TTML.encode())])
+            first_record = dict(repository.load(session_id).data["uploads"][0])
+
+            pairing = workflow.upload_files(
+                session_id,
+                [UploadData("Second.ttml", TTML.encode())],
+            )
+
+            current = repository.load(session_id).data
+            self.assertEqual([item["filename"] for item in current["uploads"]], ["Second.ttml"])
+            self.assertEqual([item["ttml_path"] for item in pairing["pairs"]], ["Second.ttml"])
+            with self.assertRaises(FileNotFoundError):
+                artifacts.get_bytes(first_record["artifact_key"])
+
+    def test_preview_and_apply_attempts_are_bounded_per_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = SessionWorkflow(
+                LocalJsonSessionRepository(root / "state"),
+                FileArtifactStore(root / "artifacts"),
+                MatchingApplication(MatchingEngine([])),
+                work_root=root / "work",
+                max_preview_jobs=1,
+                max_applies=1,
+            )
+            session_id = workflow.create_session()
+            workflow.upload_files(session_id, [UploadData("Song.ttml", TTML.encode())])
+            job = workflow.create_preview_job(session_id)
+            completed = workflow.step_preview_job(
+                session_id,
+                job["job_id"],
+                owner="worker",
+            )
+            selection = _selection_from_preview(completed["results"][0])
+            workflow.apply(session_id, completed["snapshot_id"], [selection])
+
+            with self.assertRaises(SessionQuotaExceededError):
+                workflow.create_preview_job(session_id)
+            with self.assertRaises(SessionQuotaExceededError):
+                workflow.apply(session_id, completed["snapshot_id"], [selection])
+
     def test_upload_cas_conflict_cannot_overwrite_the_committed_artifact(self):
         class CoordinatedRepository(LocalJsonSessionRepository):
             def __init__(self, root):
@@ -196,6 +322,42 @@ class SessionWorkflowTests(unittest.TestCase):
 
             self.assertTrue(workflow.delete_session(session_id))
             self.assertFalse(workflow.delete_session(session_id))
+
+    def test_expired_session_gc_retries_after_artifact_cleanup_failure(self):
+        class FailingOnceArtifactStore(FileArtifactStore):
+            def __init__(self, root):
+                super().__init__(root)
+                self.fail_once = True
+
+            def delete_prefix(self, prefix):
+                if self.fail_once:
+                    self.fail_once = False
+                    raise OSError("temporary blob cleanup failure")
+                return super().delete_prefix(prefix)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = [100.0]
+            repository = LocalJsonSessionRepository(root / "state")
+            workflow = SessionWorkflow(
+                repository,
+                FailingOnceArtifactStore(root / "artifacts"),
+                MatchingApplication(MatchingEngine([])),
+                work_root=root / "work",
+                session_ttl_seconds=10,
+                gc_grace_seconds=10,
+                clock=lambda: now[0],
+            )
+            session_id = workflow.create_session()
+            workflow.upload_files(session_id, [UploadData("Song.ttml", TTML.encode())])
+            now[0] = 111.0
+
+            first = workflow.cleanup_expired_sessions()
+            second = workflow.cleanup_expired_sessions()
+
+            self.assertEqual(first, {"examined": 1, "deleted": 0, "failed": 1})
+            self.assertEqual(second, {"examined": 1, "deleted": 1, "failed": 0})
+            self.assertIsNone(repository.load(session_id))
 
     def test_deleting_a_session_cleans_artifacts_recreated_by_an_inflight_step(self):
         class BlockingDraftStore(FileArtifactStore):

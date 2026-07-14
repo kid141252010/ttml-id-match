@@ -41,10 +41,10 @@ def main() -> None:
             work_root=temporary / "work",
         )
         schema = create_app(v2_workflow=workflow, cors_origins=()).openapi()
-    target.write_text(
-        json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with target.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(
+            json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        )
 
 
 if __name__ == "__main__":

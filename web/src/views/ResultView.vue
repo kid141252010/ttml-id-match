@@ -1,17 +1,45 @@
 <script setup lang="ts">
+import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Archive, FileDown, RotateCcw, FileText } from 'lucide-vue-next';
 import { NButton, NEmpty, NIcon, NResult, NTag } from 'naive-ui';
 
-import { downloadAllUrl, downloadFileUrl } from '@/api/client';
 import { useSessionStore } from '@/stores/session';
 
 const store = useSessionStore();
 const router = useRouter();
+const downloading = ref<string | null>(null);
 
 async function newSession() {
   await store.resetSession();
   await router.push('/upload');
+}
+
+async function downloadFile(filename: string) {
+  downloading.value = filename;
+  try {
+    saveBlob(await store.downloadOutput(filename), filename);
+  } finally {
+    downloading.value = null;
+  }
+}
+
+async function downloadAll() {
+  downloading.value = 'all';
+  try {
+    saveBlob(await store.downloadAllOutputs(), 'ttml-results.zip');
+  } finally {
+    downloading.value = null;
+  }
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 </script>
 
@@ -69,7 +97,14 @@ async function newSession() {
             </div>
 
             <div class="row-actions">
-              <NButton size="small" tag="a" :href="store.sessionId ? downloadFileUrl(store.sessionId, file.ttml) : undefined" :disabled="file.status === 'failed'" secondary strong>
+              <NButton
+                size="small"
+                :disabled="file.status === 'failed' || downloading !== null"
+                :loading="downloading === file.ttml"
+                secondary
+                strong
+                @click="downloadFile(file.ttml)"
+              >
                 <template #icon><NIcon :component="FileDown" /></template>
                 单文件下载
               </NButton>
@@ -84,7 +119,7 @@ async function newSession() {
         <NResult status="success" title="写入流程已完成" description="可下载单个 TTML，也可以打包下载全部结果。">
           <template #footer>
             <div class="action-row context-actions">
-              <NButton type="primary" tag="a" :href="store.sessionId ? downloadAllUrl(store.sessionId) : undefined">
+              <NButton type="primary" :disabled="downloading !== null" :loading="downloading === 'all'" @click="downloadAll">
                 <template #icon><NIcon :component="Archive" /></template>
                 打包下载 ZIP
               </NButton>

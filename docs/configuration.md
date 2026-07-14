@@ -86,7 +86,36 @@ KV_REST_API_TOKEN=
 
 ---
 
-## 5. 前端接口配置 (Frontend Configuration)
+## 5. API 安全与资源治理
+
+网页端创建会话时会获得一次性 `session_token`。后续上传、预览、Apply、删除和下载请求都必须携带 `Authorization: Bearer <session_token>`；服务端只保存令牌摘要。
+
+```text
+ID_MATCH_RATE_LIMIT_REQUESTS=240
+ID_MATCH_RATE_LIMIT_WINDOW_SECONDS=60
+ID_MATCH_SESSION_CREATE_LIMIT=10
+ID_MATCH_SESSION_CREATE_WINDOW_SECONDS=3600
+ID_MATCH_TRUST_PROXY_HEADERS=
+ID_MATCH_MAX_FILES=40
+ID_MATCH_MAX_PAIRS=20
+ID_MATCH_MAX_FILE_BYTES=67108864
+ID_MATCH_MAX_SESSION_BYTES=268435456
+ID_MATCH_MAX_PREVIEW_JOBS=5
+ID_MATCH_MAX_APPLIES=5
+ID_MATCH_SESSION_TTL_SECONDS=86400
+ID_MATCH_GC_GRACE_SECONDS=86400
+CRON_SECRET=
+```
+
+- 通用限流默认为每 IP 每分钟 240 次请求，创建会话额外限制为每 IP 每小时 10 次。Vercel 后端使用 Redis 原子计数，本地后端使用进程内计数。
+- `ID_MATCH_TRUST_PROXY_HEADERS` 在 Vercel 自动启用，本地默认关闭；只有部署在可信反向代理之后才应手动启用。
+- 单会话默认最多 40 个文件、20 个 TTML pair、256 MiB，总计最多 5 次预览和 5 次 Apply；单文件上限为 64 MiB。
+- 会话自创建起固定保留 24 小时，不因访问续期。Redis 会保留额外 24 小时 GC 宽限期，以便 Cron 删除 Blob 对象后再移除索引。
+- Vercel 部署必须设置高熵 `CRON_SECRET`。`vercel.json` 中的每小时任务会用该值访问清理接口。
+
+---
+
+## 6. 前端接口配置 (Frontend Configuration)
 
 前端网络交互基准路径默认为 `/api/v2`。如需使用独立的后端 API 部署：
 

@@ -83,6 +83,7 @@ class TtmlPlanner:
         metadata_values: Mapping[str, Sequence[str]] | None = None,
     ) -> ChangePlan:
         input_bytes, text = _read_source(source)
+        _validate_xml(text, label="input TTML")
         output, language = _normalize_language(text)
         update = TtmlUpdateResult()
         normalized_values = {
@@ -102,7 +103,7 @@ class TtmlPlanner:
                 output = namespaced_text[:metadata_start] + metadata + namespaced_text[metadata_end:]
 
         if output != text:
-            _validate_xml(output)
+            _validate_xml(output, label="planned TTML")
 
         return ChangePlan(
             input_sha256=_sha256(input_bytes),
@@ -138,7 +139,7 @@ class TtmlWriter:
         if not plan.changed:
             return WriteResult(path=path, output_sha256=plan.output_sha256, changed=False)
 
-        _validate_xml(plan.final_text)
+        _validate_xml(plan.final_text, label="planned TTML")
         temp_path = _write_temp_bytes(path, output)
         try:
             backup_path = _ensure_backup(path, backup_paths)
@@ -192,11 +193,11 @@ def _normalize_language(text: str) -> tuple[str, LanguageNormalizationSummary]:
     )
 
 
-def _validate_xml(text: str) -> None:
+def _validate_xml(text: str, *, label: str) -> None:
     try:
         ET.fromstring(text)
     except ET.ParseError as exc:
-        raise ValueError(f"planned TTML is not valid XML: {exc}") from exc
+        raise ValueError(f"{label} is not valid XML: {exc}") from exc
 
 
 def _write_temp_bytes(path: Path, data: bytes) -> Path:

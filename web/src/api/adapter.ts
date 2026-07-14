@@ -40,6 +40,17 @@ export function adaptPreviewJob(dto: PreviewJobDto): PreviewJobResponse {
     total: dto.total,
     completed: dto.completed,
     results: (dto.results ?? []).map(adaptPairPreview),
+    pair_failures: (dto.pair_failures ?? []).map((failure) => ({
+      pair_id: failure.pair_id,
+      ttml_path: failure.ttml_path,
+      audio_path: failure.audio_path ?? null,
+      error: {
+        code: failure.error.code,
+        message: failure.error.message,
+        retryable: failure.error.retryable,
+        details: failure.error.details ?? {},
+      },
+    })),
     errors: (dto.errors ?? []).map((error) => ({
       code: error.code,
       message: error.message,

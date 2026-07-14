@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/v2/maintenance/cleanup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cleanup Expired Sessions */
+        get: operations["cleanup_expired_sessions_api_v2_maintenance_cleanup_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v2/sessions": {
         parameters: {
             query?: never;
@@ -293,6 +310,15 @@ export interface components {
             /** Output Sha256 */
             output_sha256: string;
         };
+        /** CleanupResponse */
+        CleanupResponse: {
+            /** Deleted */
+            deleted: number;
+            /** Examined */
+            examined: number;
+            /** Failed */
+            failed: number;
+        };
         /** ErrorResponse */
         ErrorResponse: {
             /** Code */
@@ -392,6 +418,16 @@ export interface components {
                 [key: string]: components["schemas"]["SourceResult"];
             };
         };
+        /** PairPreviewFailure */
+        PairPreviewFailure: {
+            /** Audio Path */
+            audio_path?: string | null;
+            error: components["schemas"]["ErrorResponse"];
+            /** Pair Id */
+            pair_id: string;
+            /** Ttml Path */
+            ttml_path: string;
+        };
         /** PairingIssue */
         PairingIssue: {
             /** Audio Candidates */
@@ -434,6 +470,8 @@ export interface components {
             errors?: components["schemas"]["ErrorResponse"][];
             /** Job Id */
             job_id: string;
+            /** Pair Failures */
+            pair_failures?: components["schemas"]["PairPreviewFailure"][];
             /** Results */
             results?: components["schemas"]["PairPreview"][];
             /** Snapshot Id */
@@ -457,8 +495,15 @@ export interface components {
         };
         /** SessionResponse */
         SessionResponse: {
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
             /** Session Id */
             session_id: string;
+            /** Session Token */
+            session_token: string;
         };
         /** SourceResult */
         SourceResult: {
@@ -484,6 +529,35 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    cleanup_expired_sessions_api_v2_maintenance_cleanup_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CleanupResponse"];
+                };
+            };
+            /** @description Invalid request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     create_session_api_v2_sessions_post: {
         parameters: {
             query?: never;

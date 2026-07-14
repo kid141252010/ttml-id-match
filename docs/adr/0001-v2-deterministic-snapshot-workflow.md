@@ -21,6 +21,8 @@ To address these limitations, we designed a deterministic snapshot-based workflo
 - **Application Boundaries**: The `SessionWorkflow` defines the application layer boundary. Session metadata is persisted via the `SessionRepository`, while uploads, snapshots, and final results are stored in the `ArtifactStore`.
 - **Flexible Contract**: The public HTTP surface is exposed exclusively via `/api/v2`, representing provider results as extensible maps instead of fixed fields.
 - **Frontend Gateway**: The web application communicates using generated OpenAPI DTOs, adapting them to the frontend domain models at the gateway boundary, and holding temporary user choices in a `ReviewDraft`.
+- **Session Capabilities**: Anonymous web sessions receive a one-time bearer capability. Only its digest is persisted, and every session-scoped route, including downloads, requires the capability.
+- **Bounded Lifetime**: Sessions have a fixed TTL, Redis-backed rate and expiry indexes, bounded upload/operation quotas, and scheduled Blob garbage collection.
 
 ## Consequences
 
@@ -29,3 +31,4 @@ To address these limitations, we designed a deterministic snapshot-based workflo
 - **Resilient Retrievals**: A failure or rate-limit at a single music provider is isolated as a warning for that specific source, without blocking other providers or pairs.
 - **Serverless Ready**: Session execution can transition smoothly between different Vercel serverless instances, as the state is persisted externally via Redis (KV) and Blob storage.
 - **Easier Expansion**: Integrating a new music provider only requires implementing its `SourceAdapter` and API models, without database schema migrations.
+- **Ephemeral Access**: Reloading the web client discards the in-memory capability, and expired or pre-capability v2 sessions are not recoverable.

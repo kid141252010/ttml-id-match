@@ -19,10 +19,39 @@ class V2CompositionTests(unittest.TestCase):
         self.assertEqual(settings.search_workers, 3)
         self.assertEqual(settings.source_limits["apple_music"], 1)
         self.assertEqual(settings.source_limits["qq_music"], 2)
+        self.assertTrue(settings.trust_proxy_headers)
+        self.assertEqual(settings.session_ttl_seconds, 86_400)
+        self.assertEqual(settings.max_file_bytes, 64 * 1024 * 1024)
+
+    def test_security_and_quota_settings_are_loaded_from_environment(self):
+        settings = RuntimeSettings.from_env({
+            "ID_MATCH_SESSION_TTL_SECONDS": "30",
+            "ID_MATCH_MAX_FILES": "2",
+            "ID_MATCH_RATE_LIMIT_REQUESTS": "7",
+            "ID_MATCH_TRUST_PROXY_HEADERS": "true",
+            "CRON_SECRET": "cron-token",
+        })
+
+        self.assertEqual(settings.session_ttl_seconds, 30)
+        self.assertEqual(settings.max_files, 2)
+        self.assertEqual(settings.request_limit, 7)
+        self.assertTrue(settings.trust_proxy_headers)
+        self.assertEqual(settings.cleanup_token, "cron-token")
 
     def test_http_timeout_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "TTML_HTTP_TIMEOUT_SECONDS"):
             RuntimeSettings.from_env({"TTML_HTTP_TIMEOUT_SECONDS": "0"})
+
+    def test_vercel_backend_requires_cleanup_secret(self):
+        settings = RuntimeSettings.from_env({
+            "VERCEL": "1",
+            "BLOB_READ_WRITE_TOKEN": "blob",
+            "KV_REST_API_URL": "https://redis.example",
+            "KV_REST_API_TOKEN": "redis",
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "CRON_SECRET"):
+            build_v2_workflow(settings, transport=FakeTransport())
 
     def test_runtime_shares_one_transport_and_disables_provider_thread_pools(self):
         with tempfile.TemporaryDirectory() as tmp:

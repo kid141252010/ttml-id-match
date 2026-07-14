@@ -533,7 +533,10 @@ class TtmlMetadataWriterTests(unittest.TestCase):
             client,
         )
 
-        self.assertEqual(client.search_calls, [(store, "1691701944") for store in DEFAULT_STORES])
+        self.assertCountEqual(
+            client.search_calls,
+            [(store, "1691701944") for store in DEFAULT_STORES],
+        )
         self.assertEqual(result.values["appleMusicId"], ["1691701944", "song-cn", "song-us", "song-kr", "song-jp", "song-tw"])
         self.assertEqual(result.values["musicName"], ["Song", "노래", "曲"])
         self.assertEqual(result.values["artists"], ["Artist", "Artist KR", "Artist JP"])

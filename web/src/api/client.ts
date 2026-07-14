@@ -4,6 +4,7 @@ import type {
   PairingPlanResponse,
   PreviewJobResponse,
   SelectionPayload,
+  SessionCredentials,
 } from './types';
 import {
   adaptApplySummary,
@@ -23,14 +24,16 @@ import type {
 export const API_BASE = normalizeBase(import.meta.env.VITE_API_BASE ?? '/api/v2');
 
 export interface IdMatchGateway {
-  createSession(): Promise<{ session_id: string }>;
-  deleteSession(sessionId: string): Promise<void>;
-  uploadFiles(sessionId: string, files: File[]): Promise<PairingPlanResponse>;
-  createPreviewJob(sessionId: string): Promise<PreviewJobResponse>;
-  getPreviewJob(sessionId: string, jobId: string): Promise<PreviewJobResponse>;
-  stepPreviewJob(sessionId: string, jobId: string): Promise<PreviewJobResponse>;
-  changePlan(sessionId: string, snapshotId: string, selection: SelectionPayload): Promise<ChangePlanResponse>;
-  apply(sessionId: string, snapshotId: string, selections: SelectionPayload[]): Promise<ApplySummary>;
+  createSession(): Promise<SessionCredentials>;
+  deleteSession(sessionId: string, sessionToken: string): Promise<void>;
+  uploadFiles(sessionId: string, sessionToken: string, files: File[]): Promise<PairingPlanResponse>;
+  createPreviewJob(sessionId: string, sessionToken: string): Promise<PreviewJobResponse>;
+  getPreviewJob(sessionId: string, sessionToken: string, jobId: string): Promise<PreviewJobResponse>;
+  stepPreviewJob(sessionId: string, sessionToken: string, jobId: string): Promise<PreviewJobResponse>;
+  changePlan(sessionId: string, sessionToken: string, snapshotId: string, selection: SelectionPayload): Promise<ChangePlanResponse>;
+  apply(sessionId: string, sessionToken: string, snapshotId: string, selections: SelectionPayload[]): Promise<ApplySummary>;
+  downloadAll(sessionId: string, sessionToken: string): Promise<Blob>;
+  downloadFile(sessionId: string, sessionToken: string, filename: string): Promise<Blob>;
 }
 
 export class ApiError extends Error {
@@ -49,69 +52,84 @@ export class ApiError extends Error {
 export class HttpIdMatchGateway implements IdMatchGateway {
   constructor(private readonly baseUrl = API_BASE) {}
 
-  createSession(): Promise<{ session_id: string }> {
+  createSession(): Promise<SessionCredentials> {
     return this.request<SessionResponseDto>('/sessions', { method: 'POST' });
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
-    await this.request(`/sessions/${segment(sessionId)}`, { method: 'DELETE' });
+  async deleteSession(sessionId: string, sessionToken: string): Promise<void> {
+    await this.request(`/sessions/${segment(sessionId)}`, { method: 'DELETE' }, sessionToken);
   }
 
-  async uploadFiles(sessionId: string, files: File[]): Promise<PairingPlanResponse> {
+  async uploadFiles(sessionId: string, sessionToken: string, files: File[]): Promise<PairingPlanResponse> {
     const body = new FormData();
     for (const file of files) body.append('files', file);
     return adaptPairingPlan(await this.request<PairingPlanResponseDto>(
-      `/sessions/${segment(sessionId)}/files`, { method: 'POST', body },
+      `/sessions/${segment(sessionId)}/files`, { method: 'POST', body }, sessionToken,
     ));
   }
 
-  async createPreviewJob(sessionId: string): Promise<PreviewJobResponse> {
+  async createPreviewJob(sessionId: string, sessionToken: string): Promise<PreviewJobResponse> {
     return adaptPreviewJob(await this.request<PreviewJobDto>(
-      `/sessions/${segment(sessionId)}/preview-jobs`, { method: 'POST' },
+      `/sessions/${segment(sessionId)}/preview-jobs`, { method: 'POST' }, sessionToken,
     ));
   }
 
-  async getPreviewJob(sessionId: string, jobId: string): Promise<PreviewJobResponse> {
+  async getPreviewJob(sessionId: string, sessionToken: string, jobId: string): Promise<PreviewJobResponse> {
     return adaptPreviewJob(await this.request<PreviewJobDto>(
-      `/sessions/${segment(sessionId)}/preview-jobs/${segment(jobId)}`, { method: 'GET' },
+      `/sessions/${segment(sessionId)}/preview-jobs/${segment(jobId)}`, { method: 'GET' }, sessionToken,
     ));
   }
 
-  async stepPreviewJob(sessionId: string, jobId: string): Promise<PreviewJobResponse> {
+  async stepPreviewJob(sessionId: string, sessionToken: string, jobId: string): Promise<PreviewJobResponse> {
     return adaptPreviewJob(await this.request<PreviewJobDto>(
-      `/sessions/${segment(sessionId)}/preview-jobs/${segment(jobId)}/steps`, { method: 'POST' },
+      `/sessions/${segment(sessionId)}/preview-jobs/${segment(jobId)}/steps`, { method: 'POST' }, sessionToken,
     ));
   }
 
-  async changePlan(sessionId: string, snapshotId: string, selection: SelectionPayload): Promise<ChangePlanResponse> {
+  async changePlan(sessionId: string, sessionToken: string, snapshotId: string, selection: SelectionPayload): Promise<ChangePlanResponse> {
     return adaptChangePlan(await this.request<ChangePlanResponseDto>(
-      `/sessions/${segment(sessionId)}/change-plans`, jsonRequest({ snapshot_id: snapshotId, selection }),
+      `/sessions/${segment(sessionId)}/change-plans`, jsonRequest({ snapshot_id: snapshotId, selection }), sessionToken,
     ));
   }
 
-  async apply(sessionId: string, snapshotId: string, selections: SelectionPayload[]): Promise<ApplySummary> {
+  async apply(sessionId: string, sessionToken: string, snapshotId: string, selections: SelectionPayload[]): Promise<ApplySummary> {
     return adaptApplySummary(await this.request<ApplyResponseDto>(
-      `/sessions/${segment(sessionId)}/apply`, jsonRequest({ snapshot_id: snapshotId, selections }),
+      `/sessions/${segment(sessionId)}/apply`, jsonRequest({ snapshot_id: snapshotId, selections }), sessionToken,
     ));
   }
 
-  private async request<T>(path: string, init: RequestInit): Promise<T> {
-    const response = await fetch(`${normalizeBase(this.baseUrl)}${path}`, init);
+  downloadAll(sessionId: string, sessionToken: string): Promise<Blob> {
+    return this.requestBlob(`/sessions/${segment(sessionId)}/outputs.zip`, sessionToken);
+  }
+
+  downloadFile(sessionId: string, sessionToken: string, filename: string): Promise<Blob> {
+    return this.requestBlob(
+      `/sessions/${segment(sessionId)}/outputs/${segment(filename)}`,
+      sessionToken,
+    );
+  }
+
+  private async request<T>(path: string, init: RequestInit, sessionToken?: string): Promise<T> {
+    const response = await fetch(
+      `${normalizeBase(this.baseUrl)}${path}`,
+      withAuthorization(init, sessionToken),
+    );
     if (!response.ok) throw await apiError(response);
     if (response.status === 204) return undefined as T;
     return response.json() as Promise<T>;
   }
+
+  private async requestBlob(path: string, sessionToken: string): Promise<Blob> {
+    const response = await fetch(
+      `${normalizeBase(this.baseUrl)}${path}`,
+      withAuthorization({ method: 'GET' }, sessionToken),
+    );
+    if (!response.ok) throw await apiError(response);
+    return response.blob();
+  }
 }
 
 export const gateway: IdMatchGateway = new HttpIdMatchGateway();
-
-export function downloadAllUrl(sessionId: string): string {
-  return `${API_BASE}/sessions/${segment(sessionId)}/outputs.zip`;
-}
-
-export function downloadFileUrl(sessionId: string, filename: string): string {
-  return `${API_BASE}/sessions/${segment(sessionId)}/outputs/${segment(filename)}`;
-}
 
 function jsonRequest(body: unknown): RequestInit {
   return {
@@ -119,6 +137,13 @@ function jsonRequest(body: unknown): RequestInit {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   };
+}
+
+function withAuthorization(init: RequestInit, sessionToken?: string): RequestInit {
+  if (!sessionToken) return init;
+  const headers = new Headers(init.headers);
+  headers.set('Authorization', `Bearer ${sessionToken}`);
+  return { ...init, headers };
 }
 
 function normalizeBase(value: string): string {

@@ -73,8 +73,24 @@ describe('v2 session workflow store', () => {
   });
 
   it('does not show another pair preview when the selected pair failed', async () => {
+    const failedJob = job(
+      'completed_with_errors',
+      [preview('pair-1', 'A.ttml')],
+      'snapshot-1',
+    );
+    failedJob.pair_failures = [{
+      pair_id: 'pair-2',
+      ttml_path: 'B.ttml',
+      audio_path: null,
+      error: {
+        code: 'pair_preview_failed',
+        message: 'invalid TTML',
+        retryable: false,
+        details: { pair_id: 'pair-2' },
+      },
+    }];
     const fake = fakeGateway({
-      stepPreviewJob: vi.fn().mockResolvedValue(job('completed_with_errors', [preview('pair-1', 'A.ttml')], 'snapshot-1')),
+      stepPreviewJob: vi.fn().mockResolvedValue(failedJob),
     });
     const store = createSessionStore(fake, 'session-failed-pair-selection')();
     await store.uploadFiles([new File(['a'], 'A.ttml'), new File(['b'], 'B.ttml')]);
@@ -84,6 +100,37 @@ describe('v2 session workflow store', () => {
 
     expect(store.selectedPreview).toBeNull();
     expect(store.selectedChangePlan).toBeNull();
+    expect(store.selectedPreviewFailure?.error.message).toBe('invalid TTML');
+    expect(store.failedPairIds).toEqual(['pair-2']);
+    expect(store.canApply).toBe(false);
+  });
+
+  it('keeps an all-failed preview visible for diagnosis', async () => {
+    const allFailed = job('completed_with_errors', [], 'snapshot-failed');
+    allFailed.pair_failures = [{
+      pair_id: 'pair-1',
+      ttml_path: 'A.ttml',
+      audio_path: null,
+      error: {
+        code: 'pair_preview_failed',
+        message: 'malformed XML',
+        retryable: false,
+        details: {},
+      },
+    }];
+    allFailed.completed = 1;
+    allFailed.total = 1;
+    const store = createSessionStore(fakeGateway({
+      stepPreviewJob: vi.fn().mockResolvedValue(allFailed),
+    }), 'session-all-failed')();
+    await store.uploadFiles([new File(['broken'], 'A.ttml')]);
+
+    await store.previewAll();
+
+    expect(store.hasPreviewOutcomes).toBe(true);
+    expect(store.previewResults).toEqual([]);
+    expect(store.selectedPreviewFailure?.ttml_path).toBe('A.ttml');
+    expect(store.canApply).toBe(false);
   });
 
   it('ignores an out-of-order change plan response and enables apply for the latest selection', async () => {
@@ -113,7 +160,7 @@ describe('v2 session workflow store', () => {
 
     expect(store.selectedChangePlan?.output_sha256).toBe('latest-output');
     expect(store.canApply).toBe(true);
-    expect(changePlanRequest.mock.calls[1][2]).toEqual({
+    expect(changePlanRequest.mock.calls[1][3]).toEqual({
       pair_id: 'pair-1',
       sources: { qq_music: ['pair-1-qq'] },
     });
@@ -131,7 +178,7 @@ describe('v2 session workflow store', () => {
 
     await store.resetSession();
 
-    expect(deleteSession).toHaveBeenCalledWith('session-1');
+    expect(deleteSession).toHaveBeenCalledWith('session-1', 'token-1');
     expect(store.sessionId).toBeNull();
     expect(store.files).toEqual([]);
     expect(store.pairs).toEqual([]);
@@ -163,7 +210,11 @@ describe('v2 session workflow store', () => {
 
 function fakeGateway(overrides: Partial<IdMatchGateway> = {}): IdMatchGateway {
   return {
-    createSession: vi.fn().mockResolvedValue({ session_id: 'session-1' }),
+    createSession: vi.fn().mockResolvedValue({
+      session_id: 'session-1',
+      session_token: 'token-1',
+      expires_at: '2026-07-14T00:00:00Z',
+    }),
     deleteSession: vi.fn().mockResolvedValue(undefined),
     uploadFiles: vi.fn().mockResolvedValue({
       pairs: [
@@ -177,6 +228,8 @@ function fakeGateway(overrides: Partial<IdMatchGateway> = {}): IdMatchGateway {
     stepPreviewJob: vi.fn().mockResolvedValue(job('completed', [], 'snapshot-empty')),
     changePlan: vi.fn().mockResolvedValue(changePlan('pair-1', 'snapshot-1', 'out')),
     apply: vi.fn().mockResolvedValue(applySummary()),
+    downloadAll: vi.fn().mockResolvedValue(new Blob()),
+    downloadFile: vi.fn().mockResolvedValue(new Blob()),
     ...overrides,
   };
 }
@@ -226,6 +279,7 @@ function job(
     total: 2,
     completed: results.length,
     results,
+    pair_failures: [],
     errors: [],
     snapshot_id: snapshotId,
   };

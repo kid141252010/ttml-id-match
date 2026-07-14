@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
+import secrets
 import shutil
 import threading
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ttml_metadata.v2.application import MatchingApplication, PairSnapshot
 from ttml_metadata.v2.domain import Selection
@@ -18,6 +21,7 @@ from ttml_metadata.v2.ttml_plan import ChangePlan, TtmlWriter
 from .storage import (
     ArtifactStore,
     LeaseConflictError,
+    RateLimitResult,
     SessionRepository,
     VersionedSession,
     validate_identifier,
@@ -48,10 +52,36 @@ class PairingConflictError(ValueError):
     pass
 
 
+class PreviewIncompleteError(RuntimeError):
+    pass
+
+
+class SessionUnauthorizedError(PermissionError):
+    pass
+
+
+class PayloadTooLargeError(ValueError):
+    pass
+
+
+class SessionQuotaExceededError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class UploadData:
     filename: str
-    content: bytes
+    content: bytes | None = None
+    path: Path | None = None
+    sha256: str | None = None
+    size: int | None = None
+
+
+@dataclass(frozen=True)
+class SessionCredentials:
+    session_id: str
+    session_token: str
+    expires_at: float
 
 
 class SessionWorkflow:
@@ -63,6 +93,15 @@ class SessionWorkflow:
         *,
         work_root: Path,
         lease_seconds: float = 60.0,
+        session_ttl_seconds: int = 86_400,
+        gc_grace_seconds: int = 86_400,
+        max_files: int = 40,
+        max_pairs: int = 20,
+        max_file_bytes: int = 64 * 1024 * 1024,
+        max_session_bytes: int = 256 * 1024 * 1024,
+        max_preview_jobs: int = 5,
+        max_applies: int = 5,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._repository = repository
         self._artifacts = artifacts
@@ -70,9 +109,102 @@ class SessionWorkflow:
         self._work_root = Path(work_root)
         self._work_root.mkdir(parents=True, exist_ok=True)
         self._lease_seconds = lease_seconds
+        self._session_ttl_seconds = _positive_int(session_ttl_seconds, "session_ttl_seconds")
+        self._gc_grace_seconds = _positive_int(gc_grace_seconds, "gc_grace_seconds")
+        self._max_files = _positive_int(max_files, "max_files")
+        self._max_pairs = _positive_int(max_pairs, "max_pairs")
+        self._max_file_bytes = _positive_int(max_file_bytes, "max_file_bytes")
+        self._max_session_bytes = _positive_int(max_session_bytes, "max_session_bytes")
+        self._max_preview_jobs = _positive_int(max_preview_jobs, "max_preview_jobs")
+        self._max_applies = _positive_int(max_applies, "max_applies")
+        self._clock = clock
+
+    @property
+    def max_files(self) -> int:
+        return self._max_files
+
+    @property
+    def max_file_bytes(self) -> int:
+        return self._max_file_bytes
+
+    @property
+    def max_session_bytes(self) -> int:
+        return self._max_session_bytes
 
     def create_session(self) -> str:
-        return self._repository.create(_empty_session()).session_id
+        return self._create_session(token_hash=None).session_id
+
+    def create_session_credentials(self) -> SessionCredentials:
+        token = secrets.token_urlsafe(32)
+        created = self._create_session(token_hash=_token_hash(token))
+        return SessionCredentials(
+            session_id=created.session_id,
+            session_token=token,
+            expires_at=float(created.data["expires_at"]),
+        )
+
+    def _create_session(self, *, token_hash: str | None) -> VersionedSession:
+        now = self._clock()
+        expires_at = now + self._session_ttl_seconds
+        created = self._repository.create(
+            _empty_session(
+                created_at=now,
+                expires_at=expires_at,
+                token_hash=token_hash,
+            )
+        )
+        try:
+            self._repository.register_expiry(
+                created.session_id,
+                expires_at=expires_at,
+                ttl_seconds=self._session_ttl_seconds + self._gc_grace_seconds,
+            )
+        except Exception:
+            self._repository.delete(created.session_id)
+            raise
+        return created
+
+    def authorize_session(self, session_id: str, token: str) -> None:
+        current = self._repository.load(session_id)
+        if current is None:
+            raise SessionNotFoundError(f"session not found: {session_id}")
+        expires_at = float(current.data.get("expires_at", 0) or 0)
+        if expires_at and expires_at <= self._clock():
+            raise SessionNotFoundError(f"session not found: {session_id}")
+        expected = current.data.get("token_hash")
+        if not isinstance(expected, str) or not token:
+            raise SessionUnauthorizedError("valid session bearer token required")
+        if not hmac.compare_digest(expected, _token_hash(token)):
+            raise SessionUnauthorizedError("valid session bearer token required")
+
+    def consume_rate_limit(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> RateLimitResult:
+        return self._repository.consume_rate_limit(
+            key,
+            limit=limit,
+            window_seconds=window_seconds,
+            now=self._clock(),
+        )
+
+    def cleanup_expired_sessions(self, *, limit: int = 100) -> dict[str, int]:
+        session_ids = self._repository.list_expired(before=self._clock(), limit=limit)
+        deleted = 0
+        failed = 0
+        for session_id in session_ids:
+            try:
+                self._artifacts.delete_prefix(_session_prefix(session_id))
+                self._repository.delete(session_id)
+                self._repository.remove_expiry(session_id)
+                shutil.rmtree(self._work_root / session_id, ignore_errors=True)
+                deleted += 1
+            except Exception:
+                failed += 1
+        return {"examined": len(session_ids), "deleted": deleted, "failed": failed}
 
     def delete_session(self, session_id: str) -> bool:
         current = self._repository.load(session_id)
@@ -81,39 +213,66 @@ class SessionWorkflow:
         if not current.data.get("deleting"):
             current = self._repository.save(
                 session_id,
-                {"deleting": True},
+                _deleting_session(current.data),
                 expected_version=current.version,
             )
         self._artifacts.delete_prefix(_session_prefix(session_id))
         shutil.rmtree(self._work_root / session_id, ignore_errors=True)
-        return self._repository.delete(
+        deleted = self._repository.delete(
             session_id,
             expected_version=current.version,
         )
+        self._repository.remove_expiry(session_id)
+        return deleted
 
     def upload_files(self, session_id: str, uploads: Iterable[UploadData]) -> dict[str, object]:
         current = self._load(session_id)
         data = _copy_json(current.data)
-        records = [dict(record) for record in data.get("uploads", [])]
+        upload_items = list(uploads)
+        if len(upload_items) > self._max_files:
+            raise SessionQuotaExceededError(
+                f"file count exceeds session limit of {self._max_files}"
+            )
+        upload_metadata = [_upload_metadata(upload) for upload in upload_items]
+        total_size = sum(size for _, size in upload_metadata)
+        if total_size > self._max_session_bytes:
+            raise PayloadTooLargeError(
+                f"upload size exceeds session limit of {self._max_session_bytes} bytes"
+            )
+        for upload, (_, size) in zip(upload_items, upload_metadata):
+            if size > self._max_file_bytes:
+                raise PayloadTooLargeError(
+                    f"file {upload.filename!r} exceeds limit of {self._max_file_bytes} bytes"
+                )
+        records: list[dict[str, object]] = []
         upload_generation = uuid.uuid4().hex
         upload_prefix = (
             f"{_session_prefix(session_id)}/uploads/{upload_generation}"
         )
         try:
-            for upload_index, upload in enumerate(uploads):
+            for upload_index, (upload, (sha256, size)) in enumerate(
+                zip(upload_items, upload_metadata)
+            ):
                 filename = _safe_filename(upload.filename)
                 key = f"{upload_prefix}/{upload_index}/{filename}"
-                self._artifacts.put_bytes(key, bytes(upload.content))
+                if upload.path is not None:
+                    self._artifacts.put_file(key, upload.path)
+                else:
+                    self._artifacts.put_bytes(key, bytes(upload.content or b""))
                 records.append(
                     {
                         "filename": filename,
                         "artifact_key": key,
-                        "sha256": _sha256(upload.content),
-                        "size": len(upload.content),
+                        "sha256": sha256,
+                        "size": size,
                     }
                 )
 
             pairing = build_pairing_plan(Path(record["filename"]) for record in records)
+            if len(pairing.pairs) > self._max_pairs:
+                raise SessionQuotaExceededError(
+                    f"TTML pair count exceeds session limit of {self._max_pairs}"
+                )
             data.update(
                 {
                     "uploads": records,
@@ -127,11 +286,21 @@ class SessionWorkflow:
         except Exception:
             _delete_prefix_quietly(self._artifacts, upload_prefix)
             raise
+        self._cleanup_replaced_session_artifacts(
+            session_id,
+            current.data,
+            keep_upload_generation=upload_generation,
+        )
         return pairing.to_dict()
 
     def create_preview_job(self, session_id: str) -> dict[str, object]:
         current = self._load(session_id)
         data = _copy_json(current.data)
+        _consume_session_quota(
+            data,
+            "preview_jobs",
+            limit=self._max_preview_jobs,
+        )
         pairing = data.get("pairing", {"pairs": [], "issues": []})
         issues = list(pairing.get("issues", []))
         if issues:
@@ -158,7 +327,8 @@ class SessionWorkflow:
         try:
             self._artifacts.put_json(draft_key, {"version": 2, "steps": {}})
             if not pairs:
-                self._publish_snapshot(session_id, data, job, [])
+                self._publish_snapshot(session_id, data, job, [], [])
+                data["jobs"] = {job_id: job}
             saved = self._repository.save(
                 session_id,
                 data,
@@ -171,7 +341,15 @@ class SessionWorkflow:
                 _snapshot_key(session_id, pending_snapshot_id),
             )
             raise
-        return self._job_response(session_id, saved.data, job)
+        response = self._job_response(session_id, saved.data, job)
+        if job.get("snapshot_id"):
+            self._cleanup_published_preview_artifacts(
+                session_id,
+                current.data,
+                keep_snapshot_id=str(job["snapshot_id"]),
+            )
+            _delete_prefix_quietly(self._artifacts, job_prefix)
+        return response
 
     def get_preview_job(self, session_id: str, job_id: str) -> dict[str, object]:
         current = self._load(session_id)
@@ -224,6 +402,7 @@ class SessionWorkflow:
                 if step is None:
                     step_errors: list[dict[str, object]] = []
                     pair_snapshot: dict[str, Any] | None = None
+                    pair_failure: dict[str, Any] | None = None
                     try:
                         pair = self._materialize_pair(session_id, data, pair_id)
                         snapshot = self._application.preview_pair(pair)
@@ -240,17 +419,18 @@ class SessionWorkflow:
                                     )
                                 )
                     except Exception as exc:
-                        step_errors.append(
-                            _error(
-                                "pair_preview_failed",
-                                str(exc),
-                                retryable=False,
-                                pair_id=pair_id,
-                            )
+                        error = _error(
+                            "pair_preview_failed",
+                            str(exc),
+                            retryable=False,
+                            pair_id=pair_id,
                         )
+                        step_errors.append(error)
+                        pair_failure = _pair_failure(data, pair_id, error)
                     step = {
                         "pair_id": pair_id,
                         "snapshot": pair_snapshot,
+                        "failure": pair_failure,
                         "errors": step_errors,
                     }
                     steps[step_key] = step
@@ -281,11 +461,18 @@ class SessionWorkflow:
                     job["next_index"] = next_index
 
             snapshots = _draft_snapshots({"version": 2, "steps": steps})
+            pair_failures = _draft_failures({"version": 2, "steps": steps})
 
             if job.get("status") != "failed" and next_index >= len(pair_ids):
                 try:
                     heartbeat.ensure_owned()
-                    self._publish_snapshot(session_id, data, job, snapshots)
+                    self._publish_snapshot(
+                        session_id,
+                        data,
+                        job,
+                        snapshots,
+                        pair_failures,
+                    )
                 except Exception as exc:
                     job.setdefault("errors", []).append(
                         _error(
@@ -300,7 +487,12 @@ class SessionWorkflow:
             elif job.get("status") != "failed":
                 job["status"] = "running"
             jobs[job_id] = job
-            data["jobs"] = jobs
+            terminal = job.get("status") in {
+                "completed",
+                "completed_with_errors",
+                "failed",
+            }
+            data["jobs"] = {job_id: job} if terminal else jobs
             heartbeat.ensure_owned()
             try:
                 saved = self._repository.save_with_job_lease(
@@ -314,7 +506,14 @@ class SessionWorkflow:
                 raise JobBusyError(
                     f"preview job lease was lost: {job_id}"
                 ) from exc
-            return self._job_response(session_id, saved.data, job)
+            response = self._job_response(session_id, saved.data, job)
+            if job.get("snapshot_id"):
+                self._cleanup_published_preview_artifacts(
+                    session_id,
+                    current.data,
+                    keep_snapshot_id=str(job["snapshot_id"]),
+                )
+            return response
         finally:
             heartbeat.stop()
             self._repository.release_job_lease(session_id, job_id, lease_owner)
@@ -340,7 +539,15 @@ class SessionWorkflow:
     ) -> dict[str, object]:
         current = self._load(session_id)
         data = _copy_json(current.data)
+        _consume_session_quota(data, "applies", limit=self._max_applies)
+        previous_outputs = [dict(item) for item in data.get("outputs", [])]
         snapshot = self._load_snapshot(session_id, data, snapshot_id)
+        pair_failures = list(snapshot.get("pair_failures", []))
+        if pair_failures:
+            failed_ids = sorted(str(item.get("pair_id", "")) for item in pair_failures)
+            raise PreviewIncompleteError(
+                f"preview contains failed pairs: {failed_ids}"
+            )
         pair_snapshots = [PairSnapshot.from_dict(pair) for pair in snapshot.get("pairs", [])]
         selection_by_pair = {selection.pair_id: selection for selection in selections}
         if len(selection_by_pair) != len(selections):
@@ -413,6 +620,7 @@ class SessionWorkflow:
             raise
         finally:
             shutil.rmtree(output_root, ignore_errors=True)
+        self._cleanup_output_records(previous_outputs, keep_prefix=output_prefix)
         succeeded = sum(1 for item in files if item["status"] == "applied")
         skipped = sum(1 for item in files if item["status"] == "unchanged")
         failed = sum(1 for item in files if item["status"] == "failed")
@@ -450,9 +658,58 @@ class SessionWorkflow:
                 )
         return buffer.getvalue()
 
+    def materialize_output(self, session_id: str, filename: str, destination: Path) -> Path:
+        current = self._load(session_id)
+        safe_name = _safe_filename(filename)
+        record = next(
+            (
+                record
+                for record in current.data.get("outputs", [])
+                if record.get("filename") == safe_name
+            ),
+            None,
+        )
+        if record is None:
+            raise FileNotFoundError(f"output not found: {safe_name}")
+        return self._artifacts.get_file(str(record["artifact_key"]), destination)
+
+    def build_outputs_zip(self, session_id: str, destination: Path) -> Path:
+        current = self._load(session_id)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.files"
+        staging.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for record in sorted(
+                    current.data.get("outputs", []),
+                    key=lambda item: str(item["filename"]).casefold(),
+                ):
+                    filename = _safe_filename(str(record["filename"]))
+                    source = self._artifacts.get_file(
+                        str(record["artifact_key"]),
+                        staging / filename,
+                    )
+                    archive.write(source, arcname=filename)
+            return destination
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
     def _load(self, session_id: str) -> VersionedSession:
         current = self._repository.load(session_id)
         if current is None or current.data.get("deleting"):
+            raise SessionNotFoundError(f"session not found: {session_id}")
+        expires_at = float(current.data.get("expires_at", 0) or 0)
+        if expires_at and expires_at <= self._clock():
+            try:
+                self._artifacts.delete_prefix(_session_prefix(session_id))
+                self._repository.delete(session_id)
+                self._repository.remove_expiry(session_id)
+            finally:
+                shutil.rmtree(self._work_root / session_id, ignore_errors=True)
             raise SessionNotFoundError(f"session not found: {session_id}")
         return current
 
@@ -462,13 +719,15 @@ class SessionWorkflow:
         data: dict[str, Any],
         job: dict[str, Any],
         pairs: list[dict[str, Any]],
+        pair_failures: list[dict[str, Any]],
     ) -> None:
         snapshot_id = str(job.get("pending_snapshot_id") or uuid.uuid4().hex)
         snapshot = {
-            "version": 1,
+            "version": 2,
             "snapshot_id": snapshot_id,
             "upload_fingerprint": _upload_fingerprint(data),
             "pairs": pairs,
+            "pair_failures": pair_failures,
         }
         self._artifacts.put_json(
             _snapshot_key(session_id, snapshot_id),
@@ -528,10 +787,9 @@ class SessionWorkflow:
             raise KeyError(f"uploaded file not found: {filename}")
         path = self._work_root / session_id / "uploads" / filename
         path.parent.mkdir(parents=True, exist_ok=True)
-        content = self._artifacts.get_bytes(str(record["artifact_key"]))
-        if _sha256(content) != record.get("sha256"):
+        self._artifacts.get_file(str(record["artifact_key"]), path)
+        if _sha256_path(path) != record.get("sha256"):
             raise SnapshotConflictError(f"uploaded artifact hash mismatch: {filename}")
-        path.write_bytes(content)
         return path
 
     def _job_response(
@@ -546,19 +804,84 @@ class SessionWorkflow:
                 _snapshot_key(session_id, str(snapshot_id))
             )
             results = list(snapshot.get("pairs", []))
+            pair_failures = list(snapshot.get("pair_failures", []))
         else:
-            results = _draft_snapshots(
-                self._artifacts.get_json(str(job["draft_key"]))
-            )
+            draft = self._artifacts.get_json(str(job["draft_key"]))
+            results = _draft_snapshots(draft)
+            pair_failures = _draft_failures(draft)
         return {
             "job_id": str(job["job_id"]),
             "status": str(job["status"]),
             "total": int(job.get("total", 0)),
             "completed": int(job.get("next_index", 0)),
             "results": results,
+            "pair_failures": pair_failures,
             "errors": list(job.get("errors", [])),
             "snapshot_id": snapshot_id,
         }
+
+    def _cleanup_replaced_session_artifacts(
+        self,
+        session_id: str,
+        previous: dict[str, Any],
+        *,
+        keep_upload_generation: str,
+    ) -> None:
+        session_prefix = _session_prefix(session_id)
+        for record in previous.get("uploads", []):
+            key = str(record.get("artifact_key", ""))
+            parts = key.split("/")
+            if len(parts) >= 4 and parts[:3] == ["sessions", session_id, "uploads"]:
+                generation = parts[3]
+                if generation != keep_upload_generation:
+                    _delete_prefix_quietly(
+                        self._artifacts,
+                        f"{session_prefix}/uploads/{generation}",
+                    )
+        if previous.get("jobs"):
+            _delete_prefix_quietly(self._artifacts, f"{session_prefix}/jobs")
+        if previous.get("current_snapshot_id"):
+            _delete_prefix_quietly(self._artifacts, f"{session_prefix}/snapshots")
+        if previous.get("outputs"):
+            _delete_prefix_quietly(self._artifacts, f"{session_prefix}/outputs")
+        shutil.rmtree(self._work_root / session_id, ignore_errors=True)
+
+    def _cleanup_output_records(
+        self,
+        previous: list[dict[str, Any]],
+        *,
+        keep_prefix: str,
+    ) -> None:
+        prefixes: set[str] = set()
+        for record in previous:
+            key = str(record.get("artifact_key", ""))
+            parts = key.split("/")
+            if len(parts) >= 5 and parts[0] == "sessions" and parts[2] == "outputs":
+                prefix = "/".join(parts[:4])
+                if prefix != keep_prefix:
+                    prefixes.add(prefix)
+        for prefix in prefixes:
+            _delete_prefix_quietly(self._artifacts, prefix)
+
+    def _cleanup_published_preview_artifacts(
+        self,
+        session_id: str,
+        previous: dict[str, Any],
+        *,
+        keep_snapshot_id: str,
+    ) -> None:
+        session_prefix = _session_prefix(session_id)
+        for job_id in previous.get("jobs", {}):
+            _delete_prefix_quietly(
+                self._artifacts,
+                f"{session_prefix}/jobs/{job_id}",
+            )
+        current_snapshot_id = previous.get("current_snapshot_id")
+        if current_snapshot_id and str(current_snapshot_id) != keep_snapshot_id:
+            _delete_quietly(
+                self._artifacts,
+                _snapshot_key(session_id, str(current_snapshot_id)),
+            )
 
     def _cleanup_abandoned_job_artifacts(
         self,
@@ -597,6 +920,7 @@ class SessionWorkflow:
         marker = {
             "deleting": True,
             "cleanup_token": uuid.uuid4().hex,
+            **_session_security_fields(current.data if current else {}),
         }
         try:
             if current is None:
@@ -618,13 +942,37 @@ class SessionWorkflow:
             pass
 
 
-def _empty_session() -> dict[str, object]:
+def _empty_session(
+    *,
+    created_at: float,
+    expires_at: float,
+    token_hash: str | None,
+) -> dict[str, object]:
     return {
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "token_hash": token_hash,
+        "usage": {"preview_jobs": 0, "applies": 0},
         "uploads": [],
         "pairing": {"pairs": [], "issues": []},
         "jobs": {},
         "current_snapshot_id": None,
         "outputs": [],
+    }
+
+
+def _deleting_session(data: dict[str, Any]) -> dict[str, object]:
+    return {
+        "deleting": True,
+        **_session_security_fields(data),
+    }
+
+
+def _session_security_fields(data: dict[str, Any]) -> dict[str, object]:
+    return {
+        key: data[key]
+        for key in ("created_at", "expires_at", "token_hash")
+        if key in data
     }
 
 
@@ -706,6 +1054,52 @@ def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _upload_metadata(upload: UploadData) -> tuple[str, int]:
+    if upload.path is not None:
+        path = Path(upload.path)
+        if upload.content is not None:
+            raise ValueError("upload must provide either content or path")
+        actual_size = path.stat().st_size
+        if upload.size is not None and upload.size != actual_size:
+            raise ValueError(f"staged upload size changed: {upload.filename}")
+        return upload.sha256 or _sha256_path(path), actual_size
+    if upload.content is None:
+        raise ValueError("upload content is required")
+    content = bytes(upload.content)
+    actual_size = len(content)
+    if upload.size is not None and upload.size != actual_size:
+        raise ValueError(f"upload size does not match content: {upload.filename}")
+    return upload.sha256 or _sha256(content), actual_size
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _positive_int(value: int, label: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{label} must be greater than zero")
+    return result
+
+
+def _consume_session_quota(data: dict[str, Any], key: str, *, limit: int) -> None:
+    usage = dict(data.get("usage", {}))
+    count = int(usage.get(key, 0))
+    if count >= limit:
+        raise SessionQuotaExceededError(f"session {key} quota of {limit} exceeded")
+    usage[key] = count + 1
+    data["usage"] = usage
+
+
 def _error(code: str, message: str, *, retryable: bool, **details: object) -> dict[str, object]:
     return {"code": code, "message": message, "retryable": retryable, "details": details}
 
@@ -728,6 +1122,7 @@ def _draft_steps(draft: dict[str, Any]) -> dict[str, dict[str, Any]]:
         str(index): {
             "pair_id": snapshot.get("pair_id"),
             "snapshot": snapshot,
+            "failure": None,
             "errors": [],
         }
         for index, snapshot in enumerate(draft.get("pairs", []))
@@ -745,6 +1140,41 @@ def _draft_snapshots(draft: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(snapshot, dict):
             snapshots.append(snapshot)
     return snapshots
+
+
+def _draft_failures(draft: dict[str, Any]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for _, step in sorted(
+        _draft_steps(draft).items(),
+        key=lambda item: int(item[0]),
+    ):
+        failure = step.get("failure")
+        if isinstance(failure, dict):
+            failures.append(failure)
+    return failures
+
+
+def _pair_failure(
+    data: dict[str, Any],
+    pair_id: str,
+    error: dict[str, object],
+) -> dict[str, object]:
+    pair = next(
+        (
+            item
+            for item in data.get("pairing", {}).get("pairs", [])
+            if item.get("pair_id") == pair_id
+        ),
+        {},
+    )
+    return {
+        "pair_id": pair_id,
+        "ttml_path": Path(str(pair.get("ttml_path", pair_id))).name,
+        "audio_path": (
+            Path(str(pair["audio_path"])).name if pair.get("audio_path") else None
+        ),
+        "error": error,
+    }
 
 
 class _LeaseHeartbeat:

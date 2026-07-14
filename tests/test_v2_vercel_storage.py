@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ from server.v2.storage import (
     ArtifactStore,
     InvalidArtifactKeyError,
     LeaseConflictError,
+    RateLimitResult,
     SessionRepository,
     VersionConflictError,
 )
@@ -33,6 +35,7 @@ class FakeRedisJsonClient:
     def __init__(self) -> None:
         self.values: dict[str, dict[str, Any] | str] = {}
         self.expirations: dict[str, float] = {}
+        self.sorted_sets: dict[str, dict[str, float]] = {}
         self.now = 0.0
         self._lock = threading.Lock()
 
@@ -141,6 +144,49 @@ class FakeRedisJsonClient:
             self.expirations[key] = self.now + ttl_seconds
             return True
 
+    def expire(self, key: str, *, ttl_seconds: float) -> bool:
+        with self._lock:
+            self._expire(key)
+            if key not in self.values:
+                return False
+            self.expirations[key] = self.now + ttl_seconds
+            return True
+
+    def sorted_set_add(self, key: str, member: str, score: float) -> None:
+        self.sorted_sets.setdefault(key, {})[member] = float(score)
+
+    def sorted_set_range_by_score(
+        self,
+        key: str,
+        *,
+        maximum: float,
+        limit: int,
+    ) -> list[str]:
+        values = self.sorted_sets.get(key, {})
+        return [
+            member
+            for member, score in sorted(values.items(), key=lambda item: (item[1], item[0]))
+            if score <= maximum
+        ][:limit]
+
+    def sorted_set_remove(self, key: str, member: str) -> None:
+        self.sorted_sets.get(key, {}).pop(member, None)
+
+    def consume_fixed_window(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> RateLimitResult:
+        with self._lock:
+            self._expire(key)
+            count = int(self.values.get(key, 0)) + 1
+            self.values[key] = str(count)
+            self.expirations.setdefault(key, self.now + window_seconds)
+            retry_after = max(1, int(self.expirations[key] - self.now + 0.999))
+            return RateLimitResult(count <= limit, count, retry_after)
+
     def advance(self, seconds: float) -> None:
         self.now += seconds
 
@@ -161,6 +207,15 @@ class FakeBlobClient:
     def get_bytes(self, pathname: str) -> bytes:
         return self.objects[pathname]
 
+    def put_file(self, pathname: str, source: Path) -> None:
+        self.objects[pathname] = Path(source).read_bytes()
+
+    def get_file(self, pathname: str, destination: Path) -> Path:
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(self.objects[pathname])
+        return destination
+
     def delete(self, pathname: str) -> bool:
         return self.objects.pop(pathname, None) is not None
 
@@ -172,6 +227,34 @@ class FakeBlobClient:
 
 
 class RedisSessionRepositoryTests(unittest.TestCase):
+    def test_session_expiry_index_and_rate_limit_are_shared_in_redis(self) -> None:
+        redis = FakeRedisJsonClient()
+        repository = RedisSessionRepository(redis)
+        repository.create({"expires_at": 110}, session_id="session-1")
+
+        repository.register_expiry(
+            "session-1",
+            expires_at=110,
+            ttl_seconds=20,
+        )
+        first = repository.consume_rate_limit(
+            "requests:client",
+            limit=1,
+            window_seconds=60,
+        )
+        second = RedisSessionRepository(redis).consume_rate_limit(
+            "requests:client",
+            limit=1,
+            window_seconds=60,
+        )
+
+        self.assertEqual(repository.list_expired(before=109, limit=10), [])
+        self.assertEqual(repository.list_expired(before=110, limit=10), ["session-1"])
+        self.assertTrue(first.allowed)
+        self.assertFalse(second.allowed)
+        repository.remove_expiry("session-1")
+        self.assertEqual(repository.list_expired(before=110, limit=10), [])
+
     def test_rejects_unsafe_identifiers_before_building_redis_keys(self) -> None:
         repository = RedisSessionRepository(FakeRedisJsonClient())
         with self.assertRaisesRegex(ValueError, "invalid session id"):
@@ -305,6 +388,21 @@ class RedisSessionRepositoryTests(unittest.TestCase):
 
 
 class VercelBlobArtifactStoreTests(unittest.TestCase):
+    def test_file_upload_and_download_do_not_require_byte_buffers(self) -> None:
+        blob = FakeBlobClient()
+        store = VercelBlobArtifactStore(blob)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.ttml"
+            destination = root / "downloaded.ttml"
+            source.write_bytes(b"streamed")
+
+            key = store.put_file("sessions/session-1/uploads/one.ttml", source)
+            result = store.get_file(key, destination)
+
+            self.assertEqual(result, destination)
+            self.assertEqual(destination.read_bytes(), b"streamed")
+
     def test_sdk_facade_matches_vercel_0_5_result_shapes(self) -> None:
         fake_sdk = SimpleNamespace(
             upload_file=lambda *args, **kwargs: None,
@@ -417,6 +515,46 @@ class VercelBlobArtifactStoreTests(unittest.TestCase):
 
 
 class UpstashRestRedisClientTests(unittest.TestCase):
+    def test_expiry_index_and_fixed_window_commands_use_rest_redis(self) -> None:
+        commands: list[list[Any]] = []
+        responses = iter((
+            b'{"result":1}',
+            b'{"result":1}',
+            b'{"result":["session-1"]}',
+            b'{"result":1}',
+            b'{"result":[2,30]}',
+        ))
+
+        def requester(request: Any, _timeout: float) -> bytes:
+            commands.append(json.loads(request.data.decode("utf-8")))
+            return next(responses)
+
+        client = UpstashRestRedisClient(
+            "https://redis.example",
+            "secret-token",
+            requester=requester,
+        )
+
+        self.assertTrue(client.expire("session-key", ttl_seconds=20))
+        client.sorted_set_add("expiry-key", "session-1", 110)
+        self.assertEqual(
+            client.sorted_set_range_by_score("expiry-key", maximum=110, limit=5),
+            ["session-1"],
+        )
+        client.sorted_set_remove("expiry-key", "session-1")
+        limited = client.consume_fixed_window(
+            "rate-key",
+            limit=1,
+            window_seconds=60,
+        )
+
+        self.assertFalse(limited.allowed)
+        self.assertEqual(commands[0], ["EXPIRE", "session-key", 20])
+        self.assertEqual(commands[1], ["ZADD", "expiry-key", 110, "session-1"])
+        self.assertEqual(commands[2][0:4], ["ZRANGEBYSCORE", "expiry-key", "-inf", 110])
+        self.assertEqual(commands[3], ["ZREM", "expiry-key", "session-1"])
+        self.assertEqual(commands[4][0], "EVAL")
+
     def test_lease_fenced_cas_checks_session_and_lease_in_one_script(self) -> None:
         commands: list[list[Any]] = []
         responses = iter((b'{"result":1}', b'{"result":-2}'))
@@ -454,6 +592,8 @@ class UpstashRestRedisClientTests(unittest.TestCase):
         )
         self.assertEqual(commands[0][0], "EVAL")
         self.assertEqual(commands[0][2:7], [2, "session-key", "lease-key", 1, "worker-a"])
+        self.assertIn("PTTL", commands[0][1])
+        self.assertIn("math.max(ttl, 1)", commands[0][1])
 
     def test_atomic_operations_use_rest_command_json_without_network(self) -> None:
         commands: list[list[Any]] = []
