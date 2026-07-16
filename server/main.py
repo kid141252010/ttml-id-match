@@ -19,7 +19,9 @@ def create_app(
     install_v2_exception_handlers(app)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(cors_origins or settings.cors_origins),
+        allow_origins=list(
+            settings.cors_origins if cors_origins is None else cors_origins
+        ),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

@@ -179,12 +179,14 @@ class MatchingEngine:
     ) -> SourceResult:
         try:
             result = adapter.search(MatchContext(metadata=metadata, results=completed))
+            if result.source != adapter.key:
+                raise ValueError(
+                    f"source adapter {adapter.key} returned result for {result.source}"
+                )
+            _validate_source_result(adapter.key, result)
+            return result
         except Exception as exc:
             return SourceResult(source=adapter.key, warnings=(str(exc),))
-        if result.source != adapter.key:
-            raise ValueError(f"source adapter {adapter.key} returned result for {result.source}")
-        _validate_source_result(adapter.key, result)
-        return result
 
     def _search_limited(
         self,

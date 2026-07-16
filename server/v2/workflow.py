@@ -1044,7 +1044,10 @@ def _delete_quietly(artifacts: ArtifactStore, key: str) -> None:
 
 
 def _safe_filename(filename: str) -> str:
-    safe = Path(filename or "uploaded.bin").name
+    raw = str(filename or "uploaded.bin")
+    if "\0" in raw:
+        raise ValueError("invalid filename")
+    safe = Path(raw.replace("\\", "/")).name
     if safe in {"", ".", ".."}:
         raise ValueError("invalid filename")
     return safe

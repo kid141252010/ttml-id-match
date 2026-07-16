@@ -156,6 +156,30 @@ class SessionWorkflowTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 artifacts.get_bytes(first_record["artifact_key"])
 
+    def test_upload_normalizes_windows_filename_separators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = LocalJsonSessionRepository(root / "state")
+            artifacts = FileArtifactStore(root / "artifacts")
+            workflow = SessionWorkflow(
+                repository,
+                artifacts,
+                MatchingApplication(MatchingEngine([])),
+                work_root=root / "work",
+            )
+            session_id = workflow.create_session()
+
+            pairing = workflow.upload_files(
+                session_id,
+                [UploadData(r"..\Song.ttml", TTML.encode())],
+            )
+
+            self.assertEqual(pairing["pairs"][0]["ttml_path"], "Song.ttml")
+            self.assertEqual(
+                repository.load(session_id).data["uploads"][0]["filename"],
+                "Song.ttml",
+            )
+
     def test_preview_and_apply_attempts_are_bounded_per_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

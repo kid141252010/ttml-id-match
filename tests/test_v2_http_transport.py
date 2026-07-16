@@ -72,11 +72,14 @@ class HttpxTransportTests(unittest.TestCase):
 
     def test_non_retryable_http_error_is_raised_immediately(self):
         calls = 0
+        responses = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal calls
             calls += 1
-            return httpx.Response(404, request=request)
+            response = httpx.Response(404, request=request)
+            responses.append(response)
+            return response
 
         transport = HttpxTransport(
             attempts=3,
@@ -89,6 +92,7 @@ class HttpxTransportTests(unittest.TestCase):
         with self.assertRaises(httpx.HTTPStatusError):
             transport.request("spotify", "GET", "https://example.test/missing")
         self.assertEqual(calls, 1)
+        self.assertTrue(responses[0].is_closed)
 
     def test_provider_clients_use_the_shared_transport_adapter(self):
         class FakeTransport:

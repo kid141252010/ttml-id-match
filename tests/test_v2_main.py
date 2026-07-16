@@ -33,6 +33,28 @@ class V2MainTests(unittest.TestCase):
             self.assertTrue(all(path.startswith("/api/v2") for path in paths))
             self.assertNotIn("/api/v2/health", paths)
 
+    def test_explicit_empty_cors_origins_disable_default_origins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = SessionWorkflow(
+                LocalJsonSessionRepository(root / "state"),
+                FileArtifactStore(root / "artifacts"),
+                MatchingApplication(MatchingEngine([])),
+                work_root=root / "work",
+            )
+            app = create_app(v2_workflow=workflow, cors_origins=())
+            client = TestClient(app)
+
+            response = client.options(
+                "/api/v2/sessions",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+
+            self.assertNotIn("access-control-allow-origin", response.headers)
+
 
 if __name__ == "__main__":
     unittest.main()

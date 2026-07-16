@@ -72,6 +72,25 @@ class MatchingEngineTests(unittest.TestCase):
         self.assertEqual(ncm_start[2], ("apple_music", "qq_music", "spotify"))
         self.assertEqual(result.sources["ncm_music"].recommended_ids, ("ncm_music-1",))
 
+    def test_malformed_source_results_become_source_warnings(self):
+        class MalformedSource(RecordingSource):
+            def search(self, context):
+                candidate = Candidate(id="duplicate", source=self.key)
+                return SourceResult(
+                    source=self.key,
+                    candidates=(candidate, candidate),
+                )
+
+        result = MatchingEngine([MalformedSource("qq_music", [])]).match(
+            AudioMetadata(title="Song")
+        )
+
+        self.assertEqual(result.sources["qq_music"].candidates, ())
+        self.assertEqual(
+            result.sources["qq_music"].warnings,
+            ("source adapter qq_music returned duplicate candidate ids",),
+        )
+
     def test_builds_default_selection_and_metadata_values_from_public_candidates(self):
         class QQClient:
             def search_songs(self, _query):

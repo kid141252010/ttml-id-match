@@ -108,15 +108,15 @@ class HttpxTransport:
                 self._wait_before_retry(attempt, retry_after)
                 continue
 
-            response.raise_for_status()
-            payload = response.content
-            result = HttpResponse(
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                content=payload,
-            )
-            response.close()
-            return result
+            try:
+                response.raise_for_status()
+                return HttpResponse(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    content=response.content,
+                )
+            finally:
+                response.close()
         raise RuntimeError("unreachable HTTP retry state")
 
     def close(self) -> None:
