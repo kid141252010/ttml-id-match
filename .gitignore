@@ -48,6 +48,17 @@ Thumbs.db
 # temp
 # example/*
 .env
+.env.local
+
+# 搜索程序的凭据 token（绝对不要提交 ❌）
+.spotify-token.json
+*.token.json
+
+# 构建产物（体积很大，请用 GitHub Releases 发布 zip ✅）
+build/
+dist/
+_pkg/
+*.spec
 # Frontend
 node_modules/
 web/node_modules/
