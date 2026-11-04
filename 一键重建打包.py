@@ -91,14 +91,16 @@ def finalize() -> str:
 
 def test_regions(exe: str) -> None:
     step("5) 启动并测试 TW / KR / CN")
-    subprocess.Popen([exe, "--port", str(PORT), "--no-open"], cwd=HERE)
+    proc = subprocess.Popen([exe, "--port", str(PORT), "--no-open"], cwd=HERE)
     time.sleep(10)
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def q(term: str, countries: str):
         url = (f"http://127.0.0.1:{PORT}/api/search?term=" + urllib.parse.quote(term)
                + f"&countries={countries}&limit=3&sources=apple")
         try:
-            with urllib.request.urlopen(url, timeout=180) as resp:
+            with opener.open(url, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8", "replace"))
         except Exception as exc:
             return {"error": str(exc)[:120]}
@@ -112,6 +114,11 @@ def test_regions(exe: str) -> None:
         print(f"   [{cc}] {term} → count={r.get('count')}  warnings={r.get('warnings')}")
         for x in (r.get("results") or [])[:2]:
             print(f"        {x.get('name')} | {x.get('artist')} | ISRC {x.get('isrc') or '-'} | 命中区 {x.get('found_in')}")
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
 
 
 def package() -> None:
@@ -141,6 +148,10 @@ def package() -> None:
     shutil.make_archive(ZIP_PATH[:-4], "zip", tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     print("   ✅", ZIP_PATH, round(os.path.getsize(ZIP_PATH) / 1024 / 1024, 1), "MB")
+    local_zip = os.path.join(HERE, "音乐元数据搜索程序.zip")
+    if os.path.abspath(ZIP_PATH) != os.path.abspath(local_zip):
+        shutil.copy(ZIP_PATH, local_zip)
+        print("   ✅ 副本已同步至工作目录:", local_zip)
 
 
 def main() -> None:
